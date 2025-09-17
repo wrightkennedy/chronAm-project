@@ -6,17 +6,20 @@ import subprocess
 import os
 import pandas as pd
 import re
+import threading
+import html
+import urllib.parse
 from datetime import datetime, date
 from PyQt5.QtWidgets import (
     QFileDialog, QApplication, QMainWindow, QAction, QWidget,
     QApplication, QMainWindow, QAction, QFileDialog, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QProgressBar, QMessageBox, QListWidget, QListWidgetItem,
-    QCheckBox, QFormLayout, QInputDialog, QDialog, QTextEdit, QComboBox,
+    QCheckBox, QFormLayout, QInputDialog, QDialog, QTextBrowser, QComboBox,
     QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, pyqtProperty
-from PyQt5.QtGui import QPainter, QPen, QIntValidator
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, pyqtProperty, QUrl
+from PyQt5.QtGui import QPainter, QPen, QIntValidator, QTextCursor
 
 from chronam import download_data
 from chronam.map_create import create_map
@@ -24,6 +27,12 @@ from chronam.merge import merge_geojson
 from chronam.fetch_metadata import fetch_missing_metadata
 from chronam.collocate import run_collocation
 from chronam.visualize import plot_bar, plot_rank_changes
+
+DATASET_FOLDER_WARNING = (
+    "Select the folder containing the AmericanStories parquet files. "
+    "If you have already set a folder location, the software does not recognize the parquet files. "
+    "Ensure the folder is unzipped and accessible."
+)
 
 class Spinner(QWidget):
     def __init__(self, parent=None, radius=20, line_width=4):
@@ -150,6 +159,9 @@ class MainWindow(QMainWindow):
         start_dir = self.dataset_folder or self.project_folder
         folder = QFileDialog.getExistingDirectory(self, 'Select Local Dataset Folder', start_dir)
         if folder:
+            if not self._has_parquet_files(folder):
+                QMessageBox.warning(self, 'Dataset Folder Required', DATASET_FOLDER_WARNING)
+                return
             self.dataset_folder = folder
             QMessageBox.information(self, 'Dataset Folder Set', f'Using dataset folder:\n{folder}')
 
@@ -164,24 +176,37 @@ class MainWindow(QMainWindow):
                 seen.add(path)
                 yield path
 
+    def _has_parquet_files(self, folder: str) -> bool:
+        if not folder or not os.path.isdir(folder):
+            return False
+        try:
+            return any(
+                name.startswith('AmericanStories_') and name.endswith('.parquet')
+                for name in os.listdir(folder)
+            )
+        except OSError:
+            return False
+
     def ensure_dataset_folder(self, prompt: bool = True):
         for candidate in self._dataset_folder_candidates():
-            if os.path.isdir(candidate):
+            if os.path.isdir(candidate) and self._has_parquet_files(candidate):
                 self.dataset_folder = candidate
                 return candidate
 
         if not prompt:
             return None
 
-        QMessageBox.information(
+        QMessageBox.warning(
             self,
             'Dataset Folder Required',
-            'Select the folder containing the AmericanStories parquet files.'
+            DATASET_FOLDER_WARNING
         )
         folder = QFileDialog.getExistingDirectory(self, 'Select Local Dataset Folder', self.project_folder)
-        if folder:
+        if folder and self._has_parquet_files(folder):
             self.dataset_folder = folder
             return folder
+        if folder:
+            QMessageBox.warning(self, 'Dataset Folder Required', DATASET_FOLDER_WARNING)
         return None
 
     def open_json_file(self):
@@ -278,6 +303,15 @@ class DownloadDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
+        dataset_row = QHBoxLayout()
+        self.dataset_label = QLabel()
+        self.dataset_label.setWordWrap(True)
+        dataset_row.addWidget(self.dataset_label, 1)
+        self.dataset_change_btn = QPushButton('Change')
+        self.dataset_change_btn.clicked.connect(self._change_dataset_folder)
+        dataset_row.addWidget(self.dataset_change_btn, 0)
+        layout.addLayout(dataset_row)
+
         self.spinner = Spinner(self)
         self.spinner.hide()
         layout.addWidget(self.spinner, alignment=Qt.AlignCenter)
@@ -297,16 +331,18 @@ class DownloadDialog(QDialog):
         form.addRow('End Date (YYYY-MM-DD):', self.end_input)
         layout.addLayout(form)
 
-        self.log = QTextEdit()
+        self.log = QTextBrowser()
+        self.log.setOpenLinks(False)
+        self.log.anchorClicked.connect(self._handle_log_link)
         self.log.setReadOnly(True)
         self.progress = QProgressBar()
         layout.addWidget(self.log)
         layout.addWidget(self.progress)
 
         btns = QHBoxLayout()
-        self.run_btn = QPushButton('Run Download')
+        self.run_btn = QPushButton('Search Records')
         self.run_btn.clicked.connect(self.start_download)
-        self.cancel_btn = QPushButton('Cancel Download')
+        self.cancel_btn = QPushButton('Close')
         self.cancel_btn.clicked.connect(self.cancel_download)
         btns.addWidget(self.run_btn)
         btns.addWidget(self.cancel_btn)
@@ -317,27 +353,115 @@ class DownloadDialog(QDialog):
 
         self.logged_years = set()
         self.current_parquet_dir = None
+        self._search_running = False
+        self._cancel_event = threading.Event()
+        self._cancel_requested = False
+        self._year_timer = None
+
+        self.refresh_dataset_label()
+
+    def showEvent(self, event):
+        self.refresh_dataset_label()
+        super().showEvent(event)
+
+    def refresh_dataset_label(self):
+        folder = getattr(self.parent(), 'dataset_folder', None)
+        if folder and os.path.isdir(folder):
+            if self.parent()._has_parquet_files(folder):
+                text = f"Dataset folder: {folder}"
+            else:
+                text = f"Dataset folder: {folder} (no AmericanStories parquet files found)"
+        else:
+            text = "Dataset folder: Not set"
+        self.dataset_label.setText(text)
+        self.dataset_change_btn.setEnabled(True)
+
+    def _change_dataset_folder(self):
+        start_dir = getattr(self.parent(), 'dataset_folder', None) or self.parent().project_folder
+        folder = QFileDialog.getExistingDirectory(self, 'Select Local Dataset Folder', start_dir)
+        if folder:
+            if not self.parent()._has_parquet_files(folder):
+                QMessageBox.warning(self, 'Dataset Folder Required', DATASET_FOLDER_WARNING)
+                return
+            self.parent().dataset_folder = folder
+            self.refresh_dataset_label()
+
+    def _ensure_log_visible(self):
+        self.log.moveCursor(QTextCursor.End)
+        self.log.ensureCursorVisible()
+
+    def _log_plain(self, text: str):
+        safe = html.escape(text)
+        self.log.append(f"<span>{safe}</span>")
+        self._ensure_log_visible()
+
+    def _log_link(self, prefix: str, path: str, elapsed: float):
+        encoded = urllib.parse.quote(path)
+        safe_prefix = html.escape(prefix)
+        safe_path = html.escape(path)
+        self.log.append(
+            f"<span>{safe_prefix} {elapsed:.1f}s — saved to "
+            f"<a href=\"chronam-open:{encoded}\">{safe_path}</a></span>"
+        )
+        self._ensure_log_visible()
+
+    def _set_running_state(self, running: bool):
+        self._search_running = running
+        self.run_btn.setEnabled(not running)
+        self.cancel_btn.setEnabled(True)
+        self.dataset_change_btn.setEnabled(not running)
+        if running:
+            self.cancel_btn.setText('Cancel Search')
+            self.spinner.show()
+            self._anim.start()
+        else:
+            self.cancel_btn.setText('Close')
+            self._anim.stop()
+            self.spinner.hide()
+            self.current_parquet_dir = None
+            if self.thread and not self.thread.isRunning():
+                self.thread = None
+            self._year_timer = None
+
+    def _handle_log_link(self, url: QUrl):
+        if url.scheme() != 'chronam-open':
+            return
+        encoded = url.toString()[len('chronam-open:'):]
+        path = urllib.parse.unquote(encoded)
+        if not path:
+            return
+        self._reveal_in_file_manager(path)
+
+    @staticmethod
+    def _reveal_in_file_manager(path: str):
+        if not os.path.exists(path):
+            return
+        try:
+            if sys.platform == 'darwin':
+                subprocess.run(['open', '-R', path], check=False)
+            elif os.name == 'nt':
+                norm = os.path.normpath(path)
+                subprocess.run(['explorer', f'/select,{norm}'], check=False)
+            else:
+                directory = os.path.dirname(path) or '.'
+                subprocess.run(['xdg-open', directory], check=False)
+        except Exception:
+            pass
 
     def start_download(self):
+        self.refresh_dataset_label()
+
         term  = self.search_input.text().strip()
         start = self.start_input.text().strip()
         end   = self.end_input.text().strip()
 
         dataset_folder = self.parent().ensure_dataset_folder()
         if not dataset_folder:
-            QMessageBox.warning(
-                self,
-                'Dataset Required',
-                'Cannot run search without selecting the parquet dataset folder.'
-            )
-            self.log.append('Search cancelled — dataset folder not selected.')
+            self._log_plain('Search cancelled — dataset folder not recognized.')
             return
 
         self.current_parquet_dir = dataset_folder
-
-        self.parent().setEnabled(False)
-        self.spinner.show()
-        self._anim.start()
+        self.refresh_dataset_label()
 
         # Single output path for the full range
         out_path = os.path.join(
@@ -349,16 +473,23 @@ class DownloadDialog(QDialog):
                 self, 'Overwrite Warning', f'Will overwrite:\n{out_path}',
                 QMessageBox.Yes | QMessageBox.No
             ) != QMessageBox.Yes:
-                # User chose not to overwrite
-                self.spinner.hide()
-                self._anim.stop()
-                self.parent().setEnabled(True)
+                self._log_plain('Search cancelled — existing file retained.')
                 return
 
-        self.log.append('Starting search...')
+        if self.log.toPlainText().strip():
+            self.log.append('')
+            self._ensure_log_visible()
+
+        header = f'Searching for "{term}" between {start} and {end}'
+        self._log_plain(header)
+        self._log_plain('Starting search...')
         self.progress.setValue(0)
         self._start_time = time.time()
         self.logged_years.clear()
+        self._cancel_event.clear()
+        self._cancel_requested = False
+        self._year_timer = self._start_time
+        self._set_running_state(True)
 
         # Launch download in a separate thread
         self.thread = WorkerThread(
@@ -367,39 +498,18 @@ class DownloadDialog(QDialog):
             term,
             start,
             end,
-            parquet_dir=dataset_folder
+            parquet_dir=dataset_folder,
+            cancel_event=self._cancel_event
         )
         self.thread.progress.connect(self.update_progress)
         self.thread.finished.connect(self.download_finished)
         self.thread.start()
 
-    # def update_progress(self, count: int):
-    #     elapsed = time.time() - self._start_time
-    #     raw_data_folder = os.path.join(self.parent().project_folder, 'data', 'raw')
-
-    #     year_str = ""
-
-    #     try:
-    #         files = [f for f in os.listdir(raw_data_folder) if f.endswith('.parquet')]
-    #         year_pattern = r"AmericanStories_(\d{4})\.parquet"
-    #         for file in files:
-    #             match = re.match(year_pattern, file)
-    #             if match:
-    #                 year = match.group(1)
-    #                 if year not in self.logged_years:
-    #                     self.logged_years.add(year)
-    #                     year_str = f" (in year: {year})"
-    #                     break
-
-    #     except FileNotFoundError:
-    #         pass
-
-    #     self.progress.setValue(count)
-    #     self.log.append(f"Found {count:,} articles Test {year_str} — elapsed {elapsed:.1f}s")
-
     def update_progress(self, count: int):
-        elapsed = time.time() - self._start_time
+        now = time.time()
+        elapsed = now - self._start_time
         year_str = ""
+        year_elapsed = None
 
         def parquet_dir_candidates():
             explicit_dir = getattr(self, 'current_parquet_dir', None)
@@ -456,47 +566,72 @@ class DownloadDialog(QDialog):
                 for target_year in year_range or sorted(year_map.keys()):
                     if target_year in year_map and target_year not in self.logged_years:
                         self.logged_years.add(target_year)
-                        year_str = f" in year {target_year}"
+                        year_str = f" (in year: {target_year})"
+                        if self._year_timer is None:
+                            self._year_timer = now
+                        year_elapsed = max(0.0, now - self._year_timer)
+                        self._year_timer = now
                         break
 
                 if year_str:
                     break
 
         self.progress.setValue(count)
-        self.log.append(f"Found {count:,} articles{year_str} — elapsed {elapsed:.1f}s")
+        if year_elapsed is not None:
+            time_note = f"year time {year_elapsed:.1f}s"
+        else:
+            time_note = f"elapsed {elapsed:.1f}s"
+        self._log_plain(f"Found {count:,} articles{year_str} — {time_note}")
 
 
 
     def cancel_download(self):
-        if self.thread and self.thread.isRunning():
-            if QMessageBox.question(self, 'Cancel Download', 'Cancel the download?', QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-                self.thread.terminate()
-                self._anim.stop()
-                self.spinner.hide()
-                self.parent().setEnabled(True)
-                self.log.append("Download cancelled.")
-                self.current_parquet_dir = None
+        if self._search_running and self.thread and self.thread.isRunning():
+            if self._cancel_requested:
+                return
+            self._cancel_requested = True
+            self._cancel_event.set()
+            self.cancel_btn.setText('Canceling...')
+            self.cancel_btn.setEnabled(False)
+            self._log_plain('Cancelling search...')
+        else:
+            self.close()
 
     def download_finished(self, result):
         elapsed = time.time() - self._start_time
-        self._anim.stop()
-        self.spinner.hide()
-        self.parent().setEnabled(True)
-        self.current_parquet_dir = None
+        self._set_running_state(False)
         if isinstance(result, Exception):
             QMessageBox.critical(self, 'Error', str(result))
+            self._log_plain(f"Search failed: {result}")
+            self._cancel_event.clear()
+            self._cancel_requested = False
+            return
+
+        if self._cancel_requested:
+            if result:
+                for path in result:
+                    self._log_link('Cancelled after', path, elapsed)
+            else:
+                self._log_plain(f'Search cancelled after {elapsed:.1f}s — no records saved')
+            self._cancel_event.clear()
+            self._cancel_requested = False
+            return
+
+        # Automatically load the last downloaded JSON
+        last_json = result[-1] if result else None
+        if last_json:
+            p = self.parent()
+            p.json_file = last_json
+            p.json_label.setText(os.path.basename(last_json))
+
+        if result:
+            for path in result:
+                self._log_link('Finished in', path, elapsed)
         else:
-            QMessageBox.information(
-                self, 'Download Complete',
-                f'Finished in {elapsed:.1f}s\n' + '\n'.join(result)
-            )
-            # Automatically load the last downloaded JSON
-            last_json = result[-1] if result else None
-            if last_json:
-                p = self.parent()
-                p.json_file = last_json
-                p.json_label.setText(os.path.basename(last_json))
-        self.close()
+            self._log_plain(f"Finished in {elapsed:.1f}s — no records saved")
+
+        self._cancel_event.clear()
+        self._cancel_requested = False
 
 class UpdateLocationsDialog(QDialog):
     def __init__(self, parent=None):

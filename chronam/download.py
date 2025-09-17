@@ -14,7 +14,8 @@ def download_data(
     heartbeat_interval: int = 10000,
     max_saved_articles_per_year: int = None,
     batch_size: int = 10000,
-    progress_callback=None
+    progress_callback=None,
+    cancel_event=None,
 ) -> list:
     paths = init_project(project_dir)
     output_dir = paths['raw']

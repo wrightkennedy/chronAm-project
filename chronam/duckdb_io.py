@@ -39,7 +39,7 @@ Output JSON (per year) matches the app's existing downstream expectations:
 
 
 from typing import Optional, List, Dict
-import os, json, re
+import os, json, re, threading
 import pandas as pd
 import duckdb
 from .config import init_project
@@ -61,6 +61,7 @@ def download_data(
     parquet_prefix: str = DEFAULT_PARQUET_PREFIX,
     max_saved_articles_per_year: Optional[int] = None,  # kept for API compat; still acts per-file scan
     progress_callback=None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> List[str]:
     """
     Query local Parquet with DuckDB and write *one* JSON payload for the full date range
@@ -133,6 +134,8 @@ def download_data(
     all_records: List[Dict] = []
 
     for y in _years_between(start_date_str, end_date_str):
+        if cancel_event and cancel_event.is_set():
+            return []
         fpath = _file_for_year(parquet_root, y, parquet_prefix)
         if not os.path.exists(fpath):
             continue
@@ -157,6 +160,8 @@ def download_data(
             params.append(int(max_saved_articles_per_year))
 
         df = con.execute(sql, params).fetchdf()
+        if cancel_event and cancel_event.is_set():
+            return []
         if df.empty:
             if progress_callback:
                 progress_callback(0)
@@ -167,8 +172,13 @@ def download_data(
             df["newspaper_name"] = df["lccn"].map(lccn_to_title)
 
         all_records.extend(df.to_dict("records"))
+        if cancel_event and cancel_event.is_set():
+            return []
         if progress_callback:
             progress_callback(int(len(df)))
+
+    if cancel_event and cancel_event.is_set():
+        return []
 
     # Write a single payload (empty-safe)
     out_file = os.path.join(raw_dir, f"{search_term}_{start_date_str}_{end_date_str}.json")
