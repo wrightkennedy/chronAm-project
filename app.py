@@ -311,7 +311,7 @@ class DownloadDialog(QDialog):
     def update_progress(self, count: int):
         elapsed = time.time() - self._start_time
         self.progress.setValue(count)
-        self.log.append(f"Searched {count:,} articles — elapsed {elapsed:.1f}s")
+        self.log.append(f"Found {count:,} articles — elapsed {elapsed:.1f}s")
 
     def cancel_download(self):
         if self.thread and self.thread.isRunning():
