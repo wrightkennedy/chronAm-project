@@ -9,13 +9,13 @@ import re
 import threading
 import html
 import urllib.parse
+from typing import Optional, List
 from datetime import datetime, date
 from PyQt5.QtWidgets import (
     QFileDialog, QApplication, QMainWindow, QAction, QWidget,
     QApplication, QMainWindow, QAction, QFileDialog, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QProgressBar, QMessageBox, QListWidget, QListWidgetItem,
-    QCheckBox, QFormLayout, QInputDialog, QDialog, QTextBrowser, QComboBox,
+    QProgressBar, QMessageBox, QCheckBox, QFormLayout, QInputDialog, QDialog, QTextBrowser, QComboBox,
     QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup, QDockWidget
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, pyqtProperty, QUrl
@@ -24,7 +24,6 @@ from PyQt5.QtGui import QPainter, QPen, QIntValidator, QTextCursor
 from chronam import download_data
 from chronam.map_create import create_map
 from chronam.merge import merge_geojson
-from chronam.fetch_metadata import fetch_missing_metadata
 from chronam.collocate import run_collocation
 from chronam.visualize import plot_bar, plot_rank_changes
 
@@ -168,6 +167,7 @@ class MainWindow(QMainWindow):
 
     def _init_project_log(self):
         self.project_log_browser = QTextBrowser()
+        self.project_log_browser.setReadOnly(True)
         self.project_log_browser.setOpenLinks(False)
         self.project_log_browser.anchorClicked.connect(self._handle_project_log_link)
 
@@ -934,65 +934,103 @@ class UpdateLocationsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Add Geographic Info')
-        self.setMinimumSize(500, 400)
+        self.setMinimumSize(540, 320)
+
         layout = QVBoxLayout(self)
 
-        self.csv_path = None
-        self.csv_btn = QPushButton('Load CSV (default ChronAm_newspapers_XY.csv)')
-        self.csv_btn.clicked.connect(self.load_csv)
-        layout.addWidget(self.csv_btn)
+        form = QFormLayout()
 
-        self.list_widget = QListWidget()
-        layout.addWidget(self.list_widget)
+        # JSON selection
+        self.json_path = getattr(parent, 'json_file', None)
+        self.json_label = QLabel(self._display_name(self.json_path))
+        json_row = QHBoxLayout()
+        json_row.addWidget(self.json_label, 1)
+        self.json_change_btn = QPushButton('Change')
+        self.json_change_btn.clicked.connect(self.change_json)
+        json_row.addWidget(self.json_change_btn)
+        form.addRow('Articles JSON:', json_row)
 
-        self.fetch_btn = QPushButton('Fetch Missing Metadata')
-        self.fetch_btn.clicked.connect(self.fetch_metadata)
-        layout.addWidget(self.fetch_btn)
+        # CSV selection
+        self.csv_path = self._default_csv_path()
+        if not (self.csv_path and os.path.exists(self.csv_path)):
+            self.csv_path = self.prompt_csv()
 
+        self.csv_label = QLabel(self._display_name(self.csv_path))
+        csv_row = QHBoxLayout()
+        csv_row.addWidget(self.csv_label, 1)
+        self.csv_change_btn = QPushButton('Change')
+        self.csv_change_btn.clicked.connect(self.change_csv)
+        csv_row.addWidget(self.csv_change_btn)
+        form.addRow('Locations CSV:', csv_row)
+
+        layout.addLayout(form)
+
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
         self.merge_btn = QPushButton('Merge to GeoJSON')
         self.merge_btn.clicked.connect(self.perform_merge)
-        layout.addWidget(self.merge_btn)
+        btn_row.addWidget(self.merge_btn)
+        close_btn = QPushButton('Close')
+        close_btn.clicked.connect(self.close)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
 
-    def load_csv(self):
-        path, _ = QFileDialog.getOpenFileName(self, 'Load CSV', '', 'CSV Files (*.csv)')
+    def _display_name(self, path: Optional[str]) -> str:
         if not path:
-            path = os.path.join(self.parent().project_folder, 'data', 'ChronAm_newspapers_XY.csv')
-        self.csv_path = path
-        missing = []
-        try:
-            import pandas as pd
-            df = pd.read_csv(path)
-            # Find newspapers with missing coordinates
-            missing = df[df[['Long', 'Lat']].isna().any(axis=1)]['Title'].tolist()
-        except Exception:
-            pass
-        self.list_widget.clear()
-        for name in missing:
-            item = QListWidgetItem(name)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked)
-            self.list_widget.addItem(item)
+            return '(none)'
+        return path if len(path) <= 80 else '…' + path[-77:]
 
-    def fetch_metadata(self):
-        to_fetch = [
-            self.list_widget.item(i).text()
-            for i in range(self.list_widget.count())
-            if self.list_widget.item(i).checkState() == Qt.Checked
-        ]
-        if not self.csv_path:
-            self.csv_path = os.path.join(self.parent().project_folder, 'data', 'ChronAm_newspapers_XY.csv')
-        updated_csv = fetch_missing_metadata(self.parent().project_folder, to_fetch, self.csv_path)
-        self.csv_path = updated_csv
-        QMessageBox.information(self, 'Fetched', f'Metadata fetched and CSV updated:\n{updated_csv}')
+    def change_json(self):
+        parent = self.parent()
+        start = self.json_path or getattr(parent, 'project_folder', os.getcwd())
+        path, _ = QFileDialog.getOpenFileName(self, 'Select Articles JSON', start, 'JSON Files (*.json)')
+        if not path:
+            return
+        self.json_path = path
+        parent.json_file = path
+        parent._update_loaded_file_labels()
+        self.json_label.setText(self._display_name(path))
+
+    def _default_csv_path(self) -> Optional[str]:
+        parent = self.parent()
+        candidates = []
+        dataset = getattr(parent, 'dataset_folder', None)
+        if dataset:
+            candidates.append(os.path.join(os.path.dirname(dataset), 'ChronAm_newspapers_XY.csv'))
+        candidates.append(os.path.join(parent.project_folder, 'data', 'ChronAm_newspapers_XY.csv'))
+        for cand in candidates:
+            if cand and os.path.exists(cand):
+                return cand
+        return None
+
+    def prompt_csv(self) -> Optional[str]:
+        start = self.parent().project_folder
+        path, _ = QFileDialog.getOpenFileName(self, 'Select Locations CSV', start, 'CSV Files (*.csv)')
+        return path
+
+    def change_csv(self):
+        path = self.prompt_csv()
+        if not path:
+            return
+        self.csv_path = path
+        self.csv_label.setText(self._display_name(path))
 
     def perform_merge(self):
         parent = self.parent()
-        json_path, _ = QFileDialog.getOpenFileName(self, 'Select JSON File', parent.project_folder, 'JSON Files (*.json)')
-        if not json_path:
-            return
-        # Try to read minimal metadata from JSON (term and year)
+        if not self.json_path or not os.path.exists(self.json_path):
+            self.change_json()
+            if not self.json_path:
+                return
+
+        if not self.csv_path or not os.path.exists(self.csv_path):
+            self.change_csv()
+            if not self.csv_path:
+                return
+
         try:
-            with open(json_path, 'r', encoding='utf-8') as f:
+            with open(self.json_path, 'r', encoding='utf-8') as f:
                 info = json.load(f)
             term = None
             year = None
@@ -1000,13 +1038,12 @@ class UpdateLocationsDialog(QDialog):
                 term = info.get('search_term')
                 year = info.get('year')
             if not term:
-                fname = os.path.basename(json_path)
-                base, _ = os.path.splitext(fname)
+                base = os.path.basename(self.json_path)
                 term = base.split('_', 1)[0] if base else None
             if not term:
                 raise ValueError('Could not infer search_term from JSON or filename.')
-        except Exception as e:
-            QMessageBox.critical(self, 'Error', f'Could not read metadata: {e}')
+        except Exception as exc:
+            QMessageBox.critical(self, 'Error', f'Could not read metadata: {exc}')
             return
 
         try:
@@ -1015,16 +1052,44 @@ class UpdateLocationsDialog(QDialog):
                 csv_path=self.csv_path,
                 search_term=term,
                 year=year,
-                json_path=json_path
+                json_path=self.json_path
             )
-            QMessageBox.information(self, 'GeoJSON Created', 'Files created:\n' + '\n'.join(out_paths))
-            # Load the latest GeoJSON in the main window
-            last_geo = out_paths[-1] if out_paths else None
-            if last_geo:
+            if out_paths:
+                last_geo = out_paths[-1]
                 parent.geojson_file = last_geo
                 parent.geojson_label.setText(os.path.basename(last_geo))
-        except Exception as e:
-            QMessageBox.critical(self, 'Error', str(e))
+            self._log_merge_stats(out_paths)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Error', str(exc))
+
+    def _log_merge_stats(self, out_paths):
+        parent = self.parent()
+        lines = []
+        total_articles = 0
+        places_all = set()
+        for path in out_paths:
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    geo = json.load(f)
+                features = geo.get('features', [])
+                total_articles += len(features)
+                places = set()
+                for feat in features:
+                    props = feat.get('properties', {})
+                    places.add((props.get('Title'), props.get('SN')))
+                places_all.update(places)
+                encoded = urllib.parse.quote(path)
+                lines.append(
+                    f'<div>Output GeoJSON: <a href="chronam-open:{encoded}">{html.escape(path)}</a></div>'
+                )
+            except Exception:
+                continue
+
+        if not lines:
+            lines.append('<div>No GeoJSON files created.</div>')
+
+        summary = f'<div>Merged {len(places_all)} places to {total_articles} articles.</div>'
+        parent.append_project_log('Add Geographic Info', [summary] + lines)
 
 class CSVPreviewDialog(QDialog):
     def __init__(self, csv_path, parent=None, max_rows=100):
