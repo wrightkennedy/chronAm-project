@@ -180,6 +180,9 @@ def download_data(
     if cancel_event and cancel_event.is_set():
         return []
 
+    if not all_records:
+        return []
+
     # Write a single payload (empty-safe)
     out_file = os.path.join(raw_dir, f"{search_term}_{start_date_str}_{end_date_str}.json")
     payload = {

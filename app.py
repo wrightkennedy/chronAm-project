@@ -84,19 +84,26 @@ class WorkerThread(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ChronAM GUI")
+        self._base_title = 'Untitled'
+        self.setWindowTitle(self._base_title)
         self.resize(500, 300)
         self.project_folder = os.getcwd()
         self.dataset_folder = None
+        self.dataset_years = []
         self.json_file = None
         self.geojson_file = None
+        self.download_log = []
+        self.project_file = None
         self.init_ui()
+        self._update_window_title()
 
     def init_ui(self):
         menubar = self.menuBar()
         file_menu = menubar.addMenu('File')
         file_menu.addAction(self._action('New Project', self.new_project))
         file_menu.addAction(self._action('Open Project', self.open_project))
+        file_menu.addAction(self._action('Save Project', self.save_project))
+        file_menu.addAction(self._action('Save Project As...', self.save_project_as))
         file_menu.addAction(self._action('Set Local Dataset Folder...', self.set_dataset_folder))
         file_menu.addSeparator()
 
@@ -136,6 +143,31 @@ class MainWindow(QMainWindow):
         a.triggered.connect(slot)
         return a
 
+    def _project_display_name(self):
+        if self.project_file:
+            return os.path.splitext(os.path.basename(self.project_file))[0]
+        return 'Untitled'
+
+    def _update_window_title(self):
+        self.setWindowTitle(self._project_display_name())
+
+    def _update_loaded_file_labels(self):
+        if hasattr(self, 'json_label'):
+            if self.json_file and os.path.exists(self.json_file):
+                self.json_label.setText(os.path.basename(self.json_file))
+            elif self.json_file:
+                self.json_label.setText(f"(missing) {os.path.basename(self.json_file)}")
+            else:
+                self.json_label.setText('No JSON loaded')
+
+        if hasattr(self, 'geojson_label'):
+            if self.geojson_file and os.path.exists(self.geojson_file):
+                self.geojson_label.setText(os.path.basename(self.geojson_file))
+            elif self.geojson_file:
+                self.geojson_label.setText(f"(missing) {os.path.basename(self.geojson_file)}")
+            else:
+                self.geojson_label.setText('No GeoJSON loaded')
+
     def new_project(self):
         folder = QFileDialog.getExistingDirectory(self, 'Select Folder to Create Project')
         if folder:
@@ -145,25 +177,109 @@ class MainWindow(QMainWindow):
                 os.makedirs(os.path.join(path, 'data', 'raw'), exist_ok=True)
                 os.makedirs(os.path.join(path, 'data', 'processed'), exist_ok=True)
                 self.project_folder = path
+                self.project_file = None
+                self.dataset_folder = None
+                self.dataset_years = []
+                self.json_file = None
+                self.geojson_file = None
+                self.download_log.clear()
                 QMessageBox.information(self, 'Project Created', f'Project at: {path}')
                 self.ensure_dataset_folder(prompt=False)
+                self._update_loaded_file_labels()
+                self._update_window_title()
 
     def open_project(self):
-        folder = QFileDialog.getExistingDirectory(self, 'Open Project Folder')
-        if folder:
-            self.project_folder = folder
-            QMessageBox.information(self, 'Project Opened', f'Project at: {folder}')
-            self.ensure_dataset_folder(prompt=False)
+        start_dir = self.project_file or os.path.join(self.project_folder or os.getcwd(), 'chronam_project.json')
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            'Open Project File',
+            start_dir,
+            'ChronAM Project (*.chronam.json *.json);;All Files (*)'
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Open Project Failed', f'Unable to load project file:\n{exc}')
+            return
+
+        self.project_file = path
+        self.project_folder = data.get('project_folder') or os.path.dirname(path)
+
+        self.dataset_folder = data.get('dataset_folder')
+        stored_years = data.get('dataset_years', [])
+        self.dataset_years = []
+        if self.dataset_folder and not self._apply_dataset_folder(self.dataset_folder):
+            # keep stored path even if parquet files are missing
+            self.dataset_years = stored_years if isinstance(stored_years, list) else []
+
+        self.json_file = data.get('json_file')
+        self.geojson_file = data.get('geojson_file')
+
+        saved_log = data.get('download_log', [])
+        if isinstance(saved_log, list):
+            self.download_log.clear()
+            self.download_log.extend(saved_log)
+
+        QMessageBox.information(self, 'Project Loaded', f'Loaded project:\n{path}')
+        self._update_loaded_file_labels()
+        self._update_window_title()
+
+    def save_project(self):
+        if not self.project_file:
+            self.save_project_as()
+            return
+        if self._write_project_file(self.project_file):
+            QMessageBox.information(self, 'Project Saved', f'Project saved to:\n{self.project_file}')
+            self._update_window_title()
+
+    def save_project_as(self):
+        start_dir = self.project_file or os.path.join(self.project_folder or os.getcwd(), 'chronam_project.json')
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            'Save Project As',
+            start_dir,
+            'ChronAM Project (*.chronam.json *.json);;All Files (*)'
+        )
+        if not path:
+            return
+        if self._write_project_file(path):
+            self.project_file = path
+            QMessageBox.information(self, 'Project Saved', f'Project saved to:\n{path}')
+            self._update_window_title()
+
+    def _write_project_file(self, path: str) -> bool:
+        data = {
+            'version': 1,
+            'project_folder': self.project_folder,
+            'dataset_folder': self.dataset_folder,
+            'dataset_years': self.dataset_years,
+            'json_file': self.json_file,
+            'geojson_file': self.geojson_file,
+            'download_log': self.download_log,
+        }
+
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Save Project Failed', f'Unable to save project file:\n{exc}')
+            return False
+        return True
 
     def set_dataset_folder(self):
         start_dir = self.dataset_folder or self.project_folder
         folder = QFileDialog.getExistingDirectory(self, 'Select Local Dataset Folder', start_dir)
         if folder:
-            if not self._has_parquet_files(folder):
+            if not self._apply_dataset_folder(folder):
                 QMessageBox.warning(self, 'Dataset Folder Required', DATASET_FOLDER_WARNING)
                 return
-            self.dataset_folder = folder
             QMessageBox.information(self, 'Dataset Folder Set', f'Using dataset folder:\n{folder}')
+            self._update_loaded_file_labels()
+            self._update_window_title()
 
     def _dataset_folder_candidates(self):
         seen = set()
@@ -176,22 +292,35 @@ class MainWindow(QMainWindow):
                 seen.add(path)
                 yield path
 
-    def _has_parquet_files(self, folder: str) -> bool:
+    def _discover_dataset_years(self, folder: str):
         if not folder or not os.path.isdir(folder):
-            return False
+            return []
         try:
-            return any(
-                name.startswith('AmericanStories_') and name.endswith('.parquet')
-                for name in os.listdir(folder)
-            )
+            years = []
+            pattern = re.compile(r"AmericanStories_(\d{4})\.parquet$")
+            for name in os.listdir(folder):
+                match = pattern.match(name)
+                if match:
+                    years.append(int(match.group(1)))
+            return sorted(set(years))
         except OSError:
-            return False
+            return []
+
+    def _apply_dataset_folder(self, folder: str) -> bool:
+        years = self._discover_dataset_years(folder)
+        if years:
+            self.dataset_folder = folder
+            self.dataset_years = years
+            return True
+        return False
 
     def ensure_dataset_folder(self, prompt: bool = True):
+        self.dataset_years = []
         for candidate in self._dataset_folder_candidates():
-            if os.path.isdir(candidate) and self._has_parquet_files(candidate):
-                self.dataset_folder = candidate
-                return candidate
+            if self._apply_dataset_folder(candidate):
+                return self.dataset_folder
+
+        self.dataset_folder = None
 
         if not prompt:
             return None
@@ -202,9 +331,8 @@ class MainWindow(QMainWindow):
             DATASET_FOLDER_WARNING
         )
         folder = QFileDialog.getExistingDirectory(self, 'Select Local Dataset Folder', self.project_folder)
-        if folder and self._has_parquet_files(folder):
-            self.dataset_folder = folder
-            return folder
+        if folder and self._apply_dataset_folder(folder):
+            return self.dataset_folder
         if folder:
             QMessageBox.warning(self, 'Dataset Folder Required', DATASET_FOLDER_WARNING)
         return None
@@ -312,6 +440,10 @@ class DownloadDialog(QDialog):
         dataset_row.addWidget(self.dataset_change_btn, 0)
         layout.addLayout(dataset_row)
 
+        self.dataset_years_label = QLabel()
+        self.dataset_years_label.setWordWrap(True)
+        layout.addWidget(self.dataset_years_label)
+
         self.spinner = Spinner(self)
         self.spinner.hide()
         layout.addWidget(self.spinner, alignment=Qt.AlignCenter)
@@ -358,6 +490,8 @@ class DownloadDialog(QDialog):
         self._cancel_requested = False
         self._year_timer = None
 
+        self._log_history = getattr(parent, 'download_log', [])
+        self._restore_log_history()
         self.refresh_dataset_label()
 
     def showEvent(self, event):
@@ -366,44 +500,86 @@ class DownloadDialog(QDialog):
 
     def refresh_dataset_label(self):
         folder = getattr(self.parent(), 'dataset_folder', None)
-        if folder and os.path.isdir(folder):
-            if self.parent()._has_parquet_files(folder):
-                text = f"Dataset folder: {folder}"
-            else:
-                text = f"Dataset folder: {folder} (no AmericanStories parquet files found)"
+        years = getattr(self.parent(), 'dataset_years', [])
+        if folder and os.path.isdir(folder) and years:
+            folder_text = f"Dataset folder: {folder}"
+        elif folder and os.path.isdir(folder):
+            folder_text = f"Dataset folder: {folder} (no AmericanStories parquet files found)"
         else:
-            text = "Dataset folder: Not set"
-        self.dataset_label.setText(text)
+            folder_text = "Dataset folder: Not set"
+        self.dataset_label.setText(folder_text)
         self.dataset_change_btn.setEnabled(True)
+        self.dataset_years_label.setText(self._format_year_summary(years))
 
     def _change_dataset_folder(self):
         start_dir = getattr(self.parent(), 'dataset_folder', None) or self.parent().project_folder
         folder = QFileDialog.getExistingDirectory(self, 'Select Local Dataset Folder', start_dir)
         if folder:
-            if not self.parent()._has_parquet_files(folder):
+            if not self.parent()._apply_dataset_folder(folder):
                 QMessageBox.warning(self, 'Dataset Folder Required', DATASET_FOLDER_WARNING)
-                return
-            self.parent().dataset_folder = folder
-            self.refresh_dataset_label()
+            else:
+                self.refresh_dataset_label()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.ActiveWindowFocusReason)
 
     def _ensure_log_visible(self):
         self.log.moveCursor(QTextCursor.End)
         self.log.ensureCursorVisible()
 
+    def _restore_log_history(self):
+        self.log.clear()
+        for entry in self._log_history:
+            self.log.append(entry)
+        if self._log_history:
+            self._ensure_log_visible()
+
+    def _append_log_html(self, html: str):
+        self.log.append(html)
+        self._log_history.append(html)
+        self._ensure_log_visible()
+
+    @staticmethod
+    def _format_year_summary(years):
+        if not years:
+            return "Years available: none"
+
+        parts = []
+        start = prev = years[0]
+        for y in years[1:]:
+            if y == prev + 1:
+                prev = y
+                continue
+            parts.append((start, prev))
+            start = prev = y
+        parts.append((start, prev))
+
+        text_parts = []
+        for start, end in parts:
+            if start == end:
+                text_parts.append(str(start))
+            else:
+                text_parts.append(f"{start}-{end}")
+        return "Years available: " + ", ".join(text_parts)
+
     def _log_plain(self, text: str):
         safe = html.escape(text)
-        self.log.append(f"<span>{safe}</span>")
-        self._ensure_log_visible()
+        self._append_log_html(f"<span>{safe}</span>")
+
+    def _log_blank(self):
+        self._append_log_html('')
+
+    def _log_separator(self):
+        self._append_log_html('<hr/>')
 
     def _log_link(self, prefix: str, path: str, elapsed: float):
         encoded = urllib.parse.quote(path)
         safe_prefix = html.escape(prefix)
         safe_path = html.escape(path)
-        self.log.append(
+        self._append_log_html(
             f"<span>{safe_prefix} {elapsed:.1f}s — saved to "
             f"<a href=\"chronam-open:{encoded}\">{safe_path}</a></span>"
         )
-        self._ensure_log_visible()
 
     def _set_running_state(self, running: bool):
         self._search_running = running
@@ -477,8 +653,7 @@ class DownloadDialog(QDialog):
                 return
 
         if self.log.toPlainText().strip():
-            self.log.append('')
-            self._ensure_log_visible()
+            self._log_blank()
 
         header = f'Searching for "{term}" between {start} and {end}'
         self._log_plain(header)
@@ -508,7 +683,7 @@ class DownloadDialog(QDialog):
     def update_progress(self, count: int):
         now = time.time()
         elapsed = now - self._start_time
-        year_str = ""
+        year_value = None
         year_elapsed = None
 
         def parquet_dir_candidates():
@@ -542,46 +717,48 @@ class DownloadDialog(QDialog):
             lo, hi = sorted((start_year, end_year))
             year_range = [str(y) for y in range(lo, hi + 1)]
 
-        if count > 0:
-            seen_dirs = set()
+        seen_dirs = set()
 
-            for directory in parquet_dir_candidates():
-                if not directory or directory in seen_dirs:
-                    continue
-                seen_dirs.add(directory)
-                if not os.path.isdir(directory):
-                    continue
+        for directory in parquet_dir_candidates():
+            if not directory or directory in seen_dirs:
+                continue
+            seen_dirs.add(directory)
+            if not os.path.isdir(directory):
+                continue
 
-                try:
-                    files = [f for f in os.listdir(directory) if f.endswith('.parquet')]
-                except OSError:
-                    continue
+            try:
+                files = [f for f in os.listdir(directory) if f.endswith('.parquet')]
+            except OSError:
+                continue
 
-                year_map = {}
-                for file in files:
-                    match = year_pattern.fullmatch(file)
-                    if match:
-                        year_map[match.group(1)] = file
+            year_map = {}
+            for file in files:
+                match = year_pattern.fullmatch(file)
+                if match:
+                    year_map[match.group(1)] = file
 
-                for target_year in year_range or sorted(year_map.keys()):
-                    if target_year in year_map and target_year not in self.logged_years:
-                        self.logged_years.add(target_year)
-                        year_str = f" (in year: {target_year})"
-                        if self._year_timer is None:
-                            self._year_timer = now
-                        year_elapsed = max(0.0, now - self._year_timer)
+            for target_year in year_range or sorted(year_map.keys()):
+                if target_year in year_map and target_year not in self.logged_years:
+                    self.logged_years.add(target_year)
+                    year_value = target_year
+                    if self._year_timer is None:
                         self._year_timer = now
-                        break
-
-                if year_str:
+                    year_elapsed = max(0.0, now - self._year_timer)
+                    self._year_timer = now
                     break
 
+            if year_value is not None:
+                break
+
         self.progress.setValue(count)
-        if year_elapsed is not None:
-            time_note = f"year time {year_elapsed:.1f}s"
+        if year_value is not None:
+            if year_elapsed is None:
+                year_elapsed = max(0.0, now - (self._year_timer or now))
+            self._log_plain(
+                f"Found {count:,} articles in year {year_value} - search time {year_elapsed:.1f}s"
+            )
         else:
-            time_note = f"elapsed {elapsed:.1f}s"
-        self._log_plain(f"Found {count:,} articles{year_str} — {time_note}")
+            self._log_plain(f"Found {count:,} articles — elapsed {elapsed:.1f}s")
 
 
 
@@ -617,6 +794,8 @@ class DownloadDialog(QDialog):
             self._cancel_requested = False
             return
 
+        self._log_separator()
+
         # Automatically load the last downloaded JSON
         last_json = result[-1] if result else None
         if last_json:
@@ -624,11 +803,32 @@ class DownloadDialog(QDialog):
             p.json_file = last_json
             p.json_label.setText(os.path.basename(last_json))
 
+        total_articles = 0
+        total_years = len(self.logged_years)
+        for path in result:
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+                if isinstance(payload, dict):
+                    count = payload.get('match_count')
+                    if count is None:
+                        articles = payload.get('articles')
+                        count = len(articles) if isinstance(articles, list) else 0
+                    total_articles += int(count)
+            except Exception:
+                continue
+
         if result:
+            summary = f"Found {total_articles:,} articles across {total_years} year" + ("s" if total_years != 1 else "")
+            summary += f" and finished in {elapsed:.1f}s"
+            self._log_plain(summary)
             for path in result:
-                self._log_link('Finished in', path, elapsed)
+                self._log_link('Saved to', path, elapsed)
         else:
-            self._log_plain(f"Finished in {elapsed:.1f}s — no records saved")
+            summary = f"Found 0 articles across {total_years} year" + ("s" if total_years != 1 else "")
+            summary += f" and finished in {elapsed:.1f}s"
+            self._log_plain(summary)
+            self._log_plain('No JSON created.')
 
         self._cancel_event.clear()
         self._cancel_requested = False
