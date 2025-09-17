@@ -1,5 +1,10 @@
 # chronAm
-Chronicling America Text Mining Tool
+Chronicling America Text Mining and Visualization Tool
+
+This tool uses a local dataset of the of the Chronicling America historical newspapers.
+
+## Sources
+The newspaper files are from AmericanStories (https://huggingface.co/datasets/dell-research-harvard/AmericanStories) Update (3/25/2025). The json files have been converted to parquet for efficient storage and searching. The local parquet files are different from the American Stories parquet files available on huggingface (https://huggingface.co/datasets/davanstrien/AmericanStories-parquet), which were based on version 1 of the AmericanStories dataset.
 
 ## Download Parquet Files
 1. Download the newspaper articles stored as parquet files here: https://emailsc-my.sharepoint.com/:u:/r/personal/w_kennedy_sc_edu/Documents/data_tx/AmericanStories_1910.parquet?csf=1&web=1&e=5deX4n
