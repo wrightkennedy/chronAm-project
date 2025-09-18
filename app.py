@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QProgressBar, QMessageBox, QCheckBox, QFormLayout, QInputDialog, QDialog, QTextBrowser, QComboBox,
     QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup, QDockWidget
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, pyqtProperty, QUrl
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, pyqtProperty, QUrl, QObject, QEvent
 from PyQt5.QtGui import QPainter, QPen, QIntValidator, QTextCursor, QKeySequence
 
 from chronam import download_data
@@ -96,6 +96,18 @@ class WorkerThread(QThread):
         except Exception as e:
             self.finished.emit(e)
 
+class CloseShortcutFilter(QObject):
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_W:
+            modifiers = event.modifiers()
+            if modifiers & (Qt.ControlModifier | Qt.MetaModifier):
+                window = QApplication.activeWindow()
+                if window is not None and hasattr(window, 'close'):
+                    window.close()
+                    return True
+        return super().eventFilter(obj, event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -112,6 +124,8 @@ class MainWindow(QMainWindow):
         self.project_log_entries = []
         self.project_file = None
         self.init_ui()
+        self._close_filter = CloseShortcutFilter()
+        QApplication.instance().installEventFilter(self._close_filter)
         self._update_window_title()
 
     def init_ui(self):
@@ -181,6 +195,7 @@ class MainWindow(QMainWindow):
         a = QAction(name, self)
         a.triggered.connect(slot)
         return a
+
 
     def _init_project_log(self):
         self.project_log_browser = QTextBrowser()
@@ -335,7 +350,6 @@ class MainWindow(QMainWindow):
         has_json = bool(self.json_file and os.path.exists(self.json_file))
         has_geo = bool(self.geojson_file and os.path.exists(self.geojson_file))
 
-        blue_style = "background-color: #1a73e8; color: white;"
         buttons = {
             'download': getattr(self, 'btn_download', None),
             'load_json': getattr(self, 'load_json_btn', None),
@@ -345,25 +359,37 @@ class MainWindow(QMainWindow):
             'map': getattr(self, 'btn_map', None),
         }
 
-        for btn in buttons.values():
-            if btn is not None:
+        highlight_states = {
+            buttons['download']: not has_json and not has_geo,
+            buttons['load_json']: not has_json and not has_geo,
+            buttons['load_geo']: not has_json and not has_geo,
+            buttons['update']: has_json and not has_geo,
+            buttons['collocate']: (has_json and not has_geo) or has_geo,
+            buttons['map']: has_geo,
+        }
+
+        for btn, highlight in highlight_states.items():
+            if btn is None:
+                continue
+            if highlight:
+                btn.setStyleSheet(self._search_tool_highlight_style())
+            else:
                 btn.setStyleSheet('')
 
-        if not has_json and not has_geo:
-            for key in ('download', 'load_json', 'load_geo'):
-                btn = buttons.get(key)
-                if btn is not None:
-                    btn.setStyleSheet(blue_style)
-        elif has_json and not has_geo:
-            for key in ('update', 'collocate'):
-                btn = buttons.get(key)
-                if btn is not None:
-                    btn.setStyleSheet(blue_style)
-        elif has_geo:
-            for key in ('collocate', 'map'):
-                btn = buttons.get(key)
-                if btn is not None:
-                    btn.setStyleSheet(blue_style)
+    @staticmethod
+    def _search_tool_highlight_style() -> str:
+        return (
+            "QPushButton {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2b8cff, stop:1 #0066ff);"
+            " color: #ffffff;"
+            " border: 1px solid #0060e0;"
+            " border-radius: 8px;"
+            "}"
+            "QPushButton:pressed {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1e7af2, stop:1 #0051cc);"
+            " border: 1px solid #004bbd;"
+            "}"
+        )
 
     def new_project(self):
         path, _ = QFileDialog.getSaveFileName(
