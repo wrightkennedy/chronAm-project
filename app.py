@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup, QDockWidget
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, pyqtProperty, QUrl
-from PyQt5.QtGui import QPainter, QPen, QIntValidator, QTextCursor
+from PyQt5.QtGui import QPainter, QPen, QIntValidator, QTextCursor, QKeySequence
 
 from chronam import download_data
 from chronam.map_create import create_map
@@ -101,12 +101,13 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._base_title = 'Untitled'
         self.setWindowTitle(self._base_title)
-        self.resize(500, 300)
+        self.resize(900, 600)
         self.project_folder = os.getcwd()
         self.dataset_folder = None
         self.dataset_years = []
         self.json_file = None
         self.geojson_file = None
+        self.locations_csv_path = None
         self.search_log_history = []
         self.project_log_entries = []
         self.project_file = None
@@ -116,13 +117,28 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         menubar = self.menuBar()
         file_menu = menubar.addMenu('File')
-        file_menu.addAction(self._action('New Project', self.new_project))
-        file_menu.addAction(self._action('Open Project', self.open_project))
-        file_menu.addAction(self._action('Save Project', self.save_project))
+        new_project_action = self._action('New Project', self.new_project)
+        file_menu.addAction(new_project_action)
+
+        open_project_action = self._action('Open Project', self.open_project)
+        open_project_action.setShortcut(QKeySequence.Open)
+        file_menu.addAction(open_project_action)
+
+        save_project_action = self._action('Save Project', self.save_project)
+        save_project_action.setShortcut(QKeySequence.Save)
+        file_menu.addAction(save_project_action)
+
         file_menu.addAction(self._action('Save Project As...', self.save_project_as))
+
+        quit_action = self._action('Quit', self._handle_quit_request)
+        quit_action.setMenuRole(QAction.NoRole)
+        quit_action.setShortcut(QKeySequence.Quit)
+        file_menu.addAction(quit_action)
 
         sources_menu = menubar.addMenu('Sources')
         sources_menu.addAction(self._action('Set Local Dataset Folder...', self.set_dataset_folder))
+        sources_menu.addAction(self._action('Set Newspaper Locations Table...', self.set_locations_table))
+        sources_menu.addAction(self._action('Open Project Folder in Finder', self.open_project_folder))
 
         view_menu = menubar.addMenu('View')
         view_menu.addAction(self._action('Project Log', self.show_project_log))
@@ -147,18 +163,19 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(QLabel("Select an action below:"))
 
-        btn_download = QPushButton('A) Search Dataset')
-        btn_download.clicked.connect(self.action_download)
-        btn_update = QPushButton('B) Add Geographic Info')
-        btn_update.clicked.connect(self.action_update_locations)
-        btn_collocate = QPushButton('C) Run Collocation Analysis')
-        btn_collocate.clicked.connect(self.action_collocate)
-        btn_map = QPushButton('D) Create Map')
-        btn_map.clicked.connect(self.action_create_map)
-        for btn in (btn_download, btn_update, btn_collocate, btn_map):
+        self.btn_download = QPushButton('A) Search Dataset')
+        self.btn_download.clicked.connect(self.action_download)
+        self.btn_update = QPushButton('B) Add Geographic Info')
+        self.btn_update.clicked.connect(self.action_update_locations)
+        self.btn_collocate = QPushButton('C) Run Collocation Analysis')
+        self.btn_collocate.clicked.connect(self.action_collocate)
+        self.btn_map = QPushButton('D) Create Map')
+        self.btn_map.clicked.connect(self.action_create_map)
+        for btn in (self.btn_download, self.btn_update, self.btn_collocate, self.btn_map):
             main_layout.addWidget(btn)
 
         self._init_project_log()
+        self._update_primary_button_styles()
 
     def _action(self, name, slot):
         a = QAction(name, self)
@@ -198,6 +215,62 @@ class MainWindow(QMainWindow):
         for entry in self.project_log_entries:
             self.project_log_browser.append(entry)
         self.project_log_browser.moveCursor(QTextCursor.End)
+
+    def _handle_quit_request(self):
+        self.close()
+
+    def closeEvent(self, event):
+        if self._confirm_quit():
+            event.accept()
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
+    def _confirm_quit(self) -> bool:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Question)
+        dialog.setWindowTitle('Quit ChronAM Project')
+        dialog.setText('Are you sure you want to quit?')
+        save_button = dialog.addButton('Save and Quit', QMessageBox.AcceptRole)
+        quit_button = dialog.addButton('Quit without Saving', QMessageBox.DestructiveRole)
+        cancel_button = dialog.addButton(QMessageBox.Cancel)
+        if self.project_file:
+            dialog.setDefaultButton(save_button)
+        else:
+            dialog.setDefaultButton(quit_button)
+        dialog.exec_()
+        clicked = dialog.clickedButton()
+        if clicked == cancel_button:
+            return False
+        if clicked == save_button:
+            had_project_path = bool(self.project_file)
+            self.save_project()
+            if not had_project_path and not self.project_file:
+                return False
+            return True
+        return True
+
+    def set_locations_table(self):
+        start_dir = self.locations_csv_path or os.path.join(self.project_folder, 'data')
+        if not (start_dir and os.path.isdir(start_dir)):
+            start_dir = self.project_folder or os.getcwd()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            'Select Newspaper Locations CSV',
+            start_dir,
+            'CSV Files (*.csv)'
+        )
+        if not path:
+            return
+        self.locations_csv_path = path
+        self.append_project_log('Sources', [f'<div>Locations CSV set to: {html.escape(path)}</div>'])
+
+    def open_project_folder(self):
+        folder = self.project_folder
+        if not (folder and os.path.isdir(folder)):
+            QMessageBox.warning(self, 'Project Folder Missing', 'Project folder is not available to open.')
+            return
+        reveal_in_file_manager(folder)
 
     def append_project_log(self, tool_name: str, html_lines: list):
         if not html_lines:
@@ -256,6 +329,42 @@ class MainWindow(QMainWindow):
             else:
                 self.geojson_label.setText('No GeoJSON loaded')
 
+        self._update_primary_button_styles()
+
+    def _update_primary_button_styles(self):
+        has_json = bool(self.json_file and os.path.exists(self.json_file))
+        has_geo = bool(self.geojson_file and os.path.exists(self.geojson_file))
+
+        blue_style = "background-color: #1a73e8; color: white;"
+        buttons = {
+            'download': getattr(self, 'btn_download', None),
+            'load_json': getattr(self, 'load_json_btn', None),
+            'load_geo': getattr(self, 'load_geojson_btn', None),
+            'update': getattr(self, 'btn_update', None),
+            'collocate': getattr(self, 'btn_collocate', None),
+            'map': getattr(self, 'btn_map', None),
+        }
+
+        for btn in buttons.values():
+            if btn is not None:
+                btn.setStyleSheet('')
+
+        if not has_json and not has_geo:
+            for key in ('download', 'load_json', 'load_geo'):
+                btn = buttons.get(key)
+                if btn is not None:
+                    btn.setStyleSheet(blue_style)
+        elif has_json and not has_geo:
+            for key in ('update', 'collocate'):
+                btn = buttons.get(key)
+                if btn is not None:
+                    btn.setStyleSheet(blue_style)
+        elif has_geo:
+            for key in ('collocate', 'map'):
+                btn = buttons.get(key)
+                if btn is not None:
+                    btn.setStyleSheet(blue_style)
+
     def new_project(self):
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -277,6 +386,7 @@ class MainWindow(QMainWindow):
         self.dataset_years = []
         self.json_file = None
         self.geojson_file = None
+        self.locations_csv_path = None
         self.search_log_history.clear()
         self.project_log_entries.clear()
 
@@ -318,6 +428,8 @@ class MainWindow(QMainWindow):
 
         self.json_file = data.get('json_file')
         self.geojson_file = data.get('geojson_file')
+        locations_csv = data.get('locations_csv_path')
+        self.locations_csv_path = locations_csv if isinstance(locations_csv, str) else None
 
         search_log = data.get('search_log_history')
         if search_log is None:
@@ -371,6 +483,7 @@ class MainWindow(QMainWindow):
             'dataset_years': self.dataset_years,
             'json_file': self.json_file,
             'geojson_file': self.geojson_file,
+            'locations_csv_path': self.locations_csv_path,
             'search_log_history': self.search_log_history,
             'project_log': self.project_log_entries,
         }
@@ -452,16 +565,22 @@ class MainWindow(QMainWindow):
         return None
 
     def open_json_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, 'Load JSON File', '', 'JSON Files (*.json)')
+        start_dir = os.path.join(self.project_folder, 'data', 'raw') if self.project_folder else ''
+        if not (start_dir and os.path.isdir(start_dir)):
+            start_dir = self.project_folder or ''
+        file_path, _ = QFileDialog.getOpenFileName(self, 'Load JSON File', start_dir, 'JSON Files (*.json)')
         if file_path:
             self.json_file = file_path
-            self.json_label.setText(os.path.basename(file_path))
+            self._update_loaded_file_labels()
 
     def open_geojson_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, 'Load GeoJSON File', '', 'GeoJSON Files (*.geojson *.json)')
+        start_dir = os.path.join(self.project_folder, 'data', 'processed') if self.project_folder else ''
+        if not (start_dir and os.path.isdir(start_dir)):
+            start_dir = self.project_folder or ''
+        file_path, _ = QFileDialog.getOpenFileName(self, 'Load GeoJSON File', start_dir, 'GeoJSON Files (*.geojson *.json)')
         if file_path:
             self.geojson_file = file_path
-            self.geojson_label.setText(os.path.basename(file_path))
+            self._update_loaded_file_labels()
 
     def action_download(self):
         dlg = DownloadDialog(self)
@@ -921,7 +1040,7 @@ class DownloadDialog(QDialog):
         if last_json:
             p = self.parent()
             p.json_file = last_json
-            p.json_label.setText(os.path.basename(last_json))
+            p._update_loaded_file_labels()
 
         total_articles = 0
         total_years = len(self.logged_years)
@@ -964,6 +1083,8 @@ class UpdateLocationsDialog(QDialog):
 
         form = QFormLayout()
 
+        self._csv_hint_shown = False
+
         # JSON selection
         self.json_path = getattr(parent, 'json_file', None)
         self.json_label = QLabel(self._display_name(self.json_path))
@@ -977,7 +1098,8 @@ class UpdateLocationsDialog(QDialog):
         # CSV selection
         self.csv_path = self._default_csv_path()
         if not (self.csv_path and os.path.exists(self.csv_path)):
-            self.csv_path = self.prompt_csv()
+            self.csv_path = self.prompt_csv(show_hint=True)
+        self._store_selected_csv(self.csv_path)
 
         self.csv_label = QLabel(self._display_name(self.csv_path))
         csv_row = QHBoxLayout()
@@ -1020,6 +1142,9 @@ class UpdateLocationsDialog(QDialog):
     def _default_csv_path(self) -> Optional[str]:
         parent = self.parent()
         candidates = []
+        explicit = getattr(parent, 'locations_csv_path', None)
+        if explicit:
+            candidates.append(explicit)
         dataset = getattr(parent, 'dataset_folder', None)
         if dataset:
             candidates.append(os.path.join(os.path.dirname(dataset), 'ChronAm_newspapers_XY.csv'))
@@ -1027,19 +1152,40 @@ class UpdateLocationsDialog(QDialog):
         for cand in candidates:
             if cand and os.path.exists(cand):
                 return cand
-        return None
+        return candidates[0] if candidates else None
 
-    def prompt_csv(self) -> Optional[str]:
-        start = self.parent().project_folder
-        path, _ = QFileDialog.getOpenFileName(self, 'Select Locations CSV', start, 'CSV Files (*.csv)')
+    def prompt_csv(self, show_hint: bool = False) -> Optional[str]:
+        parent = self.parent()
+        if show_hint and not self._csv_hint_shown:
+            QMessageBox.information(
+                self,
+                'Locate Locations CSV',
+                'Locate the newspaper locations table named "ChronAm_newspapers_XY.csv".'
+            )
+            self._csv_hint_shown = True
+        start = parent.project_folder if parent else os.getcwd()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            'Select Locations CSV (ChronAm_newspapers_XY.csv)',
+            start,
+            'CSV Files (*.csv)'
+        )
         return path
 
     def change_csv(self):
-        path = self.prompt_csv()
+        path = self.prompt_csv(show_hint=True)
         if not path:
             return
         self.csv_path = path
         self.csv_label.setText(self._display_name(path))
+        self._store_selected_csv(path)
+
+    def _store_selected_csv(self, path: Optional[str]):
+        if not (path and os.path.exists(path)):
+            return
+        parent = self.parent()
+        if parent is not None:
+            parent.locations_csv_path = path
 
     def perform_merge(self):
         parent = self.parent()
@@ -1081,7 +1227,7 @@ class UpdateLocationsDialog(QDialog):
             if out_paths:
                 last_geo = out_paths[-1]
                 parent.geojson_file = last_geo
-                parent.geojson_label.setText(os.path.basename(last_geo))
+                parent._update_loaded_file_labels()
             self._log_merge_stats(out_paths)
             self.accept()
             if parent:
@@ -1262,14 +1408,14 @@ class CollocationDialog(QDialog):
             p, _ = QFileDialog.getOpenFileName(self, 'Select GeoJSON File', parent.project_folder, 'GeoJSON Files (*.geojson *.json)')
             if p:
                 parent.geojson_file = p
-                parent.geojson_label.setText(os.path.basename(p))
+                parent._update_loaded_file_labels()
                 # Update city/state lists for new GeoJSON
                 self.populate_city_state()
         else:
             p, _ = QFileDialog.getOpenFileName(self, 'Select JSON Results', parent.project_folder, 'JSON Files (*.json)')
             if p:
                 parent.json_file = p
-                parent.json_label.setText(os.path.basename(p))
+                parent._update_loaded_file_labels()
         # Update source label text
         self.source_label.setText(self._source_text())
 
@@ -1402,7 +1548,7 @@ class CollocationDialog(QDialog):
                 if out_geo:
                     parent = self.parent()
                     parent.geojson_file = out_geo
-                    parent.geojson_label.setText(os.path.basename(out_geo))
+                    parent._update_loaded_file_labels()
                 # Optionally reveal the output file in OS file explorer
                 try:
                     if sys.platform == "darwin":
