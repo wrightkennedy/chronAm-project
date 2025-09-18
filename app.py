@@ -208,12 +208,27 @@ class MainWindow(QMainWindow):
             '<hr/><hr/>',
             f'<div><strong>{header}</strong> — {timestamp}</div>'
         ]
-        entry_parts.extend(html_lines)
+        entry_parts.extend(self._format_project_log_lines(html_lines))
         entry_html = ''.join(entry_parts)
         self.project_log_entries.append(entry_html)
         if hasattr(self, 'project_log_browser'):
             self.project_log_browser.append(entry_html)
             self.project_log_browser.moveCursor(QTextCursor.End)
+
+    def _format_project_log_lines(self, html_lines: list) -> list:
+        formatted = []
+        for raw in html_lines:
+            if raw is None:
+                continue
+            raw = str(raw)
+            stripped = raw.strip()
+            if not stripped:
+                formatted.append('<br/>')
+            elif stripped.startswith('<div') or stripped.startswith('<hr') or stripped.startswith('<br'):
+                formatted.append(raw)
+            else:
+                formatted.append(f'<div>{raw}</div>')
+        return formatted
 
 
     def _project_display_name(self):
@@ -674,14 +689,23 @@ class DownloadDialog(QDialog):
     def _log_separator(self):
         self._append_log_html('<hr/>')
 
-    def _log_link(self, prefix: str, path: str, elapsed: float):
+    def _log_link(self, prefix: str, path: str, elapsed: Optional[float] = None):
         encoded = urllib.parse.quote(path)
         safe_prefix = html.escape(prefix)
         safe_path = html.escape(path)
-        self._append_log_html(
-            f"<span>{safe_prefix} {elapsed:.1f}s — saved to "
-            f"<a href=\"chronam-open:{encoded}\">{safe_path}</a></span>"
-        )
+        if elapsed is not None:
+            message = (
+                f"<span>{safe_prefix} {elapsed:.1f}s — saved to "
+                f"<a href=\"chronam-open:{encoded}\">{safe_path}</a></span>"
+            )
+        elif safe_prefix:
+            message = (
+                f"<span>{safe_prefix}: "
+                f"<a href=\"chronam-open:{encoded}\">{safe_path}</a></span>"
+            )
+        else:
+            message = f"<span><a href=\"chronam-open:{encoded}\">{safe_path}</a></span>"
+        self._append_log_html(message)
 
     def _finalize_project_log(self, tool_name='Search Dataset'):
         if getattr(self, '_current_run_lines', None):
@@ -919,7 +943,7 @@ class DownloadDialog(QDialog):
             summary += f" and finished in {elapsed:.1f}s"
             self._log_plain(summary)
             for path in result:
-                self._log_link('Saved to', path, elapsed)
+                self._log_link('Saved to', path)
         else:
             summary = f"Found 0 articles across {total_years} year" + ("s" if total_years != 1 else "")
             summary += f" and finished in {elapsed:.1f}s"
@@ -969,7 +993,7 @@ class UpdateLocationsDialog(QDialog):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        self.merge_btn = QPushButton('Merge to GeoJSON')
+        self.merge_btn = QPushButton('Create GeoJSON')
         self.merge_btn.clicked.connect(self.perform_merge)
         btn_row.addWidget(self.merge_btn)
         close_btn = QPushButton('Close')
@@ -1059,6 +1083,12 @@ class UpdateLocationsDialog(QDialog):
                 parent.geojson_file = last_geo
                 parent.geojson_label.setText(os.path.basename(last_geo))
             self._log_merge_stats(out_paths)
+            self.accept()
+            if parent:
+                if hasattr(parent, 'raise_'):
+                    parent.raise_()
+                if hasattr(parent, 'activateWindow'):
+                    parent.activateWindow()
         except Exception as exc:
             QMessageBox.critical(self, 'Error', str(exc))
 
@@ -1088,7 +1118,7 @@ class UpdateLocationsDialog(QDialog):
         if not lines:
             lines.append('<div>No GeoJSON files created.</div>')
 
-        summary = f'<div>Merged {len(places_all)} places to {total_articles} articles.</div>'
+        summary = f'<div>Joined {len(places_all):,} places to {total_articles:,} articles.</div>'
         parent.append_project_log('Add Geographic Info', [summary] + lines)
 
 class CSVPreviewDialog(QDialog):
