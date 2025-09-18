@@ -2,8 +2,9 @@ import html
 import json
 import os
 import re
+import uuid
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Callable
 
 import folium
 from folium import Html, Popup
@@ -62,7 +63,32 @@ def _esc(value: Any) -> str:
     return html.escape(str(value))
 
 
-def _keyword_snippet(text: Any, term: Any, window_chars: int = 30) -> str:
+def _sanitize_element_id(raw: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", raw or "")
+    safe = safe.strip("_")
+    if not safe:
+        safe = f"id_{uuid.uuid4().hex}"
+    return safe
+
+
+def _highlight_term(text: str, term: Optional[str]) -> str:
+    if not text:
+        return ""
+    term_str = (term or "").strip()
+    if not term_str:
+        return _esc(text)
+    pattern = re.compile(re.escape(term_str), re.IGNORECASE)
+    parts = []
+    last = 0
+    for match in pattern.finditer(text):
+        parts.append(_esc(text[last:match.start()]))
+        parts.append(f"<mark>{_esc(match.group(0))}</mark>")
+        last = match.end()
+    parts.append(_esc(text[last:]))
+    return ''.join(parts)
+
+
+def _keyword_snippet(text: Any, term: Any, window_chars: int = 60) -> str:
     """Return +-window_chars characters surrounding the keyword if present."""
     if not text or not term:
         return ""
@@ -75,11 +101,102 @@ def _keyword_snippet(text: Any, term: Any, window_chars: int = 30) -> str:
         return ""
     start_idx = max(0, match.start() - window_chars)
     end_idx = min(len(text_str), match.end() + window_chars)
-    snippet = text_str[start_idx:end_idx].strip()
-    snippet = re.sub(r"\s+", " ", snippet)
-    prefix = "…" if start_idx > 0 else ""
-    suffix = "…" if end_idx < len(text_str) else ""
-    return f"{prefix}{snippet}{suffix}"
+    snippet_core = text_str[start_idx:end_idx].strip()
+    snippet_core = re.sub(r"\s+", " ", snippet_core)
+    if not snippet_core:
+        return ""
+    snippet = snippet_core
+    if start_idx > 0:
+        snippet = '…' + snippet
+    if end_idx < len(text_str):
+        snippet = snippet + '…'
+    return _highlight_term(snippet, term_str)
+
+
+def _article_excerpt(text: Any, term: Any, max_chars: int = 600) -> str:
+    if not text:
+        return ""
+    term_str = str(term).strip() if term else ""
+    text_str = re.sub(r"\s+", " ", str(text)).strip()
+    if max_chars and len(text_str) > max_chars:
+        text_str = text_str[:max_chars].rstrip() + '…'
+    return _highlight_term(text_str, term_str)
+
+
+def _count_term_occurrences(text: Any, term: Optional[str]) -> int:
+    if not text or not term:
+        return 0
+    term_str = term.strip()
+    if not term_str:
+        return 0
+    return len(re.findall(re.escape(term_str), str(text), re.IGNORECASE))
+
+
+def _word_count(text: Any) -> int:
+    if not text:
+        return 0
+    return len(re.findall(r"\b\w+\b", str(text)))
+
+
+def _compute_group_stats(entries: List[Dict[str, Any]], search_term: Optional[str]) -> Dict[str, float]:
+    stats = {
+        'article_count': len(entries),
+        'page_count': 0,
+        'key_term_frequency': 0,
+        'word_count': 0,
+    }
+    pages = set()
+    term = (search_term or '').strip() or None
+    for entry in entries:
+        props = entry.get('props') or {}
+        page = props.get('page')
+        if page:
+            pages.add(str(page))
+        article_text = props.get('article') or ''
+        stats['word_count'] += _word_count(article_text)
+        if term:
+            stats['key_term_frequency'] += _count_term_occurrences(article_text, term)
+    stats['page_count'] = len(pages) if pages else len(entries)
+    return stats
+
+
+def _compute_group_value(stats: Dict[str, float], metric: str, normalize: bool, denominator: Optional[str]) -> float:
+    value = float(stats.get(metric, 0))
+    if normalize and denominator:
+        denom_value = float(stats.get(denominator, 0))
+        if denom_value <= 0:
+            return 0.0
+        value = value / denom_value
+    return max(value, 0.0)
+
+
+def _detect_search_term(geojson_path: str, data: Dict[str, Any]) -> str:
+    meta = data.get('metadata') or {}
+    for key in ('search_term', 'SearchTerm', 'term', 'Term'):
+        val = meta.get(key)
+        if val:
+            return str(val)
+
+    for feat in data.get('features', []) or []:
+        props = feat.get('properties') or {}
+        for key in ('search_term', 'SearchTerm', 'term', 'Term'):
+            val = props.get(key)
+            if val:
+                return str(val)
+
+    base = os.path.basename(geojson_path or '')
+    name, _ = os.path.splitext(base)
+    ignore = {'occurrences', 'merged', 'heatmap', 'points', 'graduated', 'attributes', 'create', 'map'}
+    for token in name.split('_'):
+        if not token:
+            continue
+        lowered = token.lower()
+        if lowered in ignore:
+            continue
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", token):
+            continue
+        return token
+    return ''
 
 
 def _unit_to_keyword(unit: str) -> str:
@@ -171,41 +288,64 @@ def _extract_points(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _popup_html(props: Dict[str, Any]) -> str:
-    city = (props.get("City") or "").strip()
-    state = (props.get("State") or "").strip()
-    newspaper = (props.get("newspaper_name") or props.get("Title") or "").strip()
-    date_str = _format_date_str(props.get("date") or "")
-    first_line = _first_line_excerpt(props.get("article") or "", 75)
-    search_term = (
-        props.get("search_term")
-        or props.get("SearchTerm")
-        or props.get("term")
-        or props.get("Term")
-    )
-    snippet = _keyword_snippet(props.get("article"), search_term)
+def _popup_html(props: Dict[str, Any], search_term: Optional[str], popup_id: str) -> str:
+    summary = _first_line_excerpt(props.get("article") or "", 120)
+    snippet_html = _keyword_snippet(props.get("article"), search_term)
     url = (props.get("url") or "").strip()
     pdf_url = url.replace(".jp2", ".pdf") if url else ""
 
-    lines = []
-    line_city_state = ", ".join([p for p in [city, state] if p])
-    if line_city_state:
-        lines.append(f'<div style="margin-bottom:2px;">{_esc(line_city_state)}</div>')
-    if newspaper:
-        lines.append(f'<div style="margin-bottom:2px;">{_esc(newspaper)}</div>')
+    date_str = _format_date_str(props.get("date") or "")
+    newspaper = (props.get("newspaper_name") or props.get("Title") or "").strip()
+    city = (props.get("City") or "").strip()
+    state = (props.get("State") or "").strip()
+    location = ", ".join([p for p in (city, state) if p])
+    page = (props.get("page") or "").strip()
+
+    article_html = _article_excerpt(props.get("article"), search_term, max_chars=700)
+    show_more_id = _sanitize_element_id(f"{popup_id}-more")
+
+    meta_rows = []
     if date_str:
-        lines.append(f'<div style="margin-bottom:2px;">{_esc(date_str)}</div>')
-    if snippet:
+        meta_rows.append(f'<div><span style="font-weight:600;">Date:</span> {_esc(date_str)}</div>')
+    if newspaper:
+        meta_rows.append(f'<div><span style="font-weight:600;">Newspaper:</span> {_esc(newspaper)}</div>')
+    if location:
+        meta_rows.append(f'<div><span style="font-weight:600;">Place:</span> {_esc(location)}</div>')
+    if page:
+        meta_rows.append(f'<div><span style="font-weight:600;">Page:</span> {_esc(page)}</div>')
+
+    lines: List[str] = []
+    if snippet_html:
         lines.append(
-            f'<div style="margin-bottom:4px;"><span style="font-weight:600;">Context:</span> '
-            f'{_esc(snippet)}</div>'
+            '<div style="margin-bottom:4px;"><span style="font-weight:600;">Context:</span> '
+            f'{snippet_html}</div>'
         )
-    if first_line:
-        lines.append(f'<div style="margin-bottom:4px;">{_esc(first_line)}</div>')
+    if summary:
+        lines.append(f'<div style="margin-bottom:4px;">{_esc(summary)}</div>')
     if pdf_url:
         lines.append(
             f'<div><a href="{_esc(pdf_url)}" target="_blank" rel="noopener">Source Image</a></div>'
         )
+
+    if article_html or meta_rows:
+        button = (
+            f"<button type=\"button\" style=\"margin-top:6px;\" "
+            f"onclick=\"var el=document.getElementById('{show_more_id}');"
+            "if(!el){return;}var hidden=el.style.display==='none';"
+            "el.style.display=hidden?'block':'none';"
+            "this.textContent=hidden?'Show less':'Show more';\">Show more</button>"
+        )
+        lines.append(button)
+        hidden_parts = ''.join(meta_rows)
+        if article_html:
+            hidden_parts += f'<div style="margin-top:6px;">{article_html}</div>'
+        lines.append(
+            f'<div id="{show_more_id}" style="display:none; margin-top:6px; max-height:260px; overflow:auto;">'
+            f'{hidden_parts}</div>'
+        )
+
+    if not lines:
+        lines.append('<div>No additional information available.</div>')
 
     return '<div style="font-size:14px; line-height:1.25;">' + "\n".join(lines) + "</div>"
 
@@ -227,7 +367,7 @@ def _feature_label(props: Dict[str, Any]) -> str:
     return label or "Feature"
 
 
-def _group_popup_html(entries: List[Dict[str, Any]]) -> str:
+def _group_popup_html(entries: List[Dict[str, Any]], search_term: Optional[str], group_id: str) -> str:
     if not entries:
         return '<div style="font-size:14px;">No data available.</div>'
 
@@ -236,7 +376,8 @@ def _group_popup_html(entries: List[Dict[str, Any]]) -> str:
     for idx, entry in enumerate(entries):
         label = _feature_label(entry["props"])
         options.append(f'<option value="{idx}">{_esc(label)}</option>')
-        detail_html = _popup_html(entry["props"])
+        detail_id = _sanitize_element_id(f"{group_id}-{idx}")
+        detail_html = _popup_html(entry["props"], search_term, detail_id)
         display = 'block' if idx == 0 else 'none'
         details.append(
             f'<div data-detail="{idx}" style="display:{display}; margin-top:6px;">{detail_html}</div>'
@@ -266,29 +407,47 @@ def _group_popup_html(entries: List[Dict[str, Any]]) -> str:
     )
 
 
-def _group_points(points: List[Dict[str, Any]], precision: int = 6) -> List[List[Dict[str, Any]]]:
+def _group_points(points: List[Dict[str, Any]], precision: int = 6) -> List[Dict[str, Any]]:
     """Group point dictionaries by rounded lat/lon for shared popups."""
-    grouped: Dict[Tuple[float, float], List[Dict[str, Any]]] = {}
+    grouped_map: Dict[Tuple[float, float], List[Dict[str, Any]]] = {}
     for pt in points:
         key = (round(pt["lat"], precision), round(pt["lon"], precision))
-        grouped.setdefault(key, []).append(pt)
-    return list(grouped.values())
+        grouped_map.setdefault(key, []).append(pt)
+
+    groups: List[Dict[str, Any]] = []
+    for idx, (key, entries) in enumerate(grouped_map.items()):
+        groups.append({
+            'location': key,
+            'entries': entries,
+            'id': _sanitize_element_id(f"group-{idx}"),
+        })
+    return groups
 
 
-def _add_point_markers(map_obj: folium.Map, grouped_entries: List[List[Dict[str, Any]]], popup_width: int = 360) -> None:
+def _add_point_markers(
+    map_obj: folium.Map,
+    groups: List[Dict[str, Any]],
+    search_term: Optional[str],
+    radius_func: Callable[[Dict[str, Any]], float],
+    popup_width: int = 360,
+) -> None:
     """Add grouped point markers with selection popups to the map."""
-    for entries in grouped_entries:
+    for idx, group in enumerate(groups):
+        entries = group.get('entries') or []
         if not entries:
             continue
-        popup_html = Html(_group_popup_html(entries), script=True)
+        group_id = group.get('id') or f'group-{idx}'
+        popup_html = Html(_group_popup_html(entries, search_term, group_id), script=True)
         popup_obj = Popup(popup_html, max_width=popup_width)
-        count = len(entries)
-        lat = sum(p["lat"] for p in entries) / count
-        lon = sum(p["lon"] for p in entries) / count
-        marker_radius = 5 if count > 1 else 3
+        lat, lon = group.get('location', (entries[0]['lat'], entries[0]['lon']))
+        radius = radius_func(group) if callable(radius_func) else 4.0
+        try:
+            radius_value = max(1.0, float(radius))
+        except (TypeError, ValueError):
+            radius_value = 4.0
         folium.CircleMarker(
             location=[lat, lon],
-            radius=marker_radius,
+            radius=radius_value,
             weight=0,
             fill=True,
             fill_opacity=0.85,
@@ -303,12 +462,12 @@ def _heat_slices(
     time_index: List[datetime],
     linger_unit: str,
     linger_step: int
-) -> List[List[Tuple[float, float]]]:
+) -> List[List[List[float]]]:
     """
     Build HeatMapWithTime slices: list where each entry is a list of [lat, lon] for that time slice.
     We include a point in slices from its date slice up to linger length.
     """
-    slices: List[List[Tuple[float, float]]] = [[] for _ in time_index]
+    slices: List[List[List[float]]] = [[] for _ in time_index]
 
     for p in points:
         dt = p["date"]
@@ -338,9 +497,37 @@ def _heat_slices(
             else:
                 if j != insert_i:
                     break
-            slices[j].append((p["lat"], p["lon"]))
+            point_entry: List[float] = [p["lat"], p["lon"]]
+            weight = p.get('value')
+            try:
+                weight_val = float(weight) if weight is not None else None
+            except (TypeError, ValueError):
+                weight_val = None
+            if weight_val is not None and weight_val > 0:
+                point_entry.append(weight_val)
+            slices[j].append(point_entry)
 
     return slices
+
+
+def _graduated_radius_resolver(groups: List[Dict[str, Any]], min_radius: float, max_radius: float):
+    values = [float(g.get('value', 0.0)) for g in groups if g.get('value') is not None]
+    if not values:
+        return lambda _group: min_radius
+    min_val = min(values)
+    max_val = max(values)
+    if max_val <= min_val:
+        return lambda _group: max_radius
+
+    span = max_val - min_val
+
+    def _resolver(group: Dict[str, Any]) -> float:
+        val = float(group.get('value', 0.0))
+        scale = (val - min_val) / span
+        radius = min_radius + scale * (max_radius - min_radius)
+        return max(min_radius, min(max_radius, radius))
+
+    return _resolver
 
 
 def _write_attribute_table(points: List[Dict[str, Any]], out_path: str) -> Optional[str]:
@@ -437,13 +624,19 @@ def create_map(
     disable_time: bool = False,
     heat_radius: Optional[int] = None,
     heat_value: Optional[float] = None,
-) -> str:
+    grad_min_radius: Optional[int] = None,
+    grad_max_radius: Optional[int] = None,
+    metric: Optional[str] = None,
+    normalize: bool = False,
+    normalize_denominator: Optional[str] = None,
+) -> Dict[str, Optional[str]]:
     """
     Create a leaflet map next to the GeoJSON.
 
     Modes:
       - "points": static points (CircleMarker dots) with popups.
       - "heatmap": heat density view. Uses a time slider if dates are present and time is enabled.
+      - "graduated": scaled circle markers sized by the chosen metric.
 
     Time slider parameters (heatmap mode only):
       - time_unit: 'day' | 'week' | 'month' | 'year'   (default 'month')
@@ -454,13 +647,21 @@ def create_map(
     Additional options:
       - disable_time: force a static heat layer even when dates are available.
       - heat_radius: override the radius for the heatmap kernel (default 15).
-      - heat_value: apply a constant intensity/weight to every heatmap point.
+      - heat_value: multiplier applied to heatmap weights (default 1.0).
+      - grad_min_radius / grad_max_radius: radius range for graduated markers.
+      - metric: 'article_count' | 'page_count' | 'key_term_frequency'.
+      - normalize: divide the metric by a denominator when True.
+      - normalize_denominator: 'word_count' | 'article_count' | 'page_count'.
 
-    Returns: path to generated HTML.
+    Returns:
+        dict with 'map_path' and optional 'attribute_table'.
     """
-    mode = (mode or "points").strip().lower()
-    if mode not in ("points", "heatmap"):
-        mode = "points"
+
+    permitted_modes = {"points", "heatmap", "graduated"}
+    mode_normalized = (mode or "points").strip().lower()
+    if mode_normalized not in permitted_modes:
+        mode_normalized = "points"
+    mode = mode_normalized
 
     with open(geojson_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -469,7 +670,34 @@ def create_map(
         raise ValueError("GeoJSON does not contain a valid 'features' list.")
 
     pts = _extract_points(features)
-    grouped_entries = _group_points(pts)
+    groups = _group_points(pts)
+    search_term = _detect_search_term(geojson_path, data)
+
+    allowed_metrics = {"article_count", "page_count", "key_term_frequency"}
+    metric_key = (metric or "article_count").strip().lower()
+    if metric_key not in allowed_metrics:
+        metric_key = "article_count"
+
+    allowed_denominators = {"word_count", "article_count", "page_count"}
+    denom_key = (normalize_denominator or "").strip().lower()
+    normalize_flag = bool(normalize) and denom_key in allowed_denominators
+    denominator_key = denom_key if normalize_flag else None
+
+    values: List[float] = []
+    for group in groups:
+        stats = _compute_group_stats(group.get("entries", []), search_term)
+        group["stats"] = stats
+        value = _compute_group_value(stats, metric_key, normalize_flag, denominator_key)
+        group["value"] = value
+        for entry in group.get("entries", []):
+            entry["value"] = value
+        values.append(value)
+
+    if groups and not any(v > 0 for v in values):
+        for group in groups:
+            group["value"] = 1.0
+            for entry in group.get("entries", []):
+                entry["value"] = 1.0
 
     heat_radius_val = 15
     if heat_radius is not None:
@@ -479,34 +707,45 @@ def create_map(
                 heat_radius_val = candidate_radius
         except (TypeError, ValueError):
             pass
-    heat_value_val: Optional[float]
-    if heat_value is None:
-        heat_value_val = None
-    else:
+
+    heat_multiplier = 1.0
+    if heat_value is not None:
         try:
-            heat_value_val = float(heat_value)
+            candidate_multiplier = float(heat_value)
+            if candidate_multiplier > 0:
+                heat_multiplier = candidate_multiplier
         except (TypeError, ValueError):
-            heat_value_val = None
-        if heat_value_val is not None and heat_value_val <= 0:
-            heat_value_val = None
+            pass
+
+    grad_min_val = max(1, int(grad_min_radius) if grad_min_radius else 6)
+    grad_max_val = max(grad_min_val + 1, int(grad_max_radius) if grad_max_radius else 28)
 
     m = folium.Map(location=[37.8, -96.0], zoom_start=4)
+
+    def point_radius(group: Dict[str, Any]) -> float:
+        count = len(group.get("entries") or [])
+        return 5 if count > 1 else 3
 
     if mode == "heatmap":
         dated_pts = [p for p in pts if p.get("date") is not None]
         use_time_slider = bool(dated_pts) and not disable_time
 
-        if use_time_slider:
+        if use_time_slider and dated_pts:
             min_dt = min(p["date"] for p in dated_pts)
             max_dt = max(p["date"] for p in dated_pts)
             idx = _build_time_index(min_dt, max_dt, time_unit, max(1, int(time_step or 1)))
             slices = _heat_slices(dated_pts, idx, linger_unit, int(linger_step or 0))
-            heat_data = []
+            heat_data: List[List[List[float]]] = []
             for frame in slices:
                 frame_pts: List[List[float]] = []
-                for lat, lon in frame:
-                    if heat_value_val is not None:
-                        frame_pts.append([lat, lon, heat_value_val])
+                for item in frame:
+                    lat, lon = item[0], item[1]
+                    base_weight = item[2] if len(item) > 2 else None
+                    if base_weight is not None and base_weight > 0:
+                        weight_val = base_weight * heat_multiplier
+                        frame_pts.append([lat, lon, weight_val])
+                    elif heat_multiplier > 0:
+                        frame_pts.append([lat, lon, heat_multiplier])
                     else:
                         frame_pts.append([lat, lon])
                 heat_data.append(frame_pts)
@@ -519,18 +758,25 @@ def create_map(
                 radius=heat_radius_val,
             ).add_to(m)
         else:
-            coords = []
+            coords: List[List[float]] = []
             for p in pts:
-                if heat_value_val is not None:
-                    coords.append([p["lat"], p["lon"], heat_value_val])
+                base_weight = p.get("value")
+                if base_weight is not None and base_weight > 0:
+                    weight_val = base_weight * heat_multiplier
+                    coords.append([p["lat"], p["lon"], weight_val])
+                elif heat_multiplier > 0:
+                    coords.append([p["lat"], p["lon"], heat_multiplier])
                 else:
                     coords.append([p["lat"], p["lon"]])
             if coords:
                 HeatMap(coords, max_opacity=0.7, radius=heat_radius_val).add_to(m)
 
-        _add_point_markers(m, grouped_entries)
+        _add_point_markers(m, groups, search_term, point_radius)
+    elif mode == "graduated":
+        resolver = _graduated_radius_resolver(groups, float(grad_min_val), float(grad_max_val))
+        _add_point_markers(m, groups, search_term, resolver)
     else:
-        _add_point_markers(m, grouped_entries)
+        _add_point_markers(m, groups, search_term, point_radius)
 
     fname = os.path.basename(geojson_path)
     label_text = f"GeoJSON: {fname}"
@@ -556,7 +802,10 @@ def create_map(
         )
         m.get_root().html.add_child(folium.Element(table_button))
 
-    suffix = "_heatmap" if mode == "heatmap" else "_points"
+    suffix = "_heatmap" if mode == "heatmap" else "_graduated" if mode == "graduated" else "_points"
     out_html = os.path.join(out_dir, f"{base}{suffix}.html")
     m.save(out_html)
-    return out_html
+    result: Dict[str, Optional[str]] = {"map_path": out_html}
+    if attr_file:
+        result["attribute_table"] = attr_file
+    return result

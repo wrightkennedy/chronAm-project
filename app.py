@@ -134,6 +134,11 @@ class MainWindow(QMainWindow):
             'disable_time': False,
             'heat_radius': 15,
             'heat_value': 1.0,
+            'grad_min_radius': 6,
+            'grad_max_radius': 28,
+            'metric': 'article_count',
+            'normalize': False,
+            'normalize_denominator': 'word_count',
         }
         self.init_ui()
         self._close_filter = CloseShortcutFilter()
@@ -437,6 +442,11 @@ class MainWindow(QMainWindow):
             'disable_time': False,
             'heat_radius': 15,
             'heat_value': 1.0,
+            'grad_min_radius': 6,
+            'grad_max_radius': 28,
+            'metric': 'article_count',
+            'normalize': False,
+            'normalize_denominator': 'word_count',
         }
 
         self.ensure_dataset_folder(prompt=False)
@@ -489,6 +499,11 @@ class MainWindow(QMainWindow):
             'disable_time': False,
             'heat_radius': 15,
             'heat_value': 1.0,
+            'grad_min_radius': 6,
+            'grad_max_radius': 28,
+            'metric': 'article_count',
+            'normalize': False,
+            'normalize_denominator': 'word_count',
         }
 
         search_log = data.get('search_log_history')
@@ -672,7 +687,7 @@ class MainWindow(QMainWindow):
         self.map_settings = dict(cfg)
 
         try:
-            out_html = create_map(
+            result = create_map(
                 self.geojson_file,
                 mode=str(cfg['mode']).strip().lower(),
                 time_unit=cfg['time_unit'],
@@ -682,15 +697,45 @@ class MainWindow(QMainWindow):
                 disable_time=cfg['disable_time'],
                 heat_radius=cfg.get('heat_radius'),
                 heat_value=cfg.get('heat_value'),
+                grad_min_radius=cfg.get('grad_min_radius'),
+                grad_max_radius=cfg.get('grad_max_radius'),
+                metric=cfg.get('metric'),
+                normalize=cfg.get('normalize'),
+                normalize_denominator=cfg.get('normalize_denominator'),
             )
         except Exception as e:
             QMessageBox.critical(self, 'Map Error', f'Failed to create map:\n{e}')
             return
 
-        # Open in browser
+        map_path = None
+        attr_path = None
+        if isinstance(result, dict):
+            map_path = result.get('map_path')
+            attr_path = result.get('attribute_table')
+        else:
+            map_path = result
+
+        if not map_path:
+            QMessageBox.critical(self, 'Map Error', 'Map creation did not return an output path.')
+            return
+
         import webbrowser
-        webbrowser.open('file://' + os.path.abspath(out_html))
-        QMessageBox.information(self, 'Map Created', f'Interactive map saved to:\n{out_html}')
+        webbrowser.open('file://' + os.path.abspath(map_path))
+
+        log_lines = [
+            (
+                '<div>Interactive map saved to: '
+                f'<a href="file://{html.escape(os.path.abspath(map_path))}" target="_blank" rel="noopener">'
+                f'{html.escape(map_path)}</a></div>'
+            )
+        ]
+        if attr_path:
+            log_lines.append(
+                '<div>Attribute table saved to: '
+                f'<a href="file://{html.escape(os.path.abspath(attr_path))}" target="_blank" rel="noopener">'
+                f'{html.escape(attr_path)}</a></div>'
+            )
+        self.append_project_log('Create Map', log_lines)
 
 class DownloadDialog(QDialog):
     def __init__(self, parent=None):
@@ -1373,18 +1418,57 @@ class MapCreationDialog(QDialog):
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItem('Point Map', 'points')
+        self.mode_combo.addItem('Graduated Symbols', 'graduated')
         self.mode_combo.addItem('Heat Map', 'heatmap')
         mode_def = str(defaults.get('mode', 'points')).lower()
         idx = self.mode_combo.findData(mode_def)
         if idx >= 0:
             self.mode_combo.setCurrentIndex(idx)
         form.addRow('Map type:', self.mode_combo)
+        self._mode_label = form.labelForField(self.mode_combo)
+
+        self.metric_combo = QComboBox()
+        metric_def = str(defaults.get('metric', 'article_count'))
+        metric_options = [
+            ('Articles', 'article_count'),
+            ('Page count', 'page_count'),
+            ('Key term frequency', 'key_term_frequency'),
+        ]
+        for label, value in metric_options:
+            self.metric_combo.addItem(label, value)
+        idx = self.metric_combo.findData(metric_def)
+        if idx >= 0:
+            self.metric_combo.setCurrentIndex(idx)
+        form.addRow('Metric:', self.metric_combo)
+        self._metric_label = form.labelForField(self.metric_combo)
+
+        self.normalize_check = QCheckBox('Enable')
+        self.normalize_check.setChecked(bool(defaults.get('normalize', False)))
+        self.normalize_denom = QComboBox()
+        denom_def = str(defaults.get('normalize_denominator', 'word_count'))
+        denom_options = [
+            ('Word count', 'word_count'),
+            ('Article count', 'article_count'),
+            ('Page count', 'page_count'),
+        ]
+        for label, value in denom_options:
+            self.normalize_denom.addItem(label, value)
+        idx = self.normalize_denom.findData(denom_def)
+        if idx >= 0:
+            self.normalize_denom.setCurrentIndex(idx)
+        norm_row = QWidget()
+        norm_layout = QHBoxLayout(norm_row)
+        norm_layout.setContentsMargins(0, 0, 0, 0)
+        norm_layout.addWidget(self.normalize_check)
+        norm_layout.addWidget(self.normalize_denom)
+        form.addRow('Normalization:', norm_row)
+        self._norm_label = form.labelForField(norm_row)
+
+        units = ['day', 'week', 'month', 'year']
 
         self.disable_time = QCheckBox('Disable time animation')
         self.disable_time.setChecked(bool(defaults.get('disable_time', False)))
         form.addRow(self.disable_time)
-
-        units = ['day', 'week', 'month', 'year']
 
         time_row = QWidget()
         time_layout = QHBoxLayout(time_row)
@@ -1401,6 +1485,8 @@ class MapCreationDialog(QDialog):
             self.time_unit.setCurrentIndex(idx)
         time_layout.addWidget(self.time_unit)
         form.addRow('Time bin:', time_row)
+        self._time_row = time_row
+        self._time_label = form.labelForField(time_row)
 
         linger_row = QWidget()
         linger_layout = QHBoxLayout(linger_row)
@@ -1417,18 +1503,40 @@ class MapCreationDialog(QDialog):
             self.linger_unit.setCurrentIndex(idx)
         linger_layout.addWidget(self.linger_unit)
         form.addRow('Linger:', linger_row)
+        self._linger_row = linger_row
+        self._linger_label = form.labelForField(linger_row)
 
         self.heat_radius = QSpinBox()
-        self.heat_radius.setRange(1, 120)
+        self.heat_radius.setRange(1, 160)
         self.heat_radius.setValue(max(1, int(defaults.get('heat_radius', 15))))
         form.addRow('Heat radius:', self.heat_radius)
+        self._heat_radius_label = form.labelForField(self.heat_radius)
 
         self.heat_value = QDoubleSpinBox()
-        self.heat_value.setRange(0.1, 25.0)
+        self.heat_value.setRange(0.1, 50.0)
         self.heat_value.setSingleStep(0.1)
         self.heat_value.setDecimals(2)
         self.heat_value.setValue(float(defaults.get('heat_value', 1.0)))
         form.addRow('Heat value:', self.heat_value)
+        self._heat_value_label = form.labelForField(self.heat_value)
+
+        grad_row = QWidget()
+        grad_layout = QHBoxLayout(grad_row)
+        grad_layout.setContentsMargins(0, 0, 0, 0)
+        grad_layout.addWidget(QLabel('Min:'))
+        self.grad_min_radius = QSpinBox()
+        self.grad_min_radius.setRange(1, 200)
+        self.grad_min_radius.setValue(max(1, int(defaults.get('grad_min_radius', 6))))
+        grad_layout.addWidget(self.grad_min_radius)
+        grad_layout.addSpacing(10)
+        grad_layout.addWidget(QLabel('Max:'))
+        self.grad_max_radius = QSpinBox()
+        self.grad_max_radius.setRange(1, 240)
+        self.grad_max_radius.setValue(max(self.grad_min_radius.value() + 1, int(defaults.get('grad_max_radius', 28))))
+        grad_layout.addWidget(self.grad_max_radius)
+        form.addRow('Graduated radii:', grad_row)
+        self._grad_row = grad_row
+        self._grad_label = form.labelForField(grad_row)
 
         layout.addLayout(form)
 
@@ -1439,16 +1547,51 @@ class MapCreationDialog(QDialog):
 
         self.mode_combo.currentIndexChanged.connect(self._update_enabled_state)
         self.disable_time.toggled.connect(self._update_enabled_state)
+        self.normalize_check.toggled.connect(self._update_enabled_state)
+        self.grad_min_radius.valueChanged.connect(self._sync_grad_radii)
+        self.grad_max_radius.valueChanged.connect(self._sync_grad_radii)
         self._update_enabled_state()
 
+    def _sync_grad_radii(self):
+        if self.grad_max_radius.value() <= self.grad_min_radius.value():
+            self.grad_max_radius.blockSignals(True)
+            self.grad_max_radius.setValue(self.grad_min_radius.value() + 1)
+            self.grad_max_radius.blockSignals(False)
+
+    def _set_row_visible(self, label_widget, field_widget, visible: bool):
+        if label_widget is not None:
+            label_widget.setVisible(visible)
+        if field_widget is not None:
+            field_widget.setVisible(visible)
+
     def _update_enabled_state(self):
-        heat_mode = self.mode_combo.currentData() == 'heatmap'
-        time_enabled = heat_mode and not self.disable_time.isChecked()
-        for widget in (self.time_step, self.time_unit, self.linger_step, self.linger_unit):
-            widget.setEnabled(time_enabled)
-        for widget in (self.heat_radius, self.heat_value):
-            widget.setEnabled(heat_mode)
+        mode = self.mode_combo.currentData()
+        heat_mode = mode == 'heatmap'
+        grad_mode = mode == 'graduated'
+        metric_mode = heat_mode or grad_mode
+
+        time_controls_enabled = heat_mode and not self.disable_time.isChecked()
+
         self.disable_time.setEnabled(heat_mode)
+        self._set_row_visible(self._time_label, self._time_row, heat_mode)
+        self._set_row_visible(self._linger_label, self._linger_row, heat_mode)
+        for widget in (self.time_step, self.time_unit, self.linger_step, self.linger_unit):
+            widget.setEnabled(time_controls_enabled)
+
+        self._set_row_visible(self._heat_radius_label, self.heat_radius, heat_mode)
+        self._set_row_visible(self._heat_value_label, self.heat_value, heat_mode)
+
+        self._set_row_visible(self._grad_label, self._grad_row, grad_mode)
+
+        self.metric_combo.setEnabled(metric_mode)
+        if self._metric_label is not None:
+            self._metric_label.setEnabled(metric_mode)
+
+        norm_enabled = metric_mode and self.normalize_check.isChecked()
+        if self._norm_label is not None:
+            self._norm_label.setEnabled(metric_mode)
+        self.normalize_check.setEnabled(metric_mode)
+        self.normalize_denom.setEnabled(norm_enabled)
 
     def values(self) -> dict:
         return {
@@ -1460,6 +1603,11 @@ class MapCreationDialog(QDialog):
             'disable_time': self.disable_time.isChecked(),
             'heat_radius': self.heat_radius.value(),
             'heat_value': self.heat_value.value(),
+            'grad_min_radius': self.grad_min_radius.value(),
+            'grad_max_radius': self.grad_max_radius.value(),
+            'metric': self.metric_combo.currentData(),
+            'normalize': self.normalize_check.isChecked(),
+            'normalize_denominator': self.normalize_denom.currentData(),
         }
 
 class CollocationDialog(QDialog):
