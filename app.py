@@ -24,7 +24,7 @@ from PyQt5.QtGui import QPainter, QPen, QIntValidator, QTextCursor, QKeySequence
 from chronam import download_data
 from chronam.map_create import create_map
 from chronam.merge import merge_geojson
-from chronam.collocate import run_collocation
+from chronam.collocate import run_collocation, build_collocation_output_paths
 from chronam.visualize import plot_bar, plot_rank_changes
 
 
@@ -123,6 +123,7 @@ class MainWindow(QMainWindow):
         self.search_log_history = []
         self.project_log_entries = []
         self.project_file = None
+        self.collocation_state = {}
         self.init_ui()
         self._close_filter = CloseShortcutFilter()
         QApplication.instance().installEventFilter(self._close_filter)
@@ -415,6 +416,7 @@ class MainWindow(QMainWindow):
         self.locations_csv_path = None
         self.search_log_history.clear()
         self.project_log_entries.clear()
+        self.collocation_state = {}
 
         self.ensure_dataset_folder(prompt=False)
         self._update_loaded_file_labels()
@@ -456,6 +458,7 @@ class MainWindow(QMainWindow):
         self.geojson_file = data.get('geojson_file')
         locations_csv = data.get('locations_csv_path')
         self.locations_csv_path = locations_csv if isinstance(locations_csv, str) else None
+        self.collocation_state = {}
 
         search_log = data.get('search_log_history')
         if search_log is None:
@@ -1297,6 +1300,7 @@ class CSVPreviewDialog(QDialog):
     def __init__(self, csv_path, parent=None, max_rows=100):
         super().__init__(parent)
         self.setWindowTitle(os.path.basename(csv_path))
+        self.setMinimumSize(900, 600)
         df = pd.read_csv(csv_path).head(max_rows)
         tbl = QTableWidget(df.shape[0], df.shape[1], self)
         tbl.setHorizontalHeaderLabels(list(df.columns))
@@ -1305,6 +1309,8 @@ class CSVPreviewDialog(QDialog):
                 tbl.setItem(i, j, QTableWidgetItem(str(val)))
         layout = QVBoxLayout(self)
         layout.addWidget(tbl)
+        tbl.setFocus()
+        self.table = tbl
 
 class CollocationDialog(QDialog):
     def __init__(self, parent=None):
@@ -1312,6 +1318,7 @@ class CollocationDialog(QDialog):
         self.setWindowTitle('Collocation Analysis')
         self.setMinimumSize(620, 580)
         layout = QVBoxLayout(self)
+        self._last_output_paths = None
 
         # --- Source selection & status line ---
         mode_row = QHBoxLayout()
@@ -1376,17 +1383,6 @@ class CollocationDialog(QDialog):
         self.term_input = QLineEdit()
         form.addRow('Search Term:', self.term_input)
 
-        # Pre-fill term and dates from loaded JSON (if available)
-        if parent.json_file:
-            try:
-                with open(parent.json_file, 'r', encoding='utf-8') as f:
-                    info = json.load(f)
-                self.term_input.setText(info.get('search_term', ''))
-                self.start_input.setText(info.get('start_date', ''))
-                self.end_input.setText(info.get('end_date', ''))
-            except Exception:
-                pass
-
         # Time bin controls
         self.bin_size = QLineEdit('1')
         self.bin_size.setValidator(QIntValidator(1, 1000, self))
@@ -1396,16 +1392,35 @@ class CollocationDialog(QDialog):
         self.bin_unit.addItems(['Days', 'Weeks', 'Months', 'Years'])
         form.addRow('Time Unit:', self.bin_unit)
         self.ignore_bin = QCheckBox('Ignore Bin Size (no time binning)')
+        self.ignore_bin.setChecked(True)
         form.addRow(self.ignore_bin)
 
         # Additional collocation options (checkboxes)
         self.checks = {}
         for opt in ['include_page_count', 'include_first_last_date', 'include_cooccurrence_rate', 'include_relative_position', 'drop_stopwords']:
             cb = QCheckBox(opt)
+            cb.setChecked(True)
             form.addRow(cb)
             self.checks[opt] = cb
 
         layout.addLayout(form)
+
+        self._loading_defaults = True
+        self._restore_state_or_defaults()
+        self._loading_defaults = False
+
+        self.bin_size.textEdited.connect(self._handle_bin_control_change)
+        self.bin_unit.currentIndexChanged.connect(self._handle_bin_control_change)
+        self.ignore_bin.stateChanged.connect(lambda *_: self._save_state())
+        self.city_combo.currentIndexChanged.connect(lambda *_: self._save_state())
+        self.state_combo.currentIndexChanged.connect(lambda *_: self._save_state())
+        self.term_input.textEdited.connect(lambda _text: self._save_state())
+        self.start_input.textEdited.connect(lambda _text: self._save_state())
+        self.end_input.textEdited.connect(lambda _text: self._save_state())
+        self.mode_geo.toggled.connect(lambda _: self._save_state())
+        self.mode_json.toggled.connect(lambda _: self._save_state())
+        for cb in self.checks.values():
+            cb.stateChanged.connect(lambda *_: self._save_state())
 
         # Action buttons
         btn_run = QPushButton('Run Collocation')
@@ -1416,9 +1431,6 @@ class CollocationDialog(QDialog):
         btn_rank.clicked.connect(self.show_rank)
         for b in (btn_run, btn_bar, btn_rank):
             layout.addWidget(b)
-
-        # Initialize city/state dropdowns based on current mode
-        self.on_mode_toggle()
 
     def _source_text(self):
         if self.mode_geo.isChecked():
@@ -1444,6 +1456,216 @@ class CollocationDialog(QDialog):
                 parent._update_loaded_file_labels()
         # Update source label text
         self.source_label.setText(self._source_text())
+        if parent is not None:
+            parent.collocation_state = {}
+        self._loading_defaults = True
+        self._prefill_from_current_source(reset_state=True)
+        self._loading_defaults = False
+        self._save_state()
+
+    def _restore_state_or_defaults(self):
+        state = {}
+        parent = self.parent()
+        if parent is not None:
+            state = getattr(parent, 'collocation_state', {}) or {}
+        if state:
+            self._apply_state(state)
+        else:
+            self.on_mode_toggle()
+            self._prefill_from_current_source()
+
+    def _apply_state(self, state: dict):
+        parent = self.parent()
+        mode = state.get('mode', 'geo')
+        self.mode_geo.blockSignals(True)
+        self.mode_json.blockSignals(True)
+        if mode == 'json' and getattr(parent, 'json_file', None):
+            self.mode_json.setChecked(True)
+        elif mode == 'geo' and getattr(parent, 'geojson_file', None):
+            self.mode_geo.setChecked(True)
+        elif getattr(parent, 'json_file', None):
+            self.mode_json.setChecked(True)
+        else:
+            self.mode_geo.setChecked(True)
+        self.mode_geo.blockSignals(False)
+        self.mode_json.blockSignals(False)
+        self.on_mode_toggle()
+
+        # Prefill term/date from current source if missing in saved state
+        self._prefill_from_current_source()
+
+        city = state.get('city')
+        if city:
+            idx = self.city_combo.findText(city, Qt.MatchFixedString)
+            if idx == -1 and city not in ('All Cities', ''):
+                self.city_combo.addItem(city)
+                idx = self.city_combo.count() - 1
+            if idx >= 0:
+                self.city_combo.setCurrentIndex(idx)
+        state_val = state.get('state')
+        if state_val:
+            idx = self.state_combo.findText(state_val, Qt.MatchFixedString)
+            if idx == -1 and state_val not in ('All States', ''):
+                self.state_combo.addItem(state_val)
+                idx = self.state_combo.count() - 1
+            if idx >= 0:
+                self.state_combo.setCurrentIndex(idx)
+
+        self.term_input.setText(state.get('term', self.term_input.text()))
+        self.start_input.setText(state.get('start', self.start_input.text()))
+        self.end_input.setText(state.get('end', self.end_input.text()))
+
+        bin_size = state.get('bin_size')
+        if bin_size:
+            self.bin_size.setText(str(bin_size))
+        bin_unit = state.get('bin_unit')
+        if bin_unit:
+            idx = self.bin_unit.findText(bin_unit, Qt.MatchFixedString)
+            if idx >= 0:
+                self.bin_unit.setCurrentIndex(idx)
+        ignore = state.get('ignore_bin')
+        if ignore is not None:
+            self.ignore_bin.setChecked(bool(ignore))
+
+        opts = state.get('options', {})
+        for key, cb in self.checks.items():
+            cb.setChecked(bool(opts.get(key, True)))
+
+    def _prefill_from_current_source(self, reset_state: bool = False):
+        parent = self.parent()
+        source_path = None
+        use_geo = self.mode_geo.isChecked()
+        if use_geo:
+            source_path = getattr(parent, 'geojson_file', None)
+        else:
+            source_path = getattr(parent, 'json_file', None)
+
+        meta = self._extract_metadata_from_source(source_path, use_geo) if source_path else {}
+        if reset_state:
+            # When switching sources, reset combos before populating
+            if use_geo:
+                self.populate_city_state()
+            else:
+                self.city_combo.setCurrentIndex(0)
+                self.state_combo.setCurrentIndex(0)
+
+        if meta.get('term'):
+            self.term_input.setText(meta.get('term'))
+        if meta.get('start_date'):
+            self.start_input.setText(meta.get('start_date'))
+        if meta.get('end_date'):
+            self.end_input.setText(meta.get('end_date'))
+
+    def _extract_metadata_from_source(self, path: Optional[str], is_geo: bool) -> dict:
+        result = {'term': '', 'start_date': '', 'end_date': ''}
+        if not path or not os.path.exists(path):
+            return result
+        try:
+            if is_geo:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                meta = data.get('metadata') or {}
+                if not meta and data.get('properties'):
+                    meta = data.get('properties', {})
+                if not meta:
+                    features = data.get('features', [])
+                    if features:
+                        probe = features[0].get('properties', {}) or {}
+                        meta = {
+                            'search_term': probe.get('search_term') or probe.get('SearchTerm'),
+                            'start_date': probe.get('start_date') or probe.get('StartDate'),
+                            'end_date': probe.get('end_date') or probe.get('EndDate'),
+                        }
+                result['term'] = meta.get('search_term') or meta.get('term') or ''
+                result['start_date'] = meta.get('start_date') or ''
+                result['end_date'] = meta.get('end_date') or ''
+            else:
+                with open(path, 'r', encoding='utf-8') as f:
+                    info = json.load(f)
+                result['term'] = info.get('search_term', '')
+                result['start_date'] = info.get('start_date', '')
+                result['end_date'] = info.get('end_date', '')
+        except Exception:
+            return self._parse_filename_metadata(path)
+
+        if not (result['term'] and result['start_date'] and result['end_date']):
+            fallback = self._parse_filename_metadata(path)
+            for key in result:
+                if not result[key] and fallback.get(key):
+                    result[key] = fallback[key]
+        return result
+
+    def _parse_filename_metadata(self, path: str) -> dict:
+        base = os.path.basename(path)
+        name, _ = os.path.splitext(base)
+        dates = re.findall(r'\d{4}-\d{2}-\d{2}', name)
+        start = dates[0] if len(dates) >= 1 else ''
+        end = dates[1] if len(dates) >= 2 else ''
+        term_part = name
+        if start:
+            term_part = term_part.split(start)[0].rstrip('_-')
+        term = term_part.split('_')[-1] if term_part else ''
+        for prefix in ['merged', 'collocates', 'occurrences']:
+            if term == prefix and '_' in term_part:
+                term = term_part.split('_')[-2]
+        return {'term': term, 'start_date': start, 'end_date': end}
+
+    def _handle_bin_control_change(self, *_):
+        if self._loading_defaults:
+            return
+        if self.ignore_bin.isChecked():
+            self.ignore_bin.blockSignals(True)
+            self.ignore_bin.setChecked(False)
+            self.ignore_bin.blockSignals(False)
+        self._save_state()
+
+    def _collect_options(self) -> dict:
+        return {opt: cb.isChecked() for opt, cb in self.checks.items()}
+
+    def _current_time_bin_unit(self) -> Optional[str]:
+        if self.ignore_bin.isChecked():
+            return None
+        size_text = self.bin_size.text().strip()
+        if not size_text or not size_text.isdigit():
+            return None
+        return f"{int(size_text)} {self.bin_unit.currentText().lower()}"
+
+    def _build_output_paths(self, term: str, start: Optional[str], end: Optional[str], city: Optional[str], state: Optional[str], options: dict):
+        parent = self.parent()
+        if parent is None:
+            raise RuntimeError('Collocation dialog has no parent window')
+        time_bin_unit = self._current_time_bin_unit()
+        return build_collocation_output_paths(
+            parent.project_folder,
+            term=term,
+            start_date=start or None,
+            end_date=end or None,
+            city=city,
+            state=state,
+            time_bin_unit=time_bin_unit,
+            ignore_bin=self.ignore_bin.isChecked(),
+            options=options,
+        )
+
+    def _save_state(self):
+        if self._loading_defaults:
+            return
+        parent = self.parent()
+        if parent is None:
+            return
+        state = {
+            'mode': 'geo' if self.mode_geo.isChecked() else 'json',
+            'city': self.city_combo.currentText() if self.city_combo.currentIndex() > 0 else '',
+            'state': self.state_combo.currentText() if self.state_combo.currentIndex() > 0 else '',
+            'term': self.term_input.text().strip(),
+            'start': self.start_input.text().strip(),
+            'end': self.end_input.text().strip(),
+            'bin_size': self.bin_size.text().strip(),
+            'bin_unit': self.bin_unit.currentText(),
+            'ignore_bin': self.ignore_bin.isChecked(),
+            'options': self._collect_options(),
+        }
+        parent.collocation_state = state
 
     def on_mode_toggle(self):
         if self.mode_geo.isChecked():
@@ -1453,6 +1675,7 @@ class CollocationDialog(QDialog):
             # Populate dropdowns if a GeoJSON is loaded
             if getattr(self.parent(), 'geojson_file', None) and os.path.exists(self.parent().geojson_file):
                 self.populate_city_state()
+            self._prefill_from_current_source()
         else:
             # Disable filters for JSON mode
             self.city_combo.setEnabled(False)
@@ -1460,6 +1683,9 @@ class CollocationDialog(QDialog):
             # Reset selections to "All"
             self.city_combo.setCurrentIndex(0)
             self.state_combo.setCurrentIndex(0)
+            self._prefill_from_current_source()
+        if not self._loading_defaults:
+            self._save_state()
 
     def populate_city_state(self):
         geo_path = getattr(self.parent(), 'geojson_file', None)
@@ -1492,6 +1718,19 @@ class CollocationDialog(QDialog):
         # Reset to "All" by default
         self.city_combo.setCurrentIndex(0)
         self.state_combo.setCurrentIndex(0)
+        if self._loading_defaults:
+            parent = self.parent()
+            state = getattr(parent, 'collocation_state', {}) if parent else {}
+            saved_city = state.get('city')
+            if saved_city:
+                idx = self.city_combo.findText(saved_city, Qt.MatchFixedString)
+                if idx >= 0:
+                    self.city_combo.setCurrentIndex(idx)
+            saved_state = state.get('state')
+            if saved_state:
+                idx = self.state_combo.findText(saved_state, Qt.MatchFixedString)
+                if idx >= 0:
+                    self.state_combo.setCurrentIndex(idx)
 
     def run_collocate(self):
         # Gather input parameters
@@ -1502,108 +1741,182 @@ class CollocationDialog(QDialog):
         start = self.start_input.text().strip()
         end   = self.end_input.text().strip()
         term  = self.term_input.text().strip()
+        if not term:
+            QMessageBox.warning(self, 'Search Term Required', 'Enter a search term before running collocation analysis.')
+            return
 
-        # Determine time bin setting
-        if self.ignore_bin.isChecked():
-            time_bin = None
-        else:
+        ignore_bin = self.ignore_bin.isChecked()
+        if not ignore_bin:
             size_text = self.bin_size.text().strip()
             if not size_text.isdigit():
                 QMessageBox.warning(self, 'Invalid Bin Size', 'Please enter an integer ≥ 1.')
                 return
-            unit = self.bin_unit.currentText().lower()
-            time_bin = f"{int(size_text)} {unit}"
 
-        # Prepare output file labels (for user info)
-        start_lbl = start or 'all'
-        end_lbl   = end or 'all'
-        safe_term = re.sub(r"[^A-Za-z0-9._-]", "", re.sub(r"\s+", "_", term)) or "term"
-        metrics_csv = os.path.join(self.parent().project_folder, 'data', 'processed', f'collocates_metrics_{safe_term}_{start_lbl}_{end_lbl}.csv')
-        by_time_csv = os.path.join(self.parent().project_folder, 'data', 'processed', f'collocates_by_time_{safe_term}_{start_lbl}_{end_lbl}.csv')
+        time_bin_unit = self._current_time_bin_unit()
+        write_by_time = not ignore_bin
+        opts = self._collect_options()
 
-        # Run collocation analysis
+        parent = self.parent()
+        if parent is None:
+            QMessageBox.warning(self, 'Unavailable', 'Parent window not available.')
+            return
+
         try:
-            # Collect options from checkboxes
-            opts = {opt: cb.isChecked() for opt, cb in self.checks.items()}
             if self.mode_json.isChecked():
-                # JSON-only mode
-                json_path = getattr(self.parent(), 'json_file', None)
+                json_path = getattr(parent, 'json_file', None)
                 if not json_path or not os.path.exists(json_path):
                     self.choose_source_file()
-                    json_path = getattr(self.parent(), 'json_file', None)
+                    json_path = getattr(parent, 'json_file', None)
                     if not json_path:
                         return
-                _ = run_collocation(
-                    self.parent().project_folder,
-                    city=city, state=state,
-                    start_date=start or None, end_date=end or None,
+                result = run_collocation(
+                    parent.project_folder,
+                    city=city,
+                    state=state,
+                    start_date=start or None,
+                    end_date=end or None,
                     term=term,
-                    time_bin_unit=time_bin,
+                    time_bin_unit=time_bin_unit,
                     json_path=json_path,
                     geojson_path=None,
                     write_occurrences_geojson=False,
-                    **opts
+                    ignore_bin=ignore_bin,
+                    write_by_time=write_by_time,
+                    **opts,
                 )
-                QMessageBox.information(self, 'Done', f'Collocation metrics saved:\n{metrics_csv}')
-                preview = CSVPreviewDialog(metrics_csv, parent=self)
-                preview.show()
             else:
-                # GeoJSON mode
-                geo_path = getattr(self.parent(), 'geojson_file', None)
+                geo_path = getattr(parent, 'geojson_file', None)
                 if not geo_path or not os.path.exists(geo_path):
                     self.choose_source_file()
-                    geo_path = getattr(self.parent(), 'geojson_file', None)
+                    geo_path = getattr(parent, 'geojson_file', None)
                     if not geo_path:
                         return
-                out_geo = run_collocation(
-                    self.parent().project_folder,
-                    city=city, state=state,
-                    start_date=start or None, end_date=end or None,
+                result = run_collocation(
+                    parent.project_folder,
+                    city=city,
+                    state=state,
+                    start_date=start or None,
+                    end_date=end or None,
                     term=term,
-                    time_bin_unit=time_bin,
+                    time_bin_unit=time_bin_unit,
                     geojson_path=geo_path,
                     json_path=None,
                     write_occurrences_geojson=True,
-                    **opts
+                    ignore_bin=ignore_bin,
+                    write_by_time=write_by_time,
+                    **opts,
                 )
-                QMessageBox.information(self, 'Done', f'Collocated occurrences GeoJSON:\n{out_geo}\n\nMetrics:\n{metrics_csv}')
-                # Preview metrics CSV
-                preview = CSVPreviewDialog(metrics_csv, parent=self)
-                preview.show()
-                # Update main window with new GeoJSON (collocated occurrences)
-                if out_geo:
-                    parent = self.parent()
-                    parent.geojson_file = out_geo
-                    parent._update_loaded_file_labels()
-                # Optionally reveal the output file in OS file explorer
-                try:
-                    if sys.platform == "darwin":
-                        subprocess.run(['open', '-R', out_geo])
-                    elif sys.platform.startswith("win"):
-                        os.startfile(out_geo)  # type: ignore[attr-defined]
-                    else:
-                        subprocess.run(['xdg-open', os.path.dirname(out_geo)])
-                except Exception:
-                    pass
         except Exception as e:
             QMessageBox.critical(self, 'Error', str(e))
+            return
+
+        metrics_path = result.get('metrics')
+        if metrics_path and os.path.exists(metrics_path):
+            self.raise_()
+            self.activateWindow()
+            preview = CSVPreviewDialog(metrics_path, parent=self, max_rows=150)
+            preview.resize(1000, 620)
+            preview.show()
+            preview.raise_()
+            preview.activateWindow()
+            preview.setFocus()
+
+        self._last_output_paths = result
+        self._save_state()
+        mode_label = 'GeoJSON' if self.mode_geo.isChecked() else 'JSON'
+        self._log_collocation_run(
+            mode_label,
+            term,
+            start or 'all',
+            end or 'all',
+            city or 'All',
+            state or 'All',
+            time_bin_unit,
+            ignore_bin,
+            opts,
+            result,
+        )
 
     def show_bar(self):
-        term  = self.term_input.text().strip()
-        start = self.start_input.text().strip() or 'all'
-        end   = self.end_input.text().strip() or 'all'
-        safe_term = re.sub(r"[^A-Za-z0-9._-]", "", re.sub(r"\s+", "_", term)) or "term"
-        csv_path = os.path.join(self.parent().project_folder, 'data', 'processed', f'collocates_metrics_{safe_term}_{start}_{end}.csv')
-        plot_bar(csv_path)
+        term = self.term_input.text().strip()
+        if not term:
+            QMessageBox.warning(self, 'Search Term Required', 'Enter a search term to view bar charts.')
+            return
+        city_text = self.city_combo.currentText()
+        state_text = self.state_combo.currentText()
+        city = None if not city_text or city_text == 'All Cities' else city_text.strip()
+        state = None if not state_text or state_text == 'All States' else state_text.strip()
+        paths = self._build_output_paths(term, self.start_input.text().strip(), self.end_input.text().strip(), city, state, self._collect_options())
+        metrics_path = paths.get('metrics')
+        if not metrics_path or not os.path.exists(metrics_path):
+            QMessageBox.warning(self, 'File Not Found', 'Metrics file not found. Please run the collocation analysis first.')
+            return
+        fig = plot_bar(metrics_path)
+        if fig is not None:
+            fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
+
+    def _log_collocation_run(self, mode: str, term: str, start: str, end: str, city: str, state: str,
+                              time_bin_unit: Optional[str], ignore_bin: bool, options: dict,
+                              paths: dict):
+        parent = self.parent()
+        if parent is None:
+            return
+        summary_parts = [
+            f"Source: {mode}",
+            f"Term: {term or '(none)'}",
+            f"Dates: {start} → {end}",
+            f"City: {city}",
+            f"State: {state}",
+        ]
+        if ignore_bin:
+            summary_parts.append('Time bin: ignored')
+        else:
+            summary_parts.append(f"Time bin: {time_bin_unit or 'default'}")
+        enabled_opts = [name for name, enabled in options.items() if enabled]
+        summary_parts.append(f"Options: {', '.join(enabled_opts) if enabled_opts else 'none'}")
+        lines = [f"<div>{html.escape('; '.join(summary_parts))}</div>"]
+
+        def link_line(label: str, path: Optional[str]):
+            if not path:
+                return None
+            encoded = urllib.parse.quote(path)
+            return f'<div>{html.escape(label)}: <a href="chronam-open:{encoded}">{html.escape(path)}</a></div>'
+
+        metrics_line = link_line('Metrics CSV', paths.get('metrics'))
+        if metrics_line:
+            lines.append(metrics_line)
+        by_time_path = paths.get('by_time')
+        if by_time_path:
+            lines.append(link_line('By-time CSV', by_time_path))
+        elif ignore_bin:
+            lines.append('<div>By-time CSV not generated (ignore bin size enabled).</div>')
+        occ_line = link_line('Occurrences GeoJSON', paths.get('occurrences'))
+        if occ_line:
+            lines.append(occ_line)
+
+        parent.append_project_log('Collocation Analysis', lines)
+
+    def closeEvent(self, event):
+        self._save_state()
+        super().closeEvent(event)
+
+    def _refocus_collocation(self):
+        self.raise_()
+        self.activateWindow()
 
     def show_rank(self):
         term = self.term_input.text().strip()
-        start = self.start_input.text().strip() or 'all'
-        end = self.end_input.text().strip() or 'all'
-        safe_term = re.sub(r"[^A-Za-z0-9._-]", "", re.sub(r"\s+", "_", term)) or "term"
-        file_path = os.path.join(self.parent().project_folder, 'data', 'processed', f'collocates_by_time_{safe_term}_{start}_{end}.csv')
-        if not os.path.exists(file_path):
-            QMessageBox.warning(self, 'No Data', 'Collocation by-time data not found. Please run collocation with a time bin first.')
+        if not term:
+            QMessageBox.warning(self, 'Search Term Required', 'Enter a search term to view rank changes.')
+            return
+        city_text = self.city_combo.currentText()
+        state_text = self.state_combo.currentText()
+        city = None if not city_text or city_text == 'All Cities' else city_text.strip()
+        state = None if not state_text or state_text == 'All States' else state_text.strip()
+        paths = self._build_output_paths(term, self.start_input.text().strip(), self.end_input.text().strip(), city, state, self._collect_options())
+        file_path = paths.get('by_time')
+        if not file_path or not os.path.exists(file_path):
+            QMessageBox.warning(self, 'No Data', 'Collocation by-time data not found. Run collocation with a time bin first.')
             return
         try:
             df = pd.read_csv(file_path)

@@ -43,8 +43,10 @@ def plot_bar(collocation_results: Union[str, pd.DataFrame], output_path: Optiona
     if output_path:
         fig.savefig(output_path, dpi=150)
         plt.close(fig)
+        return fig
     else:
         plt.show(block=False)
+        return fig
 
 
 def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
@@ -91,5 +93,7 @@ def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
     if output_path:
         fig.savefig(output_path, dpi=150)
         plt.close(fig)
+        return fig
     else:
         plt.show(block=False)
+        return fig

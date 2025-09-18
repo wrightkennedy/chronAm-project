@@ -16,6 +16,7 @@ Key features implemented here:
 import os
 import json
 import math
+import hashlib
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -343,6 +344,82 @@ def _safe_term(term: Optional[str]) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "", re.sub(r"\s+", "_", term)) or "term"
 
 
+def _safe_component(value: Optional[str], default: str) -> str:
+    if not value:
+        return default
+    return _safe_term(str(value)) or default
+
+
+def _build_output_stem(
+    term: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    city: Optional[str],
+    state: Optional[str],
+    time_bin_unit: Optional[str],
+    ignore_bin: bool,
+    options: Dict[str, bool],
+) -> str:
+    safe_term = _safe_term(term)
+    start_lbl = _safe_component(start_date, "all")
+    end_lbl = _safe_component(end_date, "all")
+    city_lbl = _safe_component(city, "allcities")
+    state_lbl = _safe_component(state, "allstates")
+    if ignore_bin or not time_bin_unit:
+        bin_lbl = "nobin"
+    else:
+        bin_lbl = _safe_component(time_bin_unit.replace(" ", ""), "bin")
+    payload = {
+        "city": city or "all",
+        "state": state or "all",
+        "start": start_date or "all",
+        "end": end_date or "all",
+        "time_bin_unit": None if ignore_bin else time_bin_unit,
+        "options": options,
+    }
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:8]
+    return "_".join([safe_term, start_lbl, end_lbl, city_lbl, state_lbl, bin_lbl, digest])
+
+
+def _build_output_paths(
+    processed_dir: str,
+    term: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    city: Optional[str],
+    state: Optional[str],
+    time_bin_unit: Optional[str],
+    ignore_bin: bool,
+    options: Dict[str, bool],
+) -> Dict[str, Optional[str]]:
+    stem = _build_output_stem(term, start_date, end_date, city, state, time_bin_unit, ignore_bin, options)
+    metrics = os.path.join(processed_dir, f"collocates_metrics_{stem}.csv")
+    by_time = None if ignore_bin or not time_bin_unit else os.path.join(processed_dir, f"collocates_by_time_{stem}.csv")
+    occurrences = os.path.join(processed_dir, f"occurrences_{stem}.geojson")
+    return {
+        "stem": stem,
+        "metrics": metrics,
+        "by_time": by_time,
+        "occurrences": occurrences,
+    }
+
+
+def build_collocation_output_paths(
+    project_dir: str,
+    *,
+    term: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    city: Optional[str],
+    state: Optional[str],
+    time_bin_unit: Optional[str],
+    ignore_bin: bool,
+    options: Dict[str, bool],
+) -> Dict[str, Optional[str]]:
+    processed = init_project(project_dir)["processed"]
+    return _build_output_paths(processed, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, options)
+
+
 def run_collocation(
     project_dir: str,
     city: Optional[str] = None,
@@ -359,7 +436,9 @@ def run_collocation(
     include_relative_position: bool = False,
     drop_stopwords: bool = False,
     write_occurrences_geojson: bool = False,
-) -> Optional[str]:
+    ignore_bin: bool = False,
+    write_by_time: bool = True,
+) -> Dict[str, Optional[str]]:
     """
     Execute collocation analysis. Writes outputs into data/processed.
 
@@ -375,6 +454,13 @@ def run_collocation(
         include_relative_position=include_relative_position,
         drop_stopwords=drop_stopwords,
     )
+    opt_dict = {
+        "include_page_count": include_page_count,
+        "include_first_last_date": include_first_last_date,
+        "include_cooccurrence_rate": include_cooccurrence_rate,
+        "include_relative_position": include_relative_position,
+        "drop_stopwords": drop_stopwords,
+    }
 
     paths = init_project(project_dir)
     proc = paths["processed"]
@@ -389,14 +475,15 @@ def run_collocation(
     df = _filter_df(df, start_date, end_date, city, state, is_geo=is_geo)
     if df.empty:
         # Still write empty CSVs to keep UI predictable
-        safe = _safe_term(term)
-        start_lbl = start_date or "all"
-        end_lbl = end_date or "all"
-        metrics_csv = os.path.join(proc, f"collocates_metrics_{safe}_{start_lbl}_{end_lbl}.csv")
-        bytime_csv = os.path.join(proc, f"collocates_by_time_{safe}_{start_lbl}_{end_lbl}.csv")
-        pd.DataFrame(columns=["collocate_term","frequency"]).to_csv(metrics_csv, index=False)
-        pd.DataFrame(columns=["time_bin","collocate_term","frequency","ordinal_rank"]).to_csv(bytime_csv, index=False)
-        return None
+        empty_paths = _build_output_paths(proc, _safe_term(term), start_date, end_date, city, state, time_bin_unit, ignore_bin, opt_dict)
+        pd.DataFrame(columns=["collocate_term","frequency"]).to_csv(empty_paths["metrics"], index=False)
+        if write_by_time and empty_paths["by_time"]:
+            pd.DataFrame(columns=["time_bin","collocate_term","frequency","ordinal_rank"]).to_csv(empty_paths["by_time"], index=False)
+        return {
+            "metrics": empty_paths["metrics"],
+            "by_time": empty_paths["by_time"] if write_by_time else None,
+            "occurrences": None,
+        }
 
     # Ensure term is present
     if not term:
@@ -416,15 +503,11 @@ def run_collocation(
     metrics, _ = _collocate_from_df(df, term, opts)
 
     # Write metrics CSV
-    safe = _safe_term(term)
-    start_lbl = start_date or "all"
-    end_lbl = end_date or "all"
-    metrics_csv = os.path.join(proc, f"collocates_metrics_{safe}_{start_lbl}_{end_lbl}.csv")
-    metrics.to_csv(metrics_csv, index=False)
+    output_paths = _build_output_paths(proc, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, opt_dict)
+    metrics.to_csv(output_paths["metrics"], index=False)
 
-    # Build by-time CSV if time_bin_unit provided
-    bytime_csv = os.path.join(proc, f"collocates_by_time_{safe}_{start_lbl}_{end_lbl}.csv")
-    if time_bin_unit and isinstance(time_bin_unit, str):
+    # Build by-time CSV if requested
+    if write_by_time and output_paths["by_time"] and time_bin_unit and isinstance(time_bin_unit, str):
         parts = time_bin_unit.strip().split()
         if len(parts) == 2 and parts[0].isdigit():
             size = int(parts[0])
@@ -433,12 +516,10 @@ def run_collocation(
             # default 1 month
             size, unit = 1, "months"
         by_time = _build_by_time(df, term, opts, start_date, end_date, size, unit)
-        by_time.to_csv(bytime_csv, index=False)
-    else:
-        # if no time bin requested, write an empty structure (prevents FileNotFoundError downstream)
-        pd.DataFrame(columns=["time_bin","collocate_term","frequency","ordinal_rank"]).to_csv(bytime_csv, index=False)
+        by_time.to_csv(output_paths["by_time"], index=False)
 
     # Optionally write occurrences geojson (filtered subset)
+    occurrence_path = None
     if write_occurrences_geojson and geojson_path:
         try:
             with open(geojson_path, "r", encoding="utf-8") as f:
@@ -465,16 +546,20 @@ def run_collocation(
                     sel.append(ft)
             out = {
                 "type": "FeatureCollection",
-                "name": f"occurrences_{safe}_{start_lbl}_{end_lbl}",
+                "name": os.path.splitext(os.path.basename(output_paths["occurrences"]))[0],
                 "crs": gj.get("crs", {"type":"name", "properties":{"name":"urn:ogc:def:crs:OGC:1.3:CRS84"}}),
                 "features": sel,
             }
-            out_path = os.path.join(proc, f"occurrences_{safe}_{start_lbl}_{end_lbl}.geojson")
+            out_path = output_paths["occurrences"]
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(out, f)
-            return out_path
+            occurrence_path = out_path
         except Exception:
-            # don't fail the whole run if we can't write occurrences
-            return None
+            occurrence_path = None
 
-    return None
+    result = {
+        "metrics": output_paths["metrics"],
+        "by_time": output_paths["by_time"] if write_by_time else None,
+        "occurrences": occurrence_path,
+    }
+    return result

@@ -14,7 +14,7 @@ __version__ = "0.2.0"
 from .config import init_project
 from .merge import merge_geojson
 from .fetch_metadata import fetch_missing_metadata
-from .collocate import run_collocation
+from .collocate import run_collocation, build_collocation_output_paths
 from .visualize import plot_bar, plot_rank_changes
 
 # Local (DuckDB) is the default
@@ -32,6 +32,7 @@ __all__ = [
     "merge_geojson",
     "fetch_missing_metadata",
     "run_collocation",
+    "build_collocation_output_paths",
     "plot_bar",
     "plot_rank_changes",
 ]
