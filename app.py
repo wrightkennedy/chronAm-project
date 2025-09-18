@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QAction, QFileDialog, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QProgressBar, QMessageBox, QCheckBox, QFormLayout, QInputDialog, QDialog, QTextBrowser, QComboBox,
-    QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup, QDockWidget
+    QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup, QDockWidget, QDialogButtonBox, QSpinBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, pyqtProperty, QUrl, QObject, QEvent
 from PyQt5.QtGui import QPainter, QPen, QIntValidator, QTextCursor, QKeySequence
@@ -124,6 +124,12 @@ class MainWindow(QMainWindow):
         self.project_log_entries = []
         self.project_file = None
         self.collocation_state = {}
+        self.map_time_settings = {
+            'time_unit': 'week',
+            'time_step': 1,
+            'linger_unit': 'week',
+            'linger_step': 2,
+        }
         self.init_ui()
         self._close_filter = CloseShortcutFilter()
         QApplication.instance().installEventFilter(self._close_filter)
@@ -417,6 +423,12 @@ class MainWindow(QMainWindow):
         self.search_log_history.clear()
         self.project_log_entries.clear()
         self.collocation_state = {}
+        self.map_time_settings = {
+            'time_unit': 'week',
+            'time_step': 1,
+            'linger_unit': 'week',
+            'linger_step': 2,
+        }
 
         self.ensure_dataset_folder(prompt=False)
         self._update_loaded_file_labels()
@@ -459,6 +471,12 @@ class MainWindow(QMainWindow):
         locations_csv = data.get('locations_csv_path')
         self.locations_csv_path = locations_csv if isinstance(locations_csv, str) else None
         self.collocation_state = {}
+        self.map_time_settings = {
+            'time_unit': 'week',
+            'time_step': 1,
+            'linger_unit': 'week',
+            'linger_step': 2,
+        }
 
         search_log = data.get('search_log_history')
         if search_log is None:
@@ -646,25 +664,20 @@ class MainWindow(QMainWindow):
         )
         if not ok:
             return
-        # Example: ask for unit, step, linger
-        units = ["day", "week", "month", "year"]
-        time_unit, ok = QInputDialog.getItem(self, "Time Unit", "Unit:", units, 1, False)
-        if not ok: return
-        time_step, ok = QInputDialog.getInt(self, "Time Step", "Step:", 1, 1, 24)
-        if not ok: return
-        linger_unit, ok = QInputDialog.getItem(self, "Linger Unit", "Unit:", units, 1, False)
-        if not ok: return
-        linger_step, ok = QInputDialog.getInt(self, "Linger After", "Length:", 2, 0, 52)
-        if not ok: return
-        
+        time_dialog = MapTimeSettingsDialog(self, self.map_time_settings)
+        if time_dialog.exec_() != QDialog.Accepted:
+            return
+        time_cfg = time_dialog.values()
+        self.map_time_settings = dict(time_cfg)
+
         try:
             out_html = create_map(
                 self.geojson_file,
                 mode=str(mode).strip().lower(),
-                time_unit=time_unit,
-                time_step=time_step,
-                linger_unit=linger_unit,
-                linger_step=linger_step
+                time_unit=time_cfg['time_unit'],
+                time_step=time_cfg['time_step'],
+                linger_unit=time_cfg['linger_unit'],
+                linger_step=time_cfg['linger_step']
             )
 #         try:
 #             # out_html = create_map(self.geojson_file, mode=str(mode).strip().lower())
@@ -1312,6 +1325,103 @@ class CSVPreviewDialog(QDialog):
         tbl.setFocus()
         self.table = tbl
 
+
+class CollocationRankSettingsDialog(QDialog):
+    def __init__(self, parent, bins: List[str], max_terms: int, default_top_n: int = 10):
+        super().__init__(parent)
+        self.setWindowTitle('Rank Chart Settings')
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+
+        self.top_spin = QSpinBox()
+        self.top_spin.setRange(1, max(1, max_terms))
+        self.top_spin.setValue(min(default_top_n, max(1, max_terms)))
+        form.addRow('Top N terms:', self.top_spin)
+
+        self.home_combo = QComboBox()
+        for label in bins:
+            self.home_combo.addItem(str(label))
+        form.addRow('Home time bin:', self.home_combo)
+
+        self.global_check = QCheckBox('Rank terms across entire time period (ignore home bin)')
+        form.addRow(self.global_check)
+
+        self.labels_check = QCheckBox('Show term labels on chart')
+        form.addRow(self.labels_check)
+
+        layout.addLayout(form)
+
+        self.global_check.toggled.connect(self.home_combo.setDisabled)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> dict:
+        return {
+            'top_n': self.top_spin.value(),
+            'home_bin_index': self.home_combo.currentIndex(),
+            'use_global': self.global_check.isChecked(),
+            'show_labels': self.labels_check.isChecked(),
+        }
+
+
+class MapTimeSettingsDialog(QDialog):
+    def __init__(self, parent=None, defaults=None):
+        super().__init__(parent)
+        self.setWindowTitle('Map Time Settings')
+        layout = QVBoxLayout(self)
+
+        defaults = defaults or {}
+        time_unit_def = defaults.get('time_unit', 'week')
+        time_step_def = defaults.get('time_step', 1)
+        linger_unit_def = defaults.get('linger_unit', 'week')
+        linger_step_def = defaults.get('linger_step', 2)
+
+        form = QFormLayout()
+        units = ['day', 'week', 'month', 'year']
+
+        self.time_unit = QComboBox()
+        self.time_unit.addItems(units)
+        idx = self.time_unit.findText(time_unit_def, Qt.MatchFixedString)
+        if idx >= 0:
+            self.time_unit.setCurrentIndex(idx)
+        form.addRow('Time unit:', self.time_unit)
+
+        self.time_step = QSpinBox()
+        self.time_step.setRange(1, 52)
+        self.time_step.setValue(max(1, int(time_step_def)))
+        form.addRow('Time step:', self.time_step)
+
+        self.linger_unit = QComboBox()
+        self.linger_unit.addItems(units)
+        idx = self.linger_unit.findText(linger_unit_def, Qt.MatchFixedString)
+        if idx >= 0:
+            self.linger_unit.setCurrentIndex(idx)
+        form.addRow('Linger unit:', self.linger_unit)
+
+        self.linger_step = QSpinBox()
+        self.linger_step.setRange(0, 104)
+        self.linger_step.setValue(max(0, int(linger_step_def)))
+        form.addRow('Linger length:', self.linger_step)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> dict:
+        return {
+            'time_unit': self.time_unit.currentText(),
+            'time_step': self.time_step.value(),
+            'linger_unit': self.linger_unit.currentText(),
+            'linger_step': self.linger_step.value(),
+        }
+
 class CollocationDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1319,6 +1429,7 @@ class CollocationDialog(QDialog):
         self.setMinimumSize(620, 580)
         layout = QVBoxLayout(self)
         self._last_output_paths = None
+        self._preview_windows = []
 
         # --- Source selection & status line ---
         mode_row = QHBoxLayout()
@@ -1647,6 +1758,48 @@ class CollocationDialog(QDialog):
             options=options,
         )
 
+    def _register_preview(self, preview: QDialog):
+        if preview is None:
+            return
+        self._preview_windows.append(preview)
+
+        def _cleanup(_obj=None, ref=preview):
+            if ref in self._preview_windows:
+                self._preview_windows.remove(ref)
+
+        preview.destroyed.connect(_cleanup)
+
+    def _confirm_overwrite_if_needed(self, paths: dict) -> bool:
+        existing = [p for p in (paths.get('metrics'), paths.get('by_time'), paths.get('occurrences')) if p and os.path.exists(p)]
+        if not existing:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle('Overwrite Existing Results?')
+        box.setText('Collocation outputs already exist for these parameters.')
+        box.setInformativeText('\n'.join(existing))
+        overwrite_btn = box.addButton('Overwrite', QMessageBox.AcceptRole)
+        open_btn = box.addButton('Open Existing', QMessageBox.ActionRole)
+        cancel_btn = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(overwrite_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked == overwrite_btn:
+            return True
+        if clicked == open_btn:
+            metrics = paths.get('metrics')
+            if metrics and os.path.exists(metrics):
+                preview = CSVPreviewDialog(metrics, parent=self, max_rows=150)
+                preview.resize(1000, 620)
+                preview.show()
+                preview.raise_()
+                preview.activateWindow()
+                preview.setFocus()
+                self._register_preview(preview)
+            return False
+        return False
+
     def _save_state(self):
         if self._loading_defaults:
             return
@@ -1761,6 +1914,10 @@ class CollocationDialog(QDialog):
             QMessageBox.warning(self, 'Unavailable', 'Parent window not available.')
             return
 
+        predicted_paths = self._build_output_paths(term, start or None, end or None, city, state, opts)
+        if not self._confirm_overwrite_if_needed(predicted_paths):
+            return
+
         try:
             if self.mode_json.isChecked():
                 json_path = getattr(parent, 'json_file', None)
@@ -1820,6 +1977,7 @@ class CollocationDialog(QDialog):
             preview.raise_()
             preview.activateWindow()
             preview.setFocus()
+            self._register_preview(preview)
 
         self._last_output_paths = result
         self._save_state()
@@ -1926,40 +2084,62 @@ class CollocationDialog(QDialog):
         if df.empty or 'time_bin' not in df.columns or 'collocate_term' not in df.columns or 'ordinal_rank' not in df.columns:
             QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available for the selected parameters.')
             return
-        # Determine time bins and prompt user for home bin and top-N
         try:
-            unique_bins = sorted(df['time_bin'].unique(), key=lambda x: pd.to_datetime(str(x), errors='coerce'))
+            bins_ordered = sorted(df['time_bin'].unique(), key=lambda x: pd.to_datetime(str(x), errors='coerce'))
         except Exception:
-            unique_bins = sorted(df['time_bin'].unique())
-        num_bins = len(unique_bins)
-        if num_bins == 0:
+            bins_ordered = sorted(df['time_bin'].unique())
+        if not bins_ordered:
             QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available.')
             return
-        bin_num, ok = QInputDialog.getInt(self, 'Select Home Bin', f'Select a home rank bin (1 - {num_bins}):', 1, 1, num_bins)
-        if not ok:
+        unique_terms = df['collocate_term'].dropna().unique().tolist()
+        if not unique_terms:
+            QMessageBox.information(self, 'No Rank Data', 'No collocate terms available to plot.')
             return
-        home_idx = bin_num - 1
-        if home_idx < 0 or home_idx >= num_bins:
+        default_top = min(10, len(unique_terms)) or 1
+        settings_dialog = CollocationRankSettingsDialog(self, bins_ordered, len(unique_terms), default_top)
+        if settings_dialog.exec_() != QDialog.Accepted:
             return
-        home_bin_label = unique_bins[home_idx]
-        df_home = df[df['time_bin'] == home_bin_label]
-        if df_home.empty:
-            QMessageBox.information(self, 'No Data', 'The selected bin contains no collocates.')
+        settings = settings_dialog.values()
+        top_n = settings['top_n']
+        use_global = settings['use_global']
+        show_labels = settings['show_labels']
+
+        averages = None
+        if use_global:
+            averages = df.groupby('collocate_term')['ordinal_rank'].mean().dropna()
+            top_terms = averages.sort_values().head(top_n).index.tolist()
+        else:
+            home_idx = settings['home_bin_index']
+            home_idx = max(0, min(home_idx, len(bins_ordered) - 1))
+            home_label = bins_ordered[home_idx]
+            df_home = df[df['time_bin'] == home_label].dropna(subset=['ordinal_rank'])
+            if df_home.empty:
+                QMessageBox.information(self, 'No Data', 'The selected bin contains no collocates.')
+                return
+            df_home_sorted = df_home.sort_values('ordinal_rank')
+            top_terms = df_home_sorted.head(top_n)['collocate_term'].tolist()
+
+        if not top_terms:
+            QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
             return
-        max_terms = len(df_home)
-        default_n = 10 if max_terms >= 10 else max_terms
-        N, ok = QInputDialog.getInt(self, 'Select Top N', f'Enter top N terms to display (max {max_terms}):', default_n, 1, max_terms)
-        if not ok:
-            return
-        N = int(N)
-        # Get top-N collocate terms in the selected home bin
-        df_home_sorted = df_home.sort_values('ordinal_rank')
-        top_terms = df_home_sorted.head(N)['collocate_term'].tolist()
+
         df_top = df[df['collocate_term'].isin(top_terms)].copy()
         if df_top.empty:
             QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
             return
-        plot_rank_changes(df_top)
+
+        if use_global:
+            if averages is None:
+                averages = df_top.groupby('collocate_term')['ordinal_rank'].mean().dropna()
+            ordered_series = averages.reindex(top_terms).dropna().sort_values()
+            legend_order = ordered_series.index.tolist()
+            if not legend_order:
+                legend_order = top_terms
+        else:
+            legend_order = top_terms
+
+        fig = plot_rank_changes(df_top, legend_order=legend_order, show_term_labels=show_labels)
+        fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
