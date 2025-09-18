@@ -15,8 +15,9 @@ from PyQt5.QtWidgets import (
     QFileDialog, QApplication, QMainWindow, QAction, QWidget,
     QApplication, QMainWindow, QAction, QFileDialog, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QProgressBar, QMessageBox, QCheckBox, QFormLayout, QInputDialog, QDialog, QTextBrowser, QComboBox,
-    QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup, QDockWidget, QDialogButtonBox, QSpinBox
+    QProgressBar, QMessageBox, QCheckBox, QFormLayout, QDialog, QTextBrowser, QComboBox,
+    QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup, QDockWidget, QDialogButtonBox, QSpinBox,
+    QDoubleSpinBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, pyqtProperty, QUrl, QObject, QEvent
 from PyQt5.QtGui import QPainter, QPen, QIntValidator, QTextCursor, QKeySequence
@@ -124,11 +125,15 @@ class MainWindow(QMainWindow):
         self.project_log_entries = []
         self.project_file = None
         self.collocation_state = {}
-        self.map_time_settings = {
+        self.map_settings = {
+            'mode': 'points',
             'time_unit': 'week',
             'time_step': 1,
             'linger_unit': 'week',
             'linger_step': 2,
+            'disable_time': False,
+            'heat_radius': 15,
+            'heat_value': 1.0,
         }
         self.init_ui()
         self._close_filter = CloseShortcutFilter()
@@ -423,11 +428,15 @@ class MainWindow(QMainWindow):
         self.search_log_history.clear()
         self.project_log_entries.clear()
         self.collocation_state = {}
-        self.map_time_settings = {
+        self.map_settings = {
+            'mode': 'points',
             'time_unit': 'week',
             'time_step': 1,
             'linger_unit': 'week',
             'linger_step': 2,
+            'disable_time': False,
+            'heat_radius': 15,
+            'heat_value': 1.0,
         }
 
         self.ensure_dataset_folder(prompt=False)
@@ -471,11 +480,15 @@ class MainWindow(QMainWindow):
         locations_csv = data.get('locations_csv_path')
         self.locations_csv_path = locations_csv if isinstance(locations_csv, str) else None
         self.collocation_state = {}
-        self.map_time_settings = {
+        self.map_settings = {
+            'mode': 'points',
             'time_unit': 'week',
             'time_step': 1,
             'linger_unit': 'week',
             'linger_step': 2,
+            'disable_time': False,
+            'heat_radius': 15,
+            'heat_value': 1.0,
         }
 
         search_log = data.get('search_log_history')
@@ -652,43 +665,24 @@ class MainWindow(QMainWindow):
             if not self.geojson_file or not os.path.exists(self.geojson_file):
                 return
 
-        # Ask for map mode
-        modes = ['Points', 'Heatmap']
-        mode, ok = QInputDialog.getItem(
-            self,
-            'Map Mode',
-            'Select map mode:',
-            modes,
-            0,
-            False
-        )
-        if not ok:
+        settings_dialog = MapCreationDialog(self, defaults=self.map_settings)
+        if settings_dialog.exec_() != QDialog.Accepted:
             return
-        time_dialog = MapTimeSettingsDialog(self, self.map_time_settings)
-        if time_dialog.exec_() != QDialog.Accepted:
-            return
-        time_cfg = time_dialog.values()
-        self.map_time_settings = dict(time_cfg)
+        cfg = settings_dialog.values()
+        self.map_settings = dict(cfg)
 
         try:
             out_html = create_map(
                 self.geojson_file,
-                mode=str(mode).strip().lower(),
-                time_unit=time_cfg['time_unit'],
-                time_step=time_cfg['time_step'],
-                linger_unit=time_cfg['linger_unit'],
-                linger_step=time_cfg['linger_step']
+                mode=str(cfg['mode']).strip().lower(),
+                time_unit=cfg['time_unit'],
+                time_step=cfg['time_step'],
+                linger_unit=cfg['linger_unit'],
+                linger_step=cfg['linger_step'],
+                disable_time=cfg['disable_time'],
+                heat_radius=cfg.get('heat_radius'),
+                heat_value=cfg.get('heat_value'),
             )
-#         try:
-#             # out_html = create_map(self.geojson_file, mode=str(mode).strip().lower())
-#             out_html = create_map(
-#                 self.geojson_file,
-#                 mode=str(mode).strip().lower(),                
-#                 time_unit="week",
-#                 time_step=1,
-#                 linger_unit="week",
-#                 linger_step=2,   # points remain 2 weeks after their date
-# )
         except Exception as e:
             QMessageBox.critical(self, 'Map Error', f'Failed to create map:\n{e}')
             return
@@ -1368,44 +1362,73 @@ class CollocationRankSettingsDialog(QDialog):
         }
 
 
-class MapTimeSettingsDialog(QDialog):
+class MapCreationDialog(QDialog):
     def __init__(self, parent=None, defaults=None):
         super().__init__(parent)
-        self.setWindowTitle('Map Time Settings')
+        self.setWindowTitle('Create Map')
         layout = QVBoxLayout(self)
 
         defaults = defaults or {}
-        time_unit_def = defaults.get('time_unit', 'week')
-        time_step_def = defaults.get('time_step', 1)
-        linger_unit_def = defaults.get('linger_unit', 'week')
-        linger_step_def = defaults.get('linger_step', 2)
-
         form = QFormLayout()
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem('Point Map', 'points')
+        self.mode_combo.addItem('Heat Map', 'heatmap')
+        mode_def = str(defaults.get('mode', 'points')).lower()
+        idx = self.mode_combo.findData(mode_def)
+        if idx >= 0:
+            self.mode_combo.setCurrentIndex(idx)
+        form.addRow('Map type:', self.mode_combo)
+
+        self.disable_time = QCheckBox('Disable time animation')
+        self.disable_time.setChecked(bool(defaults.get('disable_time', False)))
+        form.addRow(self.disable_time)
+
         units = ['day', 'week', 'month', 'year']
 
+        time_row = QWidget()
+        time_layout = QHBoxLayout(time_row)
+        time_layout.setContentsMargins(0, 0, 0, 0)
+        self.time_step = QSpinBox()
+        self.time_step.setRange(1, 104)
+        self.time_step.setValue(max(1, int(defaults.get('time_step', 1))))
+        self.time_step.setMaximumWidth(80)
+        time_layout.addWidget(self.time_step)
         self.time_unit = QComboBox()
         self.time_unit.addItems(units)
-        idx = self.time_unit.findText(time_unit_def, Qt.MatchFixedString)
+        idx = self.time_unit.findText(str(defaults.get('time_unit', 'week')), Qt.MatchFixedString)
         if idx >= 0:
             self.time_unit.setCurrentIndex(idx)
-        form.addRow('Time unit:', self.time_unit)
+        time_layout.addWidget(self.time_unit)
+        form.addRow('Time bin:', time_row)
 
-        self.time_step = QSpinBox()
-        self.time_step.setRange(1, 52)
-        self.time_step.setValue(max(1, int(time_step_def)))
-        form.addRow('Time step:', self.time_step)
-
-        self.linger_unit = QComboBox()
-        self.linger_unit.addItems(units)
-        idx = self.linger_unit.findText(linger_unit_def, Qt.MatchFixedString)
-        if idx >= 0:
-            self.linger_unit.setCurrentIndex(idx)
-        form.addRow('Linger unit:', self.linger_unit)
-
+        linger_row = QWidget()
+        linger_layout = QHBoxLayout(linger_row)
+        linger_layout.setContentsMargins(0, 0, 0, 0)
         self.linger_step = QSpinBox()
         self.linger_step.setRange(0, 104)
-        self.linger_step.setValue(max(0, int(linger_step_def)))
-        form.addRow('Linger length:', self.linger_step)
+        self.linger_step.setValue(max(0, int(defaults.get('linger_step', 2))))
+        self.linger_step.setMaximumWidth(80)
+        linger_layout.addWidget(self.linger_step)
+        self.linger_unit = QComboBox()
+        self.linger_unit.addItems(units)
+        idx = self.linger_unit.findText(str(defaults.get('linger_unit', 'week')), Qt.MatchFixedString)
+        if idx >= 0:
+            self.linger_unit.setCurrentIndex(idx)
+        linger_layout.addWidget(self.linger_unit)
+        form.addRow('Linger:', linger_row)
+
+        self.heat_radius = QSpinBox()
+        self.heat_radius.setRange(1, 120)
+        self.heat_radius.setValue(max(1, int(defaults.get('heat_radius', 15))))
+        form.addRow('Heat radius:', self.heat_radius)
+
+        self.heat_value = QDoubleSpinBox()
+        self.heat_value.setRange(0.1, 25.0)
+        self.heat_value.setSingleStep(0.1)
+        self.heat_value.setDecimals(2)
+        self.heat_value.setValue(float(defaults.get('heat_value', 1.0)))
+        form.addRow('Heat value:', self.heat_value)
 
         layout.addLayout(form)
 
@@ -1414,12 +1437,29 @@ class MapTimeSettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        self.mode_combo.currentIndexChanged.connect(self._update_enabled_state)
+        self.disable_time.toggled.connect(self._update_enabled_state)
+        self._update_enabled_state()
+
+    def _update_enabled_state(self):
+        heat_mode = self.mode_combo.currentData() == 'heatmap'
+        time_enabled = heat_mode and not self.disable_time.isChecked()
+        for widget in (self.time_step, self.time_unit, self.linger_step, self.linger_unit):
+            widget.setEnabled(time_enabled)
+        for widget in (self.heat_radius, self.heat_value):
+            widget.setEnabled(heat_mode)
+        self.disable_time.setEnabled(heat_mode)
+
     def values(self) -> dict:
         return {
+            'mode': self.mode_combo.currentData(),
             'time_unit': self.time_unit.currentText(),
             'time_step': self.time_step.value(),
             'linger_unit': self.linger_unit.currentText(),
             'linger_step': self.linger_step.value(),
+            'disable_time': self.disable_time.isChecked(),
+            'heat_radius': self.heat_radius.value(),
+            'heat_value': self.heat_value.value(),
         }
 
 class CollocationDialog(QDialog):
