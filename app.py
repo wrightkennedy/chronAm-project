@@ -138,7 +138,8 @@ class MainWindow(QMainWindow):
             'grad_max_radius': 28,
             'metric': 'article_count',
             'normalize': False,
-            'normalize_denominator': 'word_count',
+            'normalize_denominator': 'article_count',
+            'lightweight': False,
         }
         self.init_ui()
         self._close_filter = CloseShortcutFilter()
@@ -201,7 +202,7 @@ class MainWindow(QMainWindow):
         self.btn_collocate = QPushButton('C) Run Collocation Analysis')
         self.btn_collocate.clicked.connect(self.action_collocate)
         self.btn_map = QPushButton('D) Create Map')
-        self.btn_map.clicked.connect(self.action_create_map)
+        self.btn_map.clicked.connect(self.open_create_map_dialog)
         for btn in (self.btn_download, self.btn_update, self.btn_collocate, self.btn_map):
             main_layout.addWidget(btn)
 
@@ -446,7 +447,8 @@ class MainWindow(QMainWindow):
             'grad_max_radius': 28,
             'metric': 'article_count',
             'normalize': False,
-            'normalize_denominator': 'word_count',
+            'normalize_denominator': 'article_count',
+            'lightweight': False,
         }
 
         self.ensure_dataset_folder(prompt=False)
@@ -503,7 +505,8 @@ class MainWindow(QMainWindow):
             'grad_max_radius': 28,
             'metric': 'article_count',
             'normalize': False,
-            'normalize_denominator': 'word_count',
+            'normalize_denominator': 'article_count',
+            'lightweight': False,
         }
 
         search_log = data.get('search_log_history')
@@ -672,70 +675,11 @@ class MainWindow(QMainWindow):
         dlg.show()
 
 
-    def action_create_map(self):
-        """Create an interactive map from the currently loaded GeoJSON."""
-        # Ensure we have a geojson file selected
-        if not self.geojson_file or not os.path.exists(self.geojson_file):
-            self.open_geojson_file()
-            if not self.geojson_file or not os.path.exists(self.geojson_file):
-                return
-
-        settings_dialog = MapCreationDialog(self, defaults=self.map_settings)
-        if settings_dialog.exec_() != QDialog.Accepted:
-            return
-        cfg = settings_dialog.values()
-        self.map_settings = dict(cfg)
-
-        try:
-            result = create_map(
-                self.geojson_file,
-                mode=str(cfg['mode']).strip().lower(),
-                time_unit=cfg['time_unit'],
-                time_step=cfg['time_step'],
-                linger_unit=cfg['linger_unit'],
-                linger_step=cfg['linger_step'],
-                disable_time=cfg['disable_time'],
-                heat_radius=cfg.get('heat_radius'),
-                heat_value=cfg.get('heat_value'),
-                grad_min_radius=cfg.get('grad_min_radius'),
-                grad_max_radius=cfg.get('grad_max_radius'),
-                metric=cfg.get('metric'),
-                normalize=cfg.get('normalize'),
-                normalize_denominator=cfg.get('normalize_denominator'),
-            )
-        except Exception as e:
-            QMessageBox.critical(self, 'Map Error', f'Failed to create map:\n{e}')
-            return
-
-        map_path = None
-        attr_path = None
-        if isinstance(result, dict):
-            map_path = result.get('map_path')
-            attr_path = result.get('attribute_table')
-        else:
-            map_path = result
-
-        if not map_path:
-            QMessageBox.critical(self, 'Map Error', 'Map creation did not return an output path.')
-            return
-
-        import webbrowser
-        webbrowser.open('file://' + os.path.abspath(map_path))
-
-        log_lines = [
-            (
-                '<div>Interactive map saved to: '
-                f'<a href="file://{html.escape(os.path.abspath(map_path))}" target="_blank" rel="noopener">'
-                f'{html.escape(map_path)}</a></div>'
-            )
-        ]
-        if attr_path:
-            log_lines.append(
-                '<div>Attribute table saved to: '
-                f'<a href="file://{html.escape(os.path.abspath(attr_path))}" target="_blank" rel="noopener">'
-                f'{html.escape(attr_path)}</a></div>'
-            )
-        self.append_project_log('Create Map', log_lines)
+    def open_create_map_dialog(self):
+        dlg = MapToolDialog(self)
+        dlg.setModal(False)
+        dlg.setWindowModality(Qt.NonModal)
+        dlg.show()
 
 class DownloadDialog(QDialog):
     def __init__(self, parent=None):
@@ -1407,118 +1351,123 @@ class CollocationRankSettingsDialog(QDialog):
         }
 
 
-class MapCreationDialog(QDialog):
+
+class MapToolDialog(QDialog):
+    METRIC_OPTIONS = [
+        {
+            'label': 'Articles',
+            'value': 'article_count',
+            'denominator': 'article_count',
+            'metric_display': 'Articles',
+            'normalized_display': 'Articles / Total Articles',
+            'denom_label': 'total articles',
+        },
+        {
+            'label': 'Page count',
+            'value': 'page_count',
+            'denominator': 'page_count',
+            'metric_display': 'Pages',
+            'normalized_display': 'Pages / Total Pages',
+            'denom_label': 'total pages',
+        },
+        {
+            'label': 'Term frequency',
+            'value': 'key_term_frequency',
+            'denominator': 'word_count',
+            'metric_display': 'Term Frequency',
+            'normalized_display': 'Term Frequency / Total Words',
+            'denom_label': 'total words',
+        },
+    ]
+
     def __init__(self, parent=None, defaults=None):
         super().__init__(parent)
         self.setWindowTitle('Create Map')
-        layout = QVBoxLayout(self)
+        self.setMinimumSize(560, 560)
+        self._parent = parent
+        defaults = defaults or getattr(parent, 'map_settings', {})
+        self._metric_map = {opt['value']: opt for opt in self.METRIC_OPTIONS}
+        self.geojson_path = getattr(parent, 'geojson_file', None)
 
-        defaults = defaults or {}
+        main_layout = QVBoxLayout(self)
+
         form = QFormLayout()
+
+        geo_row = QWidget()
+        geo_layout = QHBoxLayout(geo_row)
+        geo_layout.setContentsMargins(0, 0, 0, 0)
+        self.geojson_display = QLabel()
+        self.geojson_display.setWordWrap(True)
+        geo_layout.addWidget(self.geojson_display, 1)
+        self.browse_geojson_btn = QPushButton('Browse…')
+        self.browse_geojson_btn.clicked.connect(self._choose_geojson)
+        geo_layout.addWidget(self.browse_geojson_btn, 0)
+        form.addRow('GeoJSON:', geo_row)
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItem('Point Map', 'points')
         self.mode_combo.addItem('Graduated Symbols', 'graduated')
         self.mode_combo.addItem('Heat Map', 'heatmap')
-        mode_def = str(defaults.get('mode', 'points')).lower()
-        idx = self.mode_combo.findData(mode_def)
-        if idx >= 0:
-            self.mode_combo.setCurrentIndex(idx)
         form.addRow('Map type:', self.mode_combo)
-        self._mode_label = form.labelForField(self.mode_combo)
 
         self.metric_combo = QComboBox()
-        metric_def = str(defaults.get('metric', 'article_count'))
-        metric_options = [
-            ('Articles', 'article_count'),
-            ('Page count', 'page_count'),
-            ('Key term frequency', 'key_term_frequency'),
-        ]
-        for label, value in metric_options:
-            self.metric_combo.addItem(label, value)
-        idx = self.metric_combo.findData(metric_def)
-        if idx >= 0:
-            self.metric_combo.setCurrentIndex(idx)
+        for opt in self.METRIC_OPTIONS:
+            self.metric_combo.addItem(opt['label'], opt['value'])
         form.addRow('Metric:', self.metric_combo)
-        self._metric_label = form.labelForField(self.metric_combo)
 
-        self.normalize_check = QCheckBox('Enable')
-        self.normalize_check.setChecked(bool(defaults.get('normalize', False)))
-        self.normalize_denom = QComboBox()
-        denom_def = str(defaults.get('normalize_denominator', 'word_count'))
-        denom_options = [
-            ('Word count', 'word_count'),
-            ('Article count', 'article_count'),
-            ('Page count', 'page_count'),
-        ]
-        for label, value in denom_options:
-            self.normalize_denom.addItem(label, value)
-        idx = self.normalize_denom.findData(denom_def)
-        if idx >= 0:
-            self.normalize_denom.setCurrentIndex(idx)
-        norm_row = QWidget()
-        norm_layout = QHBoxLayout(norm_row)
-        norm_layout.setContentsMargins(0, 0, 0, 0)
-        norm_layout.addWidget(self.normalize_check)
-        norm_layout.addWidget(self.normalize_denom)
-        form.addRow('Normalization:', norm_row)
-        self._norm_label = form.labelForField(norm_row)
+        self.normalize_check = QCheckBox()
+        form.addRow('Normalization:', self.normalize_check)
 
         units = ['day', 'week', 'month', 'year']
 
         self.disable_time = QCheckBox('Disable time animation')
-        self.disable_time.setChecked(bool(defaults.get('disable_time', False)))
-        form.addRow(self.disable_time)
+        form.addRow('', self.disable_time)
 
         time_row = QWidget()
         time_layout = QHBoxLayout(time_row)
         time_layout.setContentsMargins(0, 0, 0, 0)
         self.time_step = QSpinBox()
         self.time_step.setRange(1, 104)
-        self.time_step.setValue(max(1, int(defaults.get('time_step', 1))))
         self.time_step.setMaximumWidth(80)
         time_layout.addWidget(self.time_step)
         self.time_unit = QComboBox()
         self.time_unit.addItems(units)
-        idx = self.time_unit.findText(str(defaults.get('time_unit', 'week')), Qt.MatchFixedString)
-        if idx >= 0:
-            self.time_unit.setCurrentIndex(idx)
         time_layout.addWidget(self.time_unit)
         form.addRow('Time bin:', time_row)
         self._time_row = time_row
-        self._time_label = form.labelForField(time_row)
 
         linger_row = QWidget()
         linger_layout = QHBoxLayout(linger_row)
         linger_layout.setContentsMargins(0, 0, 0, 0)
         self.linger_step = QSpinBox()
         self.linger_step.setRange(0, 104)
-        self.linger_step.setValue(max(0, int(defaults.get('linger_step', 2))))
         self.linger_step.setMaximumWidth(80)
         linger_layout.addWidget(self.linger_step)
         self.linger_unit = QComboBox()
         self.linger_unit.addItems(units)
-        idx = self.linger_unit.findText(str(defaults.get('linger_unit', 'week')), Qt.MatchFixedString)
-        if idx >= 0:
-            self.linger_unit.setCurrentIndex(idx)
         linger_layout.addWidget(self.linger_unit)
         form.addRow('Linger:', linger_row)
         self._linger_row = linger_row
-        self._linger_label = form.labelForField(linger_row)
 
+        heat_row = QWidget()
+        heat_layout = QHBoxLayout(heat_row)
+        heat_layout.setContentsMargins(0, 0, 0, 0)
         self.heat_radius = QSpinBox()
         self.heat_radius.setRange(1, 160)
-        self.heat_radius.setValue(max(1, int(defaults.get('heat_radius', 15))))
-        form.addRow('Heat radius:', self.heat_radius)
-        self._heat_radius_label = form.labelForField(self.heat_radius)
+        heat_layout.addWidget(self.heat_radius)
+        form.addRow('Heat radius:', heat_row)
+        self._heat_row = heat_row
 
+        heat_value_row = QWidget()
+        heat_value_layout = QHBoxLayout(heat_value_row)
+        heat_value_layout.setContentsMargins(0, 0, 0, 0)
         self.heat_value = QDoubleSpinBox()
         self.heat_value.setRange(0.1, 50.0)
         self.heat_value.setSingleStep(0.1)
         self.heat_value.setDecimals(2)
-        self.heat_value.setValue(float(defaults.get('heat_value', 1.0)))
-        form.addRow('Heat value:', self.heat_value)
-        self._heat_value_label = form.labelForField(self.heat_value)
+        heat_value_layout.addWidget(self.heat_value)
+        form.addRow('Heat value:', heat_value_row)
+        self._heat_value_row = heat_value_row
 
         grad_row = QWidget()
         grad_layout = QHBoxLayout(grad_row)
@@ -1526,30 +1475,94 @@ class MapCreationDialog(QDialog):
         grad_layout.addWidget(QLabel('Min:'))
         self.grad_min_radius = QSpinBox()
         self.grad_min_radius.setRange(1, 200)
-        self.grad_min_radius.setValue(max(1, int(defaults.get('grad_min_radius', 6))))
         grad_layout.addWidget(self.grad_min_radius)
         grad_layout.addSpacing(10)
         grad_layout.addWidget(QLabel('Max:'))
         self.grad_max_radius = QSpinBox()
         self.grad_max_radius.setRange(1, 240)
-        self.grad_max_radius.setValue(max(self.grad_min_radius.value() + 1, int(defaults.get('grad_max_radius', 28))))
         grad_layout.addWidget(self.grad_max_radius)
         form.addRow('Graduated radii:', grad_row)
         self._grad_row = grad_row
-        self._grad_label = form.labelForField(grad_row)
 
-        layout.addLayout(form)
+        self.lightweight_check = QCheckBox('Lightweight output (trim popups and tables)')
+        form.addRow('Lightweight:', self.lightweight_check)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        main_layout.addLayout(form)
 
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet('color: #2b6cb0;')
+        main_layout.addWidget(self.status_label)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        self.create_btn = QPushButton('Create Map')
+        self.create_btn.clicked.connect(self._run_create_map)
+        button_row.addWidget(self.create_btn)
+        self.close_btn = QPushButton('Close')
+        self.close_btn.clicked.connect(self.close)
+        button_row.addWidget(self.close_btn)
+        main_layout.addLayout(button_row)
+
+        self._apply_defaults(defaults)
+        self._update_geojson_label()
         self.mode_combo.currentIndexChanged.connect(self._update_enabled_state)
         self.disable_time.toggled.connect(self._update_enabled_state)
         self.normalize_check.toggled.connect(self._update_enabled_state)
+        self.metric_combo.currentIndexChanged.connect(self._on_metric_changed)
         self.grad_min_radius.valueChanged.connect(self._sync_grad_radii)
         self.grad_max_radius.valueChanged.connect(self._sync_grad_radii)
+        self._update_enabled_state()
+
+    def _apply_defaults(self, defaults: dict):
+        mode_def = str(defaults.get('mode', 'points')).lower()
+        idx = self.mode_combo.findData(mode_def)
+        if idx >= 0:
+            self.mode_combo.setCurrentIndex(idx)
+
+        metric_def = str(defaults.get('metric', 'article_count'))
+        idx = self.metric_combo.findData(metric_def)
+        if idx >= 0:
+            self.metric_combo.setCurrentIndex(idx)
+
+        self.normalize_check.setChecked(bool(defaults.get('normalize', False)))
+
+        self.time_step.setValue(max(1, int(defaults.get('time_step', 1))))
+        idx = self.time_unit.findText(str(defaults.get('time_unit', 'week')), Qt.MatchFixedString)
+        if idx >= 0:
+            self.time_unit.setCurrentIndex(idx)
+
+        self.disable_time.setChecked(bool(defaults.get('disable_time', False)))
+
+        self.linger_step.setValue(max(0, int(defaults.get('linger_step', 2))))
+        idx = self.linger_unit.findText(str(defaults.get('linger_unit', 'week')), Qt.MatchFixedString)
+        if idx >= 0:
+            self.linger_unit.setCurrentIndex(idx)
+
+        self.heat_radius.setValue(max(1, int(defaults.get('heat_radius', 15))))
+        self.heat_value.setValue(float(defaults.get('heat_value', 1.0)))
+
+        self.grad_min_radius.setValue(max(1, int(defaults.get('grad_min_radius', 6))))
+        self.grad_max_radius.setValue(max(self.grad_min_radius.value() + 1, int(defaults.get('grad_max_radius', 28))))
+
+        self.lightweight_check.setChecked(bool(defaults.get('lightweight', False)))
+        self._update_normalize_text()
+
+    def _metric_info(self) -> dict:
+        key = self.metric_combo.currentData()
+        return self._metric_map.get(key, self.METRIC_OPTIONS[0])
+
+    def _update_normalize_text(self):
+        info = self._metric_info()
+        denom_text = info.get('denom_label', '')
+        if denom_text:
+            text = f'Normalize by {denom_text} (per city)'
+        else:
+            text = 'Normalize'
+        self.normalize_check.setText(text)
+
+    def _on_metric_changed(self):
+        self._update_normalize_text()
         self._update_enabled_state()
 
     def _sync_grad_radii(self):
@@ -1558,43 +1571,45 @@ class MapCreationDialog(QDialog):
             self.grad_max_radius.setValue(self.grad_min_radius.value() + 1)
             self.grad_max_radius.blockSignals(False)
 
-    def _set_row_visible(self, label_widget, field_widget, visible: bool):
-        if label_widget is not None:
-            label_widget.setVisible(visible)
-        if field_widget is not None:
-            field_widget.setVisible(visible)
+    def _update_geojson_label(self):
+        if self.geojson_path and os.path.exists(self.geojson_path):
+            self.geojson_display.setText(html.escape(self.geojson_path))
+        else:
+            self.geojson_display.setText('<span style="color:#666;">No GeoJSON selected</span>')
+
+    def _choose_geojson(self):
+        start_dir = os.path.dirname(self.geojson_path) if self.geojson_path else getattr(self._parent, 'project_folder', os.getcwd())
+        path, _ = QFileDialog.getOpenFileName(self, 'Select GeoJSON File', start_dir, 'GeoJSON Files (*.geojson *.json)')
+        if path:
+            self.geojson_path = path
+            if self._parent:
+                self._parent.geojson_file = path
+                self._parent._update_loaded_file_labels()
+            self._update_geojson_label()
 
     def _update_enabled_state(self):
         mode = self.mode_combo.currentData()
         heat_mode = mode == 'heatmap'
         grad_mode = mode == 'graduated'
-        metric_mode = heat_mode or grad_mode
 
         time_controls_enabled = heat_mode and not self.disable_time.isChecked()
 
         self.disable_time.setEnabled(heat_mode)
-        self._set_row_visible(self._time_label, self._time_row, heat_mode)
-        self._set_row_visible(self._linger_label, self._linger_row, heat_mode)
+        self._time_row.setVisible(heat_mode)
+        self._linger_row.setVisible(heat_mode)
         for widget in (self.time_step, self.time_unit, self.linger_step, self.linger_unit):
             widget.setEnabled(time_controls_enabled)
 
-        self._set_row_visible(self._heat_radius_label, self.heat_radius, heat_mode)
-        self._set_row_visible(self._heat_value_label, self.heat_value, heat_mode)
+        self._heat_row.setVisible(heat_mode)
+        self._heat_value_row.setVisible(heat_mode)
+        self._grad_row.setVisible(grad_mode)
 
-        self._set_row_visible(self._grad_label, self._grad_row, grad_mode)
+        self.normalize_check.setEnabled(True)
+        self._update_normalize_text()
 
-        self.metric_combo.setEnabled(metric_mode)
-        if self._metric_label is not None:
-            self._metric_label.setEnabled(metric_mode)
-
-        norm_enabled = metric_mode and self.normalize_check.isChecked()
-        if self._norm_label is not None:
-            self._norm_label.setEnabled(metric_mode)
-        self.normalize_check.setEnabled(metric_mode)
-        self.normalize_denom.setEnabled(norm_enabled)
-
-    def values(self) -> dict:
-        return {
+    def _collect_config(self) -> dict:
+        info = self._metric_info()
+        cfg = {
             'mode': self.mode_combo.currentData(),
             'time_unit': self.time_unit.currentText(),
             'time_step': self.time_step.value(),
@@ -1605,10 +1620,126 @@ class MapCreationDialog(QDialog):
             'heat_value': self.heat_value.value(),
             'grad_min_radius': self.grad_min_radius.value(),
             'grad_max_radius': self.grad_max_radius.value(),
-            'metric': self.metric_combo.currentData(),
+            'metric': info['value'],
             'normalize': self.normalize_check.isChecked(),
-            'normalize_denominator': self.normalize_denom.currentData(),
+            'normalize_denominator': info['denominator'] if self.normalize_check.isChecked() else None,
+            'lightweight': self.lightweight_check.isChecked(),
         }
+        return cfg
+
+    def _run_create_map(self):
+        if not self.geojson_path or not os.path.exists(self.geojson_path):
+            QMessageBox.warning(self, 'GeoJSON Required', 'Please select a GeoJSON file to map.')
+            return
+
+        cfg = self._collect_config()
+        parent = self._parent
+        if parent is not None:
+            parent.map_settings = dict(cfg)
+            parent.geojson_file = self.geojson_path
+            parent._update_loaded_file_labels()
+
+        self.create_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        try:
+            result = create_map(
+                self.geojson_path,
+                mode=cfg['mode'],
+                time_unit=cfg['time_unit'],
+                time_step=cfg['time_step'],
+                linger_unit=cfg['linger_unit'],
+                linger_step=cfg['linger_step'],
+                disable_time=cfg['disable_time'],
+                heat_radius=cfg.get('heat_radius'),
+                heat_value=cfg.get('heat_value'),
+                grad_min_radius=cfg.get('grad_min_radius'),
+                grad_max_radius=cfg.get('grad_max_radius'),
+                metric=cfg.get('metric'),
+                normalize=cfg.get('normalize'),
+                normalize_denominator=cfg.get('normalize_denominator'),
+                lightweight=cfg.get('lightweight'),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, 'Map Error', f'Failed to create map:\n{exc}')
+            result = None
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.create_btn.setEnabled(True)
+
+        if not result:
+            return
+
+        map_path = result.get('map_path') if isinstance(result, dict) else result
+        if not map_path:
+            QMessageBox.critical(self, 'Map Error', 'Map creation did not return an output path.')
+            return
+
+        summary = result.get('summary', {}) if isinstance(result, dict) else {}
+        self._display_status(summary)
+
+        import webbrowser
+        webbrowser.open('file://' + os.path.abspath(map_path))
+
+        if parent is not None:
+            attr_path = result.get('attribute_table') if isinstance(result, dict) else None
+            parent.append_project_log('Create Map', self._build_log_lines(cfg, map_path, attr_path, summary))
+
+    def _build_log_lines(self, cfg: dict, map_path: str, attr_path: Optional[str], summary: dict) -> list:
+        lines = []
+        geojson_link = self._link_html(self.geojson_path, 'GeoJSON file') if self.geojson_path else 'Unknown'
+        lines.append(f'<div><strong>GeoJSON:</strong> {geojson_link}</div>')
+        lines.append(f'<div><strong>Mode:</strong> {html.escape(cfg["mode"])}</div>')
+        metric_info = self._metric_map.get(cfg.get('metric'), self.METRIC_OPTIONS[0])
+        metric_label = metric_info.get('label', cfg.get('metric', ''))
+        lines.append(f'<div><strong>Metric:</strong> {html.escape(metric_label)}</div>')
+        if cfg.get('normalize'):
+            norm_text = metric_info.get('normalized_display', 'Normalized')
+            lines.append(f'<div><strong>Normalization:</strong> {html.escape(norm_text)}</div>')
+        lines.append(f'<div><strong>Lightweight:</strong> {"Yes" if cfg.get("lightweight") else "No"}</div>')
+        if cfg.get('mode') == 'heatmap' and not cfg.get('disable_time'):
+            lines.append(f'<div><strong>Time bin:</strong> {cfg["time_step"]} {html.escape(cfg["time_unit"])}</div>')
+            lines.append(f'<div><strong>Linger:</strong> {cfg["linger_step"]} {html.escape(cfg["linger_unit"])}</div>')
+        map_link = self._link_html(map_path, 'Open map file')
+        lines.append(f'<div><strong>Map output:</strong> {map_link}</div>')
+
+        if attr_path:
+            lines.append(f'<div><strong>Attribute table:</strong> {self._link_html(attr_path, "Open attribute table")}</div>')
+        if summary:
+            summary_parts = []
+            if summary.get('term'):
+                summary_parts.append(f"Term: {html.escape(summary['term'])}")
+            if summary.get('date_range'):
+                summary_parts.append(f"Dates: {html.escape(' – '.join(summary['date_range']))}")
+            summary_parts.append(f"Articles: {summary.get('articles', 'n/a')}")
+            summary_parts.append(f"Newspapers: {summary.get('newspapers', 'n/a')}")
+            summary_parts.append(f"Cities: {summary.get('cities', 'n/a')}")
+            if summary.get('metric_display'):
+                summary_parts.append(f"Mapped metric: {html.escape(summary['metric_display'])}")
+            summary_text = '; '.join(summary_parts)
+            lines.append(f'<div><strong>Summary:</strong> {summary_text}</div>')
+        return lines
+
+    @staticmethod
+    def _link_html(path: Optional[str], label: str) -> str:
+        if not path:
+            return html.escape(label)
+        encoded = urllib.parse.quote(path)
+        return f'{html.escape(path)} [<a href="chronam-open:{encoded}">Open in Finder</a>]'
+
+    def _display_status(self, summary: dict):
+        if not summary:
+            self.status_label.setText('Map created successfully.')
+            return
+        parts = []
+        if summary.get('term'):
+            parts.append(f"Term: {summary['term']}")
+        if summary.get('articles') is not None:
+            parts.append(f"Articles: {summary['articles']}")
+        if summary.get('newspapers') is not None and summary.get('cities') is not None:
+            parts.append(f"Newspapers: {summary['newspapers']}, Cities: {summary['cities']}")
+        if summary.get('metric_display'):
+            parts.append(f"Metric: {summary['metric_display']}")
+        self.status_label.setText(html.escape('Map created successfully. ' + '; '.join(parts)))
 
 class CollocationDialog(QDialog):
     def __init__(self, parent=None):
