@@ -632,6 +632,7 @@ def _write_attribute_table(
     max_rows: Optional[int] = None,
     omit_article: bool = False,
     include_columns: Optional[List[str]] = None,
+    hyperlink_columns: Optional[List[str]] = None,
 ) -> Optional[str]:
     """Render a simple HTML attribute table for the supplied points."""
     columns: List[str] = ["Latitude", "Longitude"]
@@ -662,6 +663,8 @@ def _write_attribute_table(
                     seen.add(key_str)
                     columns.append(key_str)
 
+    link_set = {str(col) for col in (hyperlink_columns or [])}
+
     rows: List[str] = []
     truncated = False
     for idx, entry in enumerate(points):
@@ -676,9 +679,17 @@ def _write_attribute_table(
         cells = [f"<td>{lat_cell}</td>", f"<td>{lon_cell}</td>"]
         for key in columns[2:]:
             value = props.get(key, '')
+            cell_html: str
             if key == 'article':
                 value = _truncate_plain_text(value, max_chars=420)
-            cells.append(f"<td>{_esc(value)}</td>")
+                cell_html = _esc(value)
+            elif key in link_set and value:
+                href = html.escape(str(value), quote=True)
+                text = html.escape(str(value))
+                cell_html = f'<a href="{href}" target="_blank" rel="noopener">{text}</a>'
+            else:
+                cell_html = _esc(value)
+            cells.append(f"<td>{cell_html}</td>")
         rows.append('<tr>' + ''.join(cells) + '</tr>')
 
     if not rows:
@@ -772,6 +783,8 @@ def create_map(
     normalize: bool = False,
     normalize_denominator: Optional[str] = None,
     lightweight: bool = False,
+    table_mode: str = "full",
+    table_row_limit: Optional[int] = None,
 ) -> Dict[str, Optional[str]]:
     """
     Create a leaflet map next to the GeoJSON.
@@ -796,6 +809,8 @@ def create_map(
       - normalize: divide the metric by a denominator when True.
       - normalize_denominator: 'word_count' | 'article_count' | 'page_count'.
       - lightweight: reduce popup detail and attribute table size for very large outputs.
+      - table_mode: 'full' | 'article' | 'minimal' – controls attribute table columns.
+      - table_row_limit: optional max rows in attribute table (None/<=0 for all rows).
 
     Returns:
         dict with 'map_path' and optional 'attribute_table'.
@@ -950,6 +965,20 @@ def create_map(
     time_enabled = mode == 'heatmap' and not disable_time
     metric_display_summary = metric_normalized_display if normalize_flag else metric_display
 
+    allowed_table_modes = {'full', 'article', 'minimal'}
+    table_mode_norm = (table_mode or 'full').strip().lower()
+    if table_mode_norm not in allowed_table_modes:
+        table_mode_norm = 'full'
+
+    row_limit_val: Optional[int] = None
+    if table_row_limit:
+        try:
+            parsed_limit = int(table_row_limit)
+            if parsed_limit > 0:
+                row_limit_val = parsed_limit
+        except (TypeError, ValueError):
+            row_limit_val = None
+
     summary = {
         'geojson_name': os.path.basename(geojson_path),
         'term': search_term or '',
@@ -968,6 +997,8 @@ def create_map(
         'linger_unit': linger_unit,
         'linger_step': linger_step,
         'lightweight': bool(lightweight),
+        'table_mode': table_mode_norm,
+        'table_row_limit': row_limit_val or 0,
     }
 
     timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -984,20 +1015,33 @@ def create_map(
     out_html = os.path.join(out_dir, map_filename)
     attr_path = os.path.join(out_dir, table_filename)
 
-    table_kwargs = {}
-    if lightweight:
-        table_kwargs['max_rows'] = min(len(pts), 1000) if pts else 0
+    table_kwargs: Dict[str, Any] = {'hyperlink_columns': ['url']}
+    if table_mode_norm == 'article':
+        table_kwargs['include_columns'] = ['date', 'Title', 'article', 'url']
+    elif table_mode_norm == 'minimal':
+        table_kwargs['include_columns'] = ['date', 'Title', 'City', 'State', 'lccn', 'page', 'url']
         table_kwargs['omit_article'] = True
-        table_kwargs['include_columns'] = [
-            'date',
-            'Title',
-            'headline',
-            'Headline',
-            'City',
-            'State',
-            'page',
-            'url',
-        ]
+
+    max_rows = row_limit_val
+    if lightweight:
+        light_limit = min(len(pts), 1000) if pts else None
+        if light_limit:
+            max_rows = light_limit if max_rows is None else min(max_rows, light_limit)
+        if table_mode_norm == 'full':
+            table_kwargs.setdefault('omit_article', True)
+            table_kwargs.setdefault('include_columns', [
+                'date',
+                'Title',
+                'headline',
+                'Headline',
+                'City',
+                'State',
+                'page',
+                'url',
+            ])
+
+    if max_rows:
+        table_kwargs['max_rows'] = max_rows
 
     heat_radius_val = 15
     if heat_radius is not None:
@@ -1329,5 +1373,7 @@ def create_map(
         'normalize': normalize_flag,
         'normalize_denominator': denominator_key,
         'lightweight': lightweight,
+        'table_mode': table_mode_norm,
+        'table_row_limit': row_limit_val or 0,
     }
     return result

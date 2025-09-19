@@ -140,6 +140,8 @@ class MainWindow(QMainWindow):
             'normalize': False,
             'normalize_denominator': 'article_count',
             'lightweight': False,
+            'table_mode': 'full',
+            'table_row_limit': 0,
         }
         self.init_ui()
         self._close_filter = CloseShortcutFilter()
@@ -1503,6 +1505,18 @@ class MapToolDialog(QDialog):
         self.lightweight_check = QCheckBox('Lightweight output (trim popups and tables)')
         form.addRow('Lightweight:', self.lightweight_check)
 
+        self.table_mode_combo = QComboBox()
+        self.table_mode_combo.addItem('Full Table', 'full')
+        self.table_mode_combo.addItem('Article Only', 'article')
+        self.table_mode_combo.addItem('Minimal', 'minimal')
+        form.addRow('Attribute table:', self.table_mode_combo)
+
+        self.table_row_limit = QSpinBox()
+        self.table_row_limit.setRange(0, 1_000_000)
+        self.table_row_limit.setSpecialValueText('All rows')
+        self.table_row_limit.setMaximumWidth(120)
+        form.addRow('Table row limit:', self.table_row_limit)
+
         main_layout.addLayout(form)
 
         self.status_label = QLabel()
@@ -1520,6 +1534,9 @@ class MapToolDialog(QDialog):
         button_row.addWidget(self.close_btn)
         main_layout.addLayout(button_row)
 
+        self._user_row_limit_override = False
+        self._auto_row_limit = False
+        self._current_table_mode = None
         self._apply_defaults(defaults)
         self._update_geojson_label()
         self.mode_combo.currentIndexChanged.connect(self._update_enabled_state)
@@ -1528,6 +1545,8 @@ class MapToolDialog(QDialog):
         self.metric_combo.currentIndexChanged.connect(self._on_metric_changed)
         self.grad_min_radius.valueChanged.connect(self._sync_grad_radii)
         self.grad_max_radius.valueChanged.connect(self._sync_grad_radii)
+        self.table_mode_combo.currentIndexChanged.connect(self._on_table_mode_changed)
+        self.table_row_limit.valueChanged.connect(self._on_row_limit_changed)
         self._update_enabled_state()
 
     def _apply_defaults(self, defaults: dict):
@@ -1563,6 +1582,18 @@ class MapToolDialog(QDialog):
 
         self.lightweight_check.setChecked(bool(defaults.get('lightweight', False)))
         self._update_normalize_text()
+
+        table_mode_def = str(defaults.get('table_mode', 'full')).lower()
+        idx = self.table_mode_combo.findData(table_mode_def)
+        if idx >= 0:
+            self.table_mode_combo.setCurrentIndex(idx)
+
+        row_limit_def = int(defaults.get('table_row_limit', 0) or 0)
+        self.table_row_limit.blockSignals(True)
+        self.table_row_limit.setValue(max(0, row_limit_def))
+        self.table_row_limit.blockSignals(False)
+        self._user_row_limit_override = row_limit_def > 0
+        self._on_table_mode_changed()
 
     def _metric_info(self) -> dict:
         key = self.metric_combo.currentData()
@@ -1623,6 +1654,35 @@ class MapToolDialog(QDialog):
         self.normalize_check.setEnabled(True)
         self._update_normalize_text()
 
+    def _on_table_mode_changed(self, *args):
+        prev_mode = getattr(self, '_current_table_mode', None)
+        mode = (self.table_mode_combo.currentData() or 'full').lower()
+        if mode == 'minimal':
+            if not self._user_row_limit_override and self.table_row_limit.value() == 0:
+                self.table_row_limit.blockSignals(True)
+                self.table_row_limit.setValue(1000)
+                self.table_row_limit.blockSignals(False)
+                self._auto_row_limit = True
+                self._user_row_limit_override = False
+        else:
+            if prev_mode == 'minimal':
+                self.table_row_limit.blockSignals(True)
+                self.table_row_limit.setValue(0)
+                self.table_row_limit.blockSignals(False)
+                self._auto_row_limit = False
+                self._user_row_limit_override = False
+            elif self._auto_row_limit and not self._user_row_limit_override and self.table_row_limit.value() != 0:
+                self.table_row_limit.blockSignals(True)
+                self.table_row_limit.setValue(0)
+                self.table_row_limit.blockSignals(False)
+                self._auto_row_limit = False
+                self._user_row_limit_override = False
+        self._current_table_mode = mode
+
+    def _on_row_limit_changed(self, value: int):
+        self._user_row_limit_override = value > 0
+        self._auto_row_limit = False
+
     def _collect_config(self) -> dict:
         info = self._metric_info()
         cfg = {
@@ -1640,6 +1700,8 @@ class MapToolDialog(QDialog):
             'normalize': self.normalize_check.isChecked(),
             'normalize_denominator': info['denominator'] if self.normalize_check.isChecked() else None,
             'lightweight': self.lightweight_check.isChecked(),
+            'table_mode': self.table_mode_combo.currentData(),
+            'table_row_limit': self.table_row_limit.value() if self.table_row_limit.value() > 0 else 0,
         }
         return cfg
 
@@ -1674,6 +1736,8 @@ class MapToolDialog(QDialog):
                 normalize=cfg.get('normalize'),
                 normalize_denominator=cfg.get('normalize_denominator'),
                 lightweight=cfg.get('lightweight'),
+                table_mode=cfg.get('table_mode'),
+                table_row_limit=cfg.get('table_row_limit'),
             )
         except Exception as exc:
             QMessageBox.critical(self, 'Map Error', f'Failed to create map:\n{exc}')
@@ -1712,6 +1776,15 @@ class MapToolDialog(QDialog):
             norm_text = metric_info.get('normalized_display', 'Normalized')
             lines.append(f'<div><strong>Normalization:</strong> {html.escape(norm_text)}</div>')
         lines.append(f'<div><strong>Lightweight:</strong> {"Yes" if cfg.get("lightweight") else "No"}</div>')
+        table_mode_value = str(cfg.get('table_mode') or 'full')
+        table_mode_label = {
+            'full': 'Full Table',
+            'article': 'Article Only',
+            'minimal': 'Minimal',
+        }.get(table_mode_value, table_mode_value.title())
+        row_limit_val = cfg.get('table_row_limit') or 0
+        row_limit_text = 'All rows' if not row_limit_val else f'{row_limit_val:,} rows'
+        lines.append(f'<div><strong>Attribute table:</strong> {html.escape(table_mode_label)} ({row_limit_text})</div>')
         if cfg.get('mode') == 'heatmap' and not cfg.get('disable_time'):
             lines.append(f'<div><strong>Time bin:</strong> {cfg["time_step"]} {html.escape(cfg["time_unit"])}</div>')
             lines.append(f'<div><strong>Linger:</strong> {cfg["linger_step"]} {html.escape(cfg["linger_unit"])}</div>')
@@ -1755,6 +1828,16 @@ class MapToolDialog(QDialog):
             parts.append(f"Newspapers: {summary['newspapers']}, Cities: {summary['cities']}")
         if summary.get('metric_display'):
             parts.append(f"Metric: {summary['metric_display']}")
+        table_mode = summary.get('table_mode')
+        if table_mode:
+            label = {
+                'full': 'Full Table',
+                'article': 'Article Only',
+                'minimal': 'Minimal',
+            }.get(str(table_mode), str(table_mode))
+            row_limit = summary.get('table_row_limit') or 0
+            limit_text = 'All rows' if not row_limit else f'{row_limit:,} rows'
+            parts.append(f"Table: {label} ({limit_text})")
         self.status_label.setText(html.escape('Map created successfully. ' + '; '.join(parts)))
 
 class CollocationDialog(QDialog):
