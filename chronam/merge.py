@@ -53,7 +53,7 @@ def _normalize_articles(payload: Dict[str, Any]) -> pd.DataFrame:
     # Build DataFrame
     df = pd.DataFrame(articles)
     # Ensure required columns exist
-    for col in ["lccn", "date", "article", "page", "url", "newspaper_name"]:
+    for col in ["lccn", "date", "article", "page", "url"]:
         if col not in df.columns:
             df[col] = None
     # Coerce date to datetime (naive)
@@ -156,16 +156,24 @@ def merge_geojson(
             continue
 
         # Merge with XY metadata
-        # Prefer join on lccn <-> SN; fallback to Title if lccn missing.
-        if "lccn" in df.columns:
-            merged = df.merge(df_xy, left_on="lccn", right_on="SN", how="left")
-        else:
-            merged = df.merge(df_xy, left_on="newspaper_name", right_on="Title", how="left")
+        merged = df.copy()
+        joined = False
+        if "lccn" in df.columns and df["lccn"].notna().any():
+            merged = merged.merge(df_xy, left_on="lccn", right_on="SN", how="left")
+            joined = True
+        elif "newspaper_name" in df.columns and df["newspaper_name"].notna().any():
+            merged = merged.merge(df_xy, left_on="newspaper_name", right_on="Title", how="left")
+            joined = True
 
-        # Ensure City/State are present in properties
-        for col in ["City", "State", "Title", "SN", "Long", "Lat"]:
-            if col not in merged.columns:
-                merged[col] = None
+        if not joined:
+            for col in ["SN", "Title", "City", "State", "Long", "Lat"]:
+                if col not in merged.columns:
+                    merged[col] = None
+
+        if "Title" in merged.columns and "newspaper_name" in merged.columns:
+            merged["Title"] = merged["Title"].fillna(merged["newspaper_name"])
+        if "newspaper_name" in merged.columns:
+            merged = merged.drop(columns=["newspaper_name"])
 
         # Convert to GeoDataFrame
         gdf = _to_geodataframe(merged)
@@ -186,8 +194,8 @@ def merge_geojson(
                 gdf[col] = gdf[col].astype(str)
         # Select properties to keep (article-centric + XY + location)
         keep_cols = [
-            "article_id", "lccn", "date", "page", "article", "url", "filename", "newspaper_name",
-            "SN", "Title", "City", "State", "Long", "Lat"
+            "article_id", "lccn", "date", "page", "article", "url", "filename",
+            "Title", "City", "State"
         ]
         existing_cols = [c for c in keep_cols if c in gdf.columns]
         gdf = gdf[existing_cols + ["geometry"]]

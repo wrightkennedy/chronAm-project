@@ -323,7 +323,7 @@ def _popup_html(
     pdf_url = url.replace(".jp2", ".pdf") if url else ""
 
     date_str = _format_date_str(props.get("date") or "")
-    newspaper = (props.get("newspaper_name") or props.get("Title") or "").strip()
+    newspaper = (props.get("Title") or props.get("newspaper_name") or "").strip()
     city = (props.get("City") or "").strip()
     state = (props.get("State") or "").strip()
     location = ", ".join([p for p in (city, state) if p])
@@ -383,7 +383,7 @@ def _popup_html(
 
 def _feature_label(props: Dict[str, Any]) -> str:
     date_str = _format_date_str(props.get("date") or "")
-    newspaper = (props.get("newspaper_name") or props.get("Title") or "").strip()
+    newspaper = (props.get("Title") or props.get("newspaper_name") or "").strip()
     city = (props.get("City") or "").strip()
     state = (props.get("State") or "").strip()
     location = ", ".join([p for p in (city, state) if p])
@@ -875,7 +875,7 @@ def create_map(
             url_val = (props.get('url') or '').strip()
             pdf_url = url_val.replace('.jp2', '.pdf') if url_val else ''
             date_val = _format_date_str(props.get('date') or '')
-            newspaper_val = (props.get('newspaper_name') or props.get('Title') or '').strip()
+            newspaper_val = (props.get('Title') or props.get('newspaper_name') or '').strip()
             city_val = (props.get('City') or '').strip()
             state_val = (props.get('State') or '').strip()
             place_val = ', '.join([p for p in (city_val, state_val) if p])
@@ -922,7 +922,7 @@ def create_map(
         if sn not in (None, ""):
             newspaper_ids.add(str(sn))
         else:
-            title = props.get('newspaper_name') or props.get('Title')
+            title = props.get('Title') or props.get('newspaper_name')
             if title not in (None, ""):
                 newspaper_ids.add(str(title))
         dt = p.get('date')
@@ -990,7 +990,6 @@ def create_map(
         table_kwargs['omit_article'] = True
         table_kwargs['include_columns'] = [
             'date',
-            'newspaper_name',
             'Title',
             'headline',
             'Headline',
