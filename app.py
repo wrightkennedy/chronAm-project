@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QProgressBar, QMessageBox, QCheckBox, QFormLayout, QDialog, QTextBrowser, QComboBox,
     QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup, QDockWidget, QDialogButtonBox, QSpinBox,
-    QDoubleSpinBox
+    QDoubleSpinBox, QGroupBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, pyqtProperty, QUrl, QObject, QEvent
 from PyQt5.QtGui import QPainter, QPen, QIntValidator, QTextCursor, QKeySequence
@@ -721,6 +721,17 @@ class DownloadDialog(QDialog):
         form.addRow('End Date (YYYY-MM-DD):', self.end_input)
         layout.addLayout(form)
 
+        cleaning_group = QGroupBox('Text Cleaning Options')
+        cleaning_layout = QVBoxLayout(cleaning_group)
+        self.clean_lowercase_cb = QCheckBox('Convert article text to lowercase')
+        self.clean_urls_cb = QCheckBox('Change article URLs to end in .pdf (replaces .jp2)')
+        self.clean_urls_cb.setChecked(True)
+        self.clean_hyphen_cb = QCheckBox('Collapse hyphenated breaks (remove "- " sequences)')
+        cleaning_layout.addWidget(self.clean_lowercase_cb)
+        cleaning_layout.addWidget(self.clean_urls_cb)
+        cleaning_layout.addWidget(self.clean_hyphen_cb)
+        layout.addWidget(cleaning_group)
+
         self.log = QTextBrowser()
         self.log.setOpenLinks(False)
         self.log.anchorClicked.connect(self._handle_log_link)
@@ -936,7 +947,12 @@ class DownloadDialog(QDialog):
             start,
             end,
             parquet_dir=dataset_folder,
-            cancel_event=self._cancel_event
+            cancel_event=self._cancel_event,
+            cleaning_options={
+                'lowercase_articles': self.clean_lowercase_cb.isChecked(),
+                'urls_to_pdf': self.clean_urls_cb.isChecked(),
+                'collapse_hyphenated_breaks': self.clean_hyphen_cb.isChecked(),
+            }
         )
         self.thread.progress.connect(self.update_progress)
         self.thread.finished.connect(self.download_finished)

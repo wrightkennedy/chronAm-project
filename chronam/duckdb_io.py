@@ -62,6 +62,7 @@ def download_data(
     max_saved_articles_per_year: Optional[int] = None,  # kept for API compat; still acts per-file scan
     progress_callback=None,
     cancel_event: Optional[threading.Event] = None,
+    cleaning_options: Optional[Dict[str, bool]] = None,
 ) -> List[str]:
     """
     Query local Parquet with DuckDB and write *one* JSON payload for the full date range
@@ -182,6 +183,27 @@ def download_data(
 
     if not all_records:
         return []
+
+    cleaning_options = cleaning_options or {}
+    lowercase_articles = bool(cleaning_options.get('lowercase_articles'))
+    urls_to_pdf = bool(cleaning_options.get('urls_to_pdf'))
+    collapse_hyphenated = bool(cleaning_options.get('collapse_hyphenated_breaks'))
+
+    if lowercase_articles or urls_to_pdf or collapse_hyphenated:
+        hyphen_pattern = re.compile(r'-\s+') if collapse_hyphenated else None
+        jp2_pattern = re.compile(r'\.jp2(?=$|[?#])', re.IGNORECASE) if urls_to_pdf else None
+        for record in all_records:
+            article_text = record.get('article')
+            if isinstance(article_text, str):
+                if hyphen_pattern:
+                    article_text = hyphen_pattern.sub('', article_text)
+                if lowercase_articles:
+                    article_text = article_text.lower()
+                record['article'] = article_text
+            if jp2_pattern:
+                url_val = record.get('url')
+                if isinstance(url_val, str):
+                    record['url'] = jp2_pattern.sub('.pdf', url_val)
 
     # Write a single payload (empty-safe)
     out_file = os.path.join(raw_dir, f"{search_term}_{start_date_str}_{end_date_str}.json")
