@@ -1282,133 +1282,170 @@ def create_map(
         metric_label_js = json.dumps(metric_display_summary)
         normalized_js = 'true' if normalize_flag else 'false'
         cluster_block = f"""
-  (function() {{
-    var clusterLayer = {cluster_var};
-    if (clusterLayer && clusterLayer.on) {{
-      clusterLayer.options.iconCreateFunction = function(cluster) {{
-        var sum = 0;
-        cluster.getAllChildMarkers().forEach(function(marker) {{
-          var v = marker.options && marker.options.metricValue;
-          if (typeof v === 'number' && !isNaN(v)) {{
-            sum += v;
-          }} else if (v) {{
-            var num = parseFloat(v);
-            if (!isNaN(num)) sum += num;
-          }}
-        }});
-        var formatted;
-        if ({normalized_js}) {{
-          formatted = sum.toFixed(4);
-        }} else {{
-          formatted = Math.round(sum).toLocaleString();
-        }}
-        var absSum = Math.abs(sum);
-        var c = 'marker-cluster marker-cluster-small';
-        if (absSum >= 100) {{
-          c = 'marker-cluster marker-cluster-large';
-        }} else if (absSum >= 10) {{
-          c = 'marker-cluster marker-cluster-medium';
-        }}
-        return L.divIcon({{
-          html: '<div><span>' + formatted + '</span></div>',
-          className: c,
-          iconSize: new L.Point(40, 40)
-        }});
-      }};
-      if (clusterLayer.refreshClusters) {{
-        clusterLayer.refreshClusters();
-      }}
-      clusterLayer.on('clusterclick', function(e) {{
-        if (e && e.originalEvent) {{
-          e.originalEvent.preventDefault();
-          if (typeof e.originalEvent.stopPropagation === 'function') {{
-            e.originalEvent.stopPropagation();
-          }}
-        }}
-        loadData(function(dataset) {{
-          dataset = dataset || {{}};
-          var markers = e.layer.getAllChildMarkers();
-          var ids = [];
-          var metricSum = 0;
-          markers.forEach(function(marker) {{
-            var gid = marker.options && marker.options.groupId;
-            if (gid && ids.indexOf(gid) === -1) ids.push(gid);
-            var mv = marker.options && marker.options.metricValue;
-            if (typeof mv === 'number' && !isNaN(mv)) {{
-              metricSum += mv;
-            }} else if (mv) {{
-              var num = parseFloat(mv);
-              if (!isNaN(num)) metricSum += num;
-            }}
-          }});
-          if (!ids.length) return;
-          var container = document.createElement('div');
-          container.style.minWidth = '280px';
-          container.style.fontSize = '14px';
-          container.style.lineHeight = '1.3';
-          var summary = document.createElement('div');
-          summary.style.fontSize = '12px';
-          summary.style.color = '#555';
-          var metricText;
-          if ({normalized_js}) {{
-            metricText = (metricSum).toFixed(4);
-          }} else {{
-            metricText = Math.round(metricSum).toLocaleString();
-          }}
-          summary.textContent = {metric_label_js} + ': ' + metricText;
-          container.appendChild(summary);
-          var select = null;
-          if (ids.length > 1) {{
-            var selectLabel = document.createElement('div');
-            selectLabel.style.marginTop = '6px';
-            selectLabel.style.fontWeight = '600';
-            selectLabel.textContent = 'Select a location';
-            container.appendChild(selectLabel);
-            select = document.createElement('select');
-            select.style.width = '100%';
-            select.style.marginTop = '4px';
-            ids.forEach(function(gid) {{
-              var data = dataset[gid];
-              var opt = document.createElement('option');
-              opt.value = gid;
-              opt.textContent = (data && data.title) || gid;
-              select.appendChild(opt);
-            }});
-            container.appendChild(select);
-          }}
-          var detailHost = document.createElement('div');
-          detailHost.style.marginTop = '8px';
-          container.appendChild(detailHost);
-          function renderGroup(gid) {{
-            detailHost.innerHTML = '';
-            var data = dataset[gid];
-            if (!data) {{
-              detailHost.textContent = 'No data.';
-              return;
-            }}
-            if (data.template) {{
-              var wrapper = document.createElement('div');
-              wrapper.innerHTML = data.template;
-              var root = wrapper.firstElementChild;
-              if (root) {{
-                detailHost.appendChild(root);
-                attach(root);
-              }}
-            }} else {{
-              detailHost.textContent = 'No data.';
-            }}
-          }}
-          renderGroup(ids[0]);
-          if (select) {{
-            select.addEventListener('change', function() {{
-              renderGroup(this.value);
-            }});
-          }}
-          L.popup({{maxWidth: 360}}).setLatLng(e.latlng).setContent(container).openOn({map_var});
-        }});
-      }});
+  whenLayerReady('{cluster_var}', function(clusterLayer) {{
+    if (!clusterLayer) {{
+      return;
     }}
-  }})();
+    clusterLayer.options.iconCreateFunction = function(cluster) {{
+      var sum = 0;
+      cluster.getAllChildMarkers().forEach(function(marker) {{
+        var v = marker.options && marker.options.metricValue;
+        if (typeof v === 'number' && !isNaN(v)) {{
+          sum += v;
+        }} else if (v) {{
+          var num = parseFloat(v);
+          if (!isNaN(num)) sum += num;
+        }}
+      }});
+      var formatted;
+      if ({normalized_js}) {{
+        formatted = sum.toFixed(4);
+      }} else {{
+        formatted = Math.round(sum).toLocaleString();
+      }}
+      var absSum = Math.abs(sum);
+      var c = 'marker-cluster marker-cluster-small';
+      if (absSum >= 100) {{
+        c = 'marker-cluster marker-cluster-large';
+      }} else if (absSum >= 10) {{
+        c = 'marker-cluster marker-cluster-medium';
+      }}
+      return L.divIcon({{
+        html: '<div><span>' + formatted + '</span></div>',
+        className: c,
+        iconSize: new L.Point(40, 40)
+      }});
+    }};
+    if (clusterLayer.refreshClusters) {{
+      clusterLayer.refreshClusters();
+    }}
+    clusterLayer.on('clusterclick', function(e) {{
+      if (e && e.originalEvent) {{
+        if (typeof e.originalEvent.preventDefault === 'function') {{
+          e.originalEvent.preventDefault();
+        }}
+        if (typeof e.originalEvent.stopPropagation === 'function') {{
+          e.originalEvent.stopPropagation();
+        }}
+        if (typeof L !== 'undefined' && L.DomEvent && typeof L.DomEvent.stop === 'function') {{
+          L.DomEvent.stop(e.originalEvent);
+        }}
+      }}
+      loadData(function(dataset) {{
+        dataset = dataset || {{}};
+        var markers = e.layer.getAllChildMarkers();
+        var ids = [];
+        var metricSum = 0;
+        markers.forEach(function(marker) {{
+          var gid = marker.options && marker.options.groupId;
+          if (gid && ids.indexOf(gid) === -1) ids.push(gid);
+          var mv = marker.options && marker.options.metricValue;
+          if (typeof mv === 'number' && !isNaN(mv)) {{
+            metricSum += mv;
+          }} else if (mv) {{
+            var num = parseFloat(mv);
+            if (!isNaN(num)) metricSum += num;
+          }}
+        }});
+        if (!ids.length) return;
+        var metricLabel = {metric_label_js};
+        var isNormalized = {normalized_js};
+        var metricText = isNormalized ? (metricSum).toFixed(4) : Math.round(metricSum).toLocaleString();
+        var container = document.createElement('div');
+        container.style.minWidth = '280px';
+        container.style.fontSize = '14px';
+        container.style.lineHeight = '1.3';
+        var summary = document.createElement('div');
+        summary.style.fontSize = '12px';
+        summary.style.color = '#555';
+        var cityCount = ids.length;
+        var cityLabel = cityCount === 1 ? 'City' : 'Cities';
+        var totalArticles = 0;
+        var hasArticleCounts = true;
+        ids.forEach(function(gid) {{
+          var data = dataset[gid];
+          var articleCount = data && data.article_count;
+          var parsed = Number(articleCount);
+          if (Number.isFinite(parsed)) {{
+            totalArticles += parsed;
+          }} else {{
+            hasArticleCounts = false;
+          }}
+        }});
+        var articleDisplay;
+        if (hasArticleCounts) {{
+          articleDisplay = Math.round(totalArticles).toLocaleString();
+        }} else if (!isNormalized) {{
+          articleDisplay = Math.round(metricSum).toLocaleString();
+        }} else {{
+          articleDisplay = metricText;
+        }}
+        summary.textContent = 'Articles: ' + articleDisplay + ' from ' + cityCount + ' ' + cityLabel;
+        container.appendChild(summary);
+        if (isNormalized || metricLabel !== 'Articles') {{
+          var metricDetail = document.createElement('div');
+          metricDetail.style.marginTop = '2px';
+          metricDetail.style.fontSize = '12px';
+          metricDetail.style.color = '#555';
+          metricDetail.textContent = metricLabel + ': ' + metricText;
+          container.appendChild(metricDetail);
+        }}
+        var select = null;
+        if (ids.length > 1) {{
+          var selectLabel = document.createElement('div');
+          selectLabel.style.marginTop = '6px';
+          selectLabel.style.fontWeight = '600';
+          selectLabel.textContent = 'Select a location';
+          container.appendChild(selectLabel);
+          select = document.createElement('select');
+          select.style.width = '100%';
+          select.style.marginTop = '4px';
+          ids.forEach(function(gid) {{
+            var data = dataset[gid];
+            var opt = document.createElement('option');
+            opt.value = gid;
+            opt.textContent = (data && data.title) || gid;
+            select.appendChild(opt);
+          }});
+          container.appendChild(select);
+        }}
+        var detailHost = document.createElement('div');
+        detailHost.style.marginTop = '8px';
+        container.appendChild(detailHost);
+        function renderGroup(gid) {{
+          detailHost.innerHTML = '';
+          var data = dataset[gid];
+          if (!data) {{
+            detailHost.textContent = 'No data.';
+            return;
+          }}
+          if (data.template) {{
+            var wrapper = document.createElement('div');
+            wrapper.innerHTML = data.template;
+            var root = wrapper.firstElementChild;
+            if (root) {{
+              detailHost.appendChild(root);
+              attach(root);
+            }}
+          }} else {{
+            detailHost.textContent = 'No data.';
+          }}
+        }}
+        renderGroup(ids[0]);
+        if (select) {{
+          select.addEventListener('change', function() {{
+            renderGroup(this.value);
+          }});
+        }}
+        var mapRef = clusterLayer._map;
+        if (!mapRef || typeof mapRef.openPopup !== 'function') {{
+          return;
+        }}
+        L.popup({{maxWidth: 360}}).setLatLng(e.latlng).setContent(container).openOn(mapRef);
+      }});
+      return false;
+    }});
+  }});
 """
     script_template = StrTemplate("""
 (function() {
@@ -1538,6 +1575,22 @@ def create_map(
     });
   }
   var mapVarName = "${map_var}";
+  function whenLayerReady(layerName, callback, attempt) {
+    if (!layerName || typeof callback !== 'function') {
+      return;
+    }
+    var tryCount = typeof attempt === 'number' ? attempt : 0;
+    var layerRef = window[layerName];
+    if (layerRef && typeof layerRef.on === 'function') {
+      callback(layerRef);
+      return;
+    }
+    if (tryCount > 200) {
+      console.warn('Layer not ready for cluster popups:', layerName);
+      return;
+    }
+    setTimeout(function() { whenLayerReady(layerName, callback, tryCount + 1); }, 25);
+  }
   function whenMapReady(callback, attempt) {
     var tryCount = typeof attempt === 'number' ? attempt : 0;
     var mapRef = window[mapVarName];
