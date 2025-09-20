@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Tuple, Optional, Callable
 
 import folium
 from folium import Html, Popup
-from folium.plugins import HeatMap, HeatMapWithTime
+from folium.plugins import HeatMap, HeatMapWithTime, MarkerCluster
 
 
 # ----------------------------
@@ -398,12 +398,26 @@ def _feature_label(props: Dict[str, Any]) -> str:
     return label or "Feature"
 
 
+def _group_header(entries: List[Dict[str, Any]], stats: Dict[str, Any], search_term: Optional[str]) -> Tuple[str, int, str]:
+    first_props = entries[0].get('props', {}) if entries else {}
+    city_name = (first_props.get('City') or '').strip() or 'this location'
+    term_text = (search_term or '').strip()
+    article_count = int(stats.get('article_count', len(entries))) if stats else len(entries)
+    if term_text:
+        title_text = f'Articles mentioning "{term_text}" in {city_name}'
+    else:
+        title_text = f'Articles in {city_name}'
+    return title_text, article_count, city_name
+
+
 def _group_popup_html(
     group: Dict[str, Any],
     search_term: Optional[str],
     group_id: str,
     *,
     lightweight: bool = False,
+    title_text: Optional[str] = None,
+    article_count: Optional[int] = None,
 ) -> str:
     entries: List[Dict[str, Any]] = group.get('entries') or []
     if not entries:
@@ -418,15 +432,11 @@ def _group_popup_html(
     metric_value = group.get('value')
     raw_metric_value = stats.get(metric_key) if stats else None
 
-    first_props = entries[0].get('props', {}) if entries else {}
-    city_name = (first_props.get('City') or '').strip() or 'this location'
-    term_text = (search_term or '').strip()
-    article_count = int(stats.get('article_count', len(entries))) if stats else len(entries)
-
-    if term_text:
-        title_text = f'Articles mentioning "{term_text}" in {city_name}'
-    else:
-        title_text = f'Articles in {city_name}'
+    header_title, header_articles, _ = _group_header(entries, stats, search_term)
+    if title_text is None:
+        title_text = header_title
+    if article_count is None:
+        article_count = header_articles
 
     metric_lines: List[str] = []
     if metric_key:
@@ -523,6 +533,7 @@ def _add_point_markers(
     radius_func: Callable[[Dict[str, Any]], float],
     popup_width: int = 360,
     lightweight: bool = False,
+    popup_dataset: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Add grouped point markers with selection popups to the map."""
     for idx, group in enumerate(groups):
@@ -530,18 +541,27 @@ def _add_point_markers(
         if not entries:
             continue
         group_id = group.get('id') or f'group-{idx}'
-        popup_html = Html(
-            _group_popup_html(group, search_term, group_id, lightweight=lightweight),
-            script=True,
+        dataset_entry = popup_dataset.get(group_id) if isinstance(popup_dataset, dict) else None
+        override_title = dataset_entry.get('title') if isinstance(dataset_entry, dict) else None
+        override_articles = dataset_entry.get('article_count') if isinstance(dataset_entry, dict) else None
+        popup_html_str = _group_popup_html(
+            group,
+            search_term,
+            group_id,
+            lightweight=lightweight,
+            title_text=override_title,
+            article_count=override_articles,
         )
-        popup_obj = Popup(popup_html, max_width=popup_width)
+        if isinstance(dataset_entry, dict):
+            dataset_entry.setdefault('template', popup_html_str)
+        popup_obj = Popup(Html(popup_html_str, script=True), max_width=popup_width)
         lat, lon = group.get('location', (entries[0]['lat'], entries[0]['lon']))
         radius = radius_func(group) if callable(radius_func) else 4.0
         try:
             radius_value = max(1.0, float(radius))
         except (TypeError, ValueError):
             radius_value = 4.0
-        folium.CircleMarker(
+        marker = folium.CircleMarker(
             location=[lat, lon],
             radius=radius_value,
             weight=0,
@@ -550,7 +570,13 @@ def _add_point_markers(
             color="#2b6cb0",
             fill_color="#2b6cb0",
             popup=popup_obj,
-        ).add_to(map_obj)
+        )
+        try:
+            metric_val = float(group.get('value', 0.0))
+        except (TypeError, ValueError):
+            metric_val = 0.0
+        marker.options.update({'groupId': group_id, 'metricValue': metric_val})
+        marker.add_to(map_obj)
 
 
 def _heat_slices(
@@ -791,6 +817,7 @@ def create_map(
 
     Modes:
       - "points": static points (CircleMarker dots) with popups.
+      - "cluster": clustered point markers that expand on zoom/click.
       - "heatmap": heat density view. Uses a time slider if dates are present and time is enabled.
       - "graduated": scaled circle markers sized by the chosen metric.
 
@@ -816,7 +843,7 @@ def create_map(
         dict with 'map_path' and optional 'attribute_table'.
     """
 
-    permitted_modes = {"points", "heatmap", "graduated"}
+    permitted_modes = {"points", "heatmap", "graduated", "cluster"}
     mode_normalized = (mode or "points").strip().lower()
     if mode_normalized not in permitted_modes:
         mode_normalized = "points"
@@ -871,6 +898,7 @@ def create_map(
     values: List[float] = []
     popup_dataset: Dict[str, Any] = {}
     for group in groups:
+        entries = group.get("entries", [])
         stats = _compute_group_stats(group.get("entries", []), search_term)
         group["stats"] = stats
         value = _compute_group_value(stats, metric_key, normalize_flag, denominator_key)
@@ -882,7 +910,7 @@ def create_map(
         group["denominator_label"] = denom_label if normalize_flag else ''
 
         entry_payloads: List[Dict[str, Any]] = []
-        for entry in group.get("entries", []):
+        for entry in entries:
             props = entry.get('props') or {}
             article_text = props.get('article') or ''
             first_line = _first_line_excerpt(article_text, 160)
@@ -912,7 +940,13 @@ def create_map(
 
             entry["value"] = value
 
-        popup_dataset[group['id']] = {'entries': entry_payloads}
+        title_text, article_count, _ = _group_header(entries, stats, search_term)
+        popup_dataset[group['id']] = {
+            'entries': entry_payloads,
+            'value': value,
+            'article_count': article_count,
+            'title': title_text,
+        }
         values.append(value)
 
     if groups and not any(v > 0 for v in values):
@@ -1123,6 +1157,7 @@ def create_map(
             point_radius,
             popup_width=popup_width,
             lightweight=lightweight,
+            popup_dataset=popup_dataset,
         )
 
     elif mode == "graduated":
@@ -1134,6 +1169,46 @@ def create_map(
             resolver,
             popup_width=popup_width,
             lightweight=lightweight,
+            popup_dataset=popup_dataset,
+        )
+    elif mode == "cluster":
+        icon_create_function = (
+            "function(cluster) {"
+            " var sum = 0;"
+            " cluster.getAllChildMarkers().forEach(function(marker) {"
+            "   var v = marker.options && marker.options.metricValue;"
+            "   if (typeof v === 'number' && !isNaN(v)) { sum += v; }"
+            "   else if (v) { var num = parseFloat(v); if (!isNaN(num)) sum += num; }"
+            " });"
+            " var formatted;"
+            " if (%s) { formatted = sum.toFixed(4); }"
+            " else { formatted = Math.round(sum).toLocaleString(); }"
+            " var absSum = Math.abs(sum);"
+            " var c = 'marker-cluster marker-cluster-small';"
+            " if (absSum >= 100) { c = 'marker-cluster marker-cluster-large'; }"
+            " else if (absSum >= 10) { c = 'marker-cluster marker-cluster-medium'; }"
+            " return L.divIcon({ html: '<div><span>' + formatted + '</span></div>', className: c, iconSize: new L.Point(40, 40) });"
+            "}"
+        ) % ('true' if normalize_flag else 'false')
+
+        cluster = MarkerCluster(
+            name='Markers',
+            options={
+                'showCoverageOnHover': False,
+                'zoomToBoundsOnClick': False,
+                'spiderfyOnMaxZoom': False,
+            },
+            icon_create_function=icon_create_function,
+        )
+        cluster.add_to(m)
+        _add_point_markers(
+            cluster,
+            groups,
+            search_term,
+            point_radius,
+            popup_width=popup_width,
+            lightweight=lightweight,
+            popup_dataset=popup_dataset,
         )
     else:
         _add_point_markers(
@@ -1143,6 +1218,7 @@ def create_map(
             point_radius,
             popup_width=popup_width,
             lightweight=lightweight,
+            popup_dataset=popup_dataset,
         )
 
 
@@ -1200,6 +1276,140 @@ def create_map(
     m.get_root().html.add_child(folium.Element(data_script))
 
     map_var = m.get_name()
+    cluster_block = ''
+    if mode == 'cluster':
+        cluster_var = cluster.get_name()
+        metric_label_js = json.dumps(metric_display_summary)
+        normalized_js = 'true' if normalize_flag else 'false'
+        cluster_block = f"""
+  (function() {{
+    var clusterLayer = {cluster_var};
+    if (clusterLayer && clusterLayer.on) {{
+      clusterLayer.options.iconCreateFunction = function(cluster) {{
+        var sum = 0;
+        cluster.getAllChildMarkers().forEach(function(marker) {{
+          var v = marker.options && marker.options.metricValue;
+          if (typeof v === 'number' && !isNaN(v)) {{
+            sum += v;
+          }} else if (v) {{
+            var num = parseFloat(v);
+            if (!isNaN(num)) sum += num;
+          }}
+        }});
+        var formatted;
+        if ({normalized_js}) {{
+          formatted = sum.toFixed(4);
+        }} else {{
+          formatted = Math.round(sum).toLocaleString();
+        }}
+        var absSum = Math.abs(sum);
+        var c = 'marker-cluster marker-cluster-small';
+        if (absSum >= 100) {{
+          c = 'marker-cluster marker-cluster-large';
+        }} else if (absSum >= 10) {{
+          c = 'marker-cluster marker-cluster-medium';
+        }}
+        return L.divIcon({{
+          html: '<div><span>' + formatted + '</span></div>',
+          className: c,
+          iconSize: new L.Point(40, 40)
+        }});
+      }};
+      if (clusterLayer.refreshClusters) {{
+        clusterLayer.refreshClusters();
+      }}
+      clusterLayer.on('clusterclick', function(e) {{
+        if (e && e.originalEvent) {{
+          e.originalEvent.preventDefault();
+          if (typeof e.originalEvent.stopPropagation === 'function') {{
+            e.originalEvent.stopPropagation();
+          }}
+        }}
+        loadData(function(dataset) {{
+          dataset = dataset || {{}};
+          var markers = e.layer.getAllChildMarkers();
+          var ids = [];
+          var metricSum = 0;
+          markers.forEach(function(marker) {{
+            var gid = marker.options && marker.options.groupId;
+            if (gid && ids.indexOf(gid) === -1) ids.push(gid);
+            var mv = marker.options && marker.options.metricValue;
+            if (typeof mv === 'number' && !isNaN(mv)) {{
+              metricSum += mv;
+            }} else if (mv) {{
+              var num = parseFloat(mv);
+              if (!isNaN(num)) metricSum += num;
+            }}
+          }});
+          if (!ids.length) return;
+          var container = document.createElement('div');
+          container.style.minWidth = '280px';
+          container.style.fontSize = '14px';
+          container.style.lineHeight = '1.3';
+          var summary = document.createElement('div');
+          summary.style.fontSize = '12px';
+          summary.style.color = '#555';
+          var metricText;
+          if ({normalized_js}) {{
+            metricText = (metricSum).toFixed(4);
+          }} else {{
+            metricText = Math.round(metricSum).toLocaleString();
+          }}
+          summary.textContent = {metric_label_js} + ': ' + metricText;
+          container.appendChild(summary);
+          var select = null;
+          if (ids.length > 1) {{
+            var selectLabel = document.createElement('div');
+            selectLabel.style.marginTop = '6px';
+            selectLabel.style.fontWeight = '600';
+            selectLabel.textContent = 'Select a location';
+            container.appendChild(selectLabel);
+            select = document.createElement('select');
+            select.style.width = '100%';
+            select.style.marginTop = '4px';
+            ids.forEach(function(gid) {{
+              var data = dataset[gid];
+              var opt = document.createElement('option');
+              opt.value = gid;
+              opt.textContent = (data && data.title) || gid;
+              select.appendChild(opt);
+            }});
+            container.appendChild(select);
+          }}
+          var detailHost = document.createElement('div');
+          detailHost.style.marginTop = '8px';
+          container.appendChild(detailHost);
+          function renderGroup(gid) {{
+            detailHost.innerHTML = '';
+            var data = dataset[gid];
+            if (!data) {{
+              detailHost.textContent = 'No data.';
+              return;
+            }}
+            if (data.template) {{
+              var wrapper = document.createElement('div');
+              wrapper.innerHTML = data.template;
+              var root = wrapper.firstElementChild;
+              if (root) {{
+                detailHost.appendChild(root);
+                attach(root);
+              }}
+            }} else {{
+              detailHost.textContent = 'No data.';
+            }}
+          }}
+          renderGroup(ids[0]);
+          if (select) {{
+            select.addEventListener('change', function() {{
+              renderGroup(this.value);
+            }});
+          }}
+          L.popup({{maxWidth: 360}}).setLatLng(e.latlng).setContent(container).openOn({map_var});
+        }});
+      }});
+    }}
+  }})();
+"""
     script_template = StrTemplate("""
 (function() {
   var popupCache = null;
@@ -1358,9 +1568,10 @@ def create_map(
   } else {
     init();
   }
+${cluster_block}
 })();
 """)
-    script_html = script_template.substitute(map_var=map_var)
+    script_html = script_template.substitute(map_var=map_var, cluster_block=cluster_block)
     m.get_root().script.add_child(folium.Element(script_html))
 
     m.save(out_html)

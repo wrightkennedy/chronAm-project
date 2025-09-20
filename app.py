@@ -1426,6 +1426,7 @@ class MapToolDialog(QDialog):
         self.mode_combo.addItem('Point Map', 'points')
         self.mode_combo.addItem('Graduated Symbols', 'graduated')
         self.mode_combo.addItem('Heat Map', 'heatmap')
+        self.mode_combo.addItem('Cluster Map', 'cluster')
         form.addRow('Map type:', self.mode_combo)
 
         self.metric_combo = QComboBox()
