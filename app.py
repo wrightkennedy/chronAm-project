@@ -1,26 +1,55 @@
-import sys
-import os
-import json
-import time
-import subprocess
-import os
-import pandas as pd
-import re
-import threading
 import html
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
 import urllib.parse
-from typing import Optional, List
-from datetime import datetime, date
-from PyQt5.QtWidgets import (
-    QFileDialog, QApplication, QMainWindow, QAction, QWidget,
-    QApplication, QMainWindow, QAction, QFileDialog, QWidget,
-    QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QProgressBar, QMessageBox, QCheckBox, QFormLayout, QDialog, QTextBrowser, QComboBox,
-    QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup, QDockWidget, QDialogButtonBox, QSpinBox,
-    QDoubleSpinBox, QGroupBox
+from datetime import datetime
+from typing import List, Optional
+
+import pandas as pd
+from PyQt5.QtCore import (
+    QEvent,
+    QObject,
+    QPropertyAnimation,
+    QThread,
+    QUrl,
+    Qt,
+    pyqtProperty,
+    pyqtSignal,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, pyqtProperty, QUrl, QObject, QEvent
-from PyQt5.QtGui import QPainter, QPen, QIntValidator, QTextCursor, QKeySequence
+from PyQt5.QtGui import QIntValidator, QKeySequence, QPainter, QPen, QTextCursor
+from PyQt5.QtWidgets import (
+    QAction,
+    QApplication,
+    QButtonGroup,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDockWidget,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QRadioButton,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextBrowser,
+    QVBoxLayout,
+    QWidget,
+    QDoubleSpinBox,
+)
 
 from chronam import download_data
 from chronam.map_create import create_map
@@ -49,6 +78,39 @@ DATASET_FOLDER_WARNING = (
     "If you have already set a folder location, the software does not recognize the parquet files. "
     "Ensure the folder is unzipped and accessible."
 )
+
+
+def _default_map_settings() -> dict:
+    """Return a fresh copy of the map rendering defaults."""
+    return {
+        'mode': 'points',
+        'time_unit': 'week',
+        'time_step': 1,
+        'linger_unit': 'week',
+        'linger_step': 2,
+        'disable_time': False,
+        'heat_radius': 15,
+        'heat_value': 1.0,
+        'grad_min_radius': 6,
+        'grad_max_radius': 28,
+        'metric': 'article_count',
+        'normalize': False,
+        'normalize_denominator': 'article_count',
+        'lightweight': False,
+        'table_mode': 'full',
+        'table_row_limit': 0,
+    }
+
+
+def _load_map_settings(raw: Optional[dict]) -> dict:
+    """Overlay any persisted map settings onto the defaults."""
+    defaults = _default_map_settings()
+    if isinstance(raw, dict):
+        for key in defaults:
+            if key in raw:
+                defaults[key] = raw[key]
+    return defaults
+
 
 class Spinner(QWidget):
     def __init__(self, parent=None, radius=20, line_width=4):
@@ -125,24 +187,7 @@ class MainWindow(QMainWindow):
         self.project_log_entries = []
         self.project_file = None
         self.collocation_state = {}
-        self.map_settings = {
-            'mode': 'points',
-            'time_unit': 'week',
-            'time_step': 1,
-            'linger_unit': 'week',
-            'linger_step': 2,
-            'disable_time': False,
-            'heat_radius': 15,
-            'heat_value': 1.0,
-            'grad_min_radius': 6,
-            'grad_max_radius': 28,
-            'metric': 'article_count',
-            'normalize': False,
-            'normalize_denominator': 'article_count',
-            'lightweight': False,
-            'table_mode': 'full',
-            'table_row_limit': 0,
-        }
+        self.map_settings = _default_map_settings()
         self.init_ui()
         self._close_filter = CloseShortcutFilter()
         QApplication.instance().installEventFilter(self._close_filter)
@@ -436,22 +481,7 @@ class MainWindow(QMainWindow):
         self.search_log_history.clear()
         self.project_log_entries.clear()
         self.collocation_state = {}
-        self.map_settings = {
-            'mode': 'points',
-            'time_unit': 'week',
-            'time_step': 1,
-            'linger_unit': 'week',
-            'linger_step': 2,
-            'disable_time': False,
-            'heat_radius': 15,
-            'heat_value': 1.0,
-            'grad_min_radius': 6,
-            'grad_max_radius': 28,
-            'metric': 'article_count',
-            'normalize': False,
-            'normalize_denominator': 'article_count',
-            'lightweight': False,
-        }
+        self.map_settings = _default_map_settings()
 
         self.ensure_dataset_folder(prompt=False)
         self._update_loaded_file_labels()
@@ -493,23 +523,9 @@ class MainWindow(QMainWindow):
         self.geojson_file = data.get('geojson_file')
         locations_csv = data.get('locations_csv_path')
         self.locations_csv_path = locations_csv if isinstance(locations_csv, str) else None
-        self.collocation_state = {}
-        self.map_settings = {
-            'mode': 'points',
-            'time_unit': 'week',
-            'time_step': 1,
-            'linger_unit': 'week',
-            'linger_step': 2,
-            'disable_time': False,
-            'heat_radius': 15,
-            'heat_value': 1.0,
-            'grad_min_radius': 6,
-            'grad_max_radius': 28,
-            'metric': 'article_count',
-            'normalize': False,
-            'normalize_denominator': 'article_count',
-            'lightweight': False,
-        }
+        collocation_state = data.get('collocation_state')
+        self.collocation_state = dict(collocation_state) if isinstance(collocation_state, dict) else {}
+        self.map_settings = _load_map_settings(data.get('map_settings'))
 
         search_log = data.get('search_log_history')
         if search_log is None:
@@ -566,6 +582,8 @@ class MainWindow(QMainWindow):
             'locations_csv_path': self.locations_csv_path,
             'search_log_history': self.search_log_history,
             'project_log': self.project_log_entries,
+            'map_settings': dict(self.map_settings),
+            'collocation_state': dict(self.collocation_state),
         }
 
         try:
@@ -970,10 +988,6 @@ class DownloadDialog(QDialog):
             explicit_dir = getattr(self, 'current_parquet_dir', None)
             if explicit_dir:
                 yield explicit_dir
-
-            override_dir = getattr(self, 'current_raw_folder', None)
-            if override_dir:
-                yield override_dir
 
             project_dir = getattr(self.parent(), 'project_folder', None)
             if project_dir:
