@@ -8,17 +8,25 @@ The newspaper files are from AmericanStories (https://huggingface.co/datasets/de
 
 # First time set up
 ## Download Parquet Files
-1. Download the newspaper articles stored as parquet files here: https://emailsc-my.sharepoint.com/:u:/r/personal/w_kennedy_sc_edu/Documents/data_tx/AmericanStories_1910.parquet?csf=1&web=1&e=5deX4n
-2. If you downloaded the zip archive with all years between 1900 and 1922, unzip the archive.
-3. You should see parquet files for each year, roughly 2-3 GB each (for 1900-1910s)
+1. Download the newspaper articles stored as parquet datasets here: https://emailsc-my.sharepoint.com/:f:/r/personal/w_kennedy_sc_edu/Documents/data_tx?csf=1&web=1&e=gHy9xJ
+2. If you downloaded the zip archive with all years between 1900 and 1922 ("AmericanStories_parquet1900-1922.zip"), unzip the archive.
+3. In Finder/File Explorer, you should see parquet files for each year, roughly 2-3 GB each (for 1900-1910s)
 
 ## Set up the App
-1. Clone Repository
-2. Create a new virtual environment `python3 -m venv venv`
-3. Activate the virtual environment `source venv/bin/activate`
-4. Install dependencies `pip install -r requirements.txt`
-5. Run the python script `python app.py`
-6. The first start up is often slow, since the software downloads the NLTK tools and stopwords (even though stop words from NLTK are not working right now -- they are hardcoded)
+VS Code Instructions for first-time use
+VS Code needs Git installed and logged in (github account), if not done so already
+1. Set folder location for program files using File > Open Folder... 
+2. Clone Repository (https://github.com/wrightkennedy/chronAm-project.git)
+    Cmd/Ctrl + Shift + P
+    type `Clone` + Enter
+    paste https://github.com/wrightkennedy/chronAm-project.git + Enter
+3. Open Terminal with Ctrl + Shift + `
+    The current directory should be set to the project folder by default
+4. In the Terminal, create a new virtual environment with the following command `python3 -m venv venv`
+5. Activate the virtual environment `source venv/bin/activate`
+6. Install dependencies `pip install -r requirements.txt`
+7. Run the python script `python app.py`
+8. The first start up is often slow, since the software downloads the dependencies
 
 # Working in the app
 ## Create or Load a Project
