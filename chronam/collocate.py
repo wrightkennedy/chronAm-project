@@ -380,6 +380,13 @@ def _build_output_stem(
     return "_".join([safe_term, start_lbl, end_lbl, city_lbl, state_lbl, bin_lbl, digest])
 
 
+def _drop_suffix(drop_terms: Optional[List[str]]) -> str:
+    if not drop_terms:
+        return "_nodrop"
+    cleaned = [str(term).strip() for term in drop_terms if str(term).strip()]
+    return "_drop" if cleaned else "_nodrop"
+
+
 def _build_output_paths(
     processed_dir: str,
     term: str,
@@ -390,13 +397,15 @@ def _build_output_paths(
     time_bin_unit: Optional[str],
     ignore_bin: bool,
     options: Dict[str, bool],
+    filename_suffix: str,
 ) -> Dict[str, Optional[str]]:
     stem = _build_output_stem(term, start_date, end_date, city, state, time_bin_unit, ignore_bin, options)
-    metrics = os.path.join(processed_dir, f"collocates_metrics_{stem}.csv")
-    by_time = None if ignore_bin or not time_bin_unit else os.path.join(processed_dir, f"collocates_by_time_{stem}.csv")
-    occurrences = os.path.join(processed_dir, f"occurrences_{stem}.geojson")
+    stem_with_suffix = f"{stem}{filename_suffix}" if filename_suffix else stem
+    metrics = os.path.join(processed_dir, f"collocates_metrics_{stem_with_suffix}.csv")
+    by_time = None if ignore_bin or not time_bin_unit else os.path.join(processed_dir, f"collocates_by_time_{stem_with_suffix}.csv")
+    occurrences = os.path.join(processed_dir, f"occurrences_{stem_with_suffix}.geojson")
     return {
-        "stem": stem,
+        "stem": stem_with_suffix,
         "metrics": metrics,
         "by_time": by_time,
         "occurrences": occurrences,
@@ -414,9 +423,11 @@ def build_collocation_output_paths(
     time_bin_unit: Optional[str],
     ignore_bin: bool,
     options: Dict[str, bool],
+    drop_terms: Optional[List[str]] = None,
 ) -> Dict[str, Optional[str]]:
     processed = init_project(project_dir)["processed"]
-    return _build_output_paths(processed, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, options)
+    suffix = _drop_suffix(drop_terms)
+    return _build_output_paths(processed, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, options, suffix)
 
 
 def run_collocation(
@@ -437,6 +448,7 @@ def run_collocation(
     write_occurrences_geojson: bool = False,
     ignore_bin: bool = False,
     write_by_time: bool = True,
+    drop_terms: Optional[List[str]] = None,
 ) -> Dict[str, Optional[str]]:
     """
     Execute collocation analysis. Writes outputs into data/processed.
@@ -472,17 +484,6 @@ def run_collocation(
         df = _load_json(json_path)  # type: ignore
 
     df = _filter_df(df, start_date, end_date, city, state, is_geo=is_geo)
-    if df.empty:
-        # Still write empty CSVs to keep UI predictable
-        empty_paths = _build_output_paths(proc, _safe_term(term), start_date, end_date, city, state, time_bin_unit, ignore_bin, opt_dict)
-        pd.DataFrame(columns=["collocate_term","frequency"]).to_csv(empty_paths["metrics"], index=False)
-        if write_by_time and empty_paths["by_time"]:
-            pd.DataFrame(columns=["time_bin","collocate_term","frequency","ordinal_rank"]).to_csv(empty_paths["by_time"], index=False)
-        return {
-            "metrics": empty_paths["metrics"],
-            "by_time": empty_paths["by_time"] if write_by_time else None,
-            "occurrences": None,
-        }
 
     # Ensure term is present
     if not term:
@@ -498,11 +499,30 @@ def run_collocation(
     if not term:
         raise ValueError("Search term is required to run collocation.")
 
+    drop_terms = drop_terms or []
+    drop_set = {str(t).strip() for t in drop_terms if str(t).strip()}
+    suffix = _drop_suffix(list(drop_set))
+
+    if df.empty:
+        # Still write empty CSVs to keep UI predictable
+        empty_paths = _build_output_paths(proc, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, opt_dict, suffix)
+        pd.DataFrame(columns=["collocate_term","frequency"]).to_csv(empty_paths["metrics"], index=False)
+        if write_by_time and empty_paths["by_time"]:
+            pd.DataFrame(columns=["time_bin","collocate_term","frequency","ordinal_rank"]).to_csv(empty_paths["by_time"], index=False)
+        return {
+            "metrics": empty_paths["metrics"],
+            "by_time": empty_paths["by_time"] if write_by_time else None,
+            "occurrences": None,
+        }
+
     # Build metrics (without time dimension)
     metrics, _ = _collocate_from_df(df, term, opts)
 
+    if drop_set:
+        metrics = metrics[~metrics['collocate_term'].isin(drop_set)].reset_index(drop=True)
+
     # Write metrics CSV
-    output_paths = _build_output_paths(proc, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, opt_dict)
+    output_paths = _build_output_paths(proc, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, opt_dict, suffix)
     metrics.to_csv(output_paths["metrics"], index=False)
 
     # Build by-time CSV if requested
@@ -515,6 +535,8 @@ def run_collocation(
             # default 1 month
             size, unit = 1, "months"
         by_time = _build_by_time(df, term, opts, start_date, end_date, size, unit)
+        if drop_set:
+            by_time = by_time[~by_time['collocate_term'].isin(drop_set)].reset_index(drop=True)
         by_time.to_csv(output_paths["by_time"], index=False)
 
     # Optionally write occurrences geojson (filtered subset)

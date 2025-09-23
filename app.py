@@ -31,12 +31,15 @@ from PyQt5.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDockWidget,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -48,7 +51,6 @@ from PyQt5.QtWidgets import (
     QTextBrowser,
     QVBoxLayout,
     QWidget,
-    QDoubleSpinBox,
 )
 
 from chronam import download_data
@@ -186,7 +188,8 @@ class MainWindow(QMainWindow):
         self.search_log_history = []
         self.project_log_entries = []
         self.project_file = None
-        self.collocation_state = {}
+        self.collocation_state = {'dropped_terms': []}
+        self.collocation_drop_terms = []
         self.map_settings = _default_map_settings()
         self.init_ui()
         self._close_filter = CloseShortcutFilter()
@@ -480,7 +483,8 @@ class MainWindow(QMainWindow):
         self.locations_csv_path = None
         self.search_log_history.clear()
         self.project_log_entries.clear()
-        self.collocation_state = {}
+        self.collocation_state = {'dropped_terms': []}
+        self.collocation_drop_terms = []
         self.map_settings = _default_map_settings()
 
         self.ensure_dataset_folder(prompt=False)
@@ -526,6 +530,15 @@ class MainWindow(QMainWindow):
         collocation_state = data.get('collocation_state')
         self.collocation_state = dict(collocation_state) if isinstance(collocation_state, dict) else {}
         self.map_settings = _load_map_settings(data.get('map_settings'))
+        drop_terms = data.get('collocation_drop_terms')
+        if drop_terms is None:
+            drop_terms = self.collocation_state.get('dropped_terms') if isinstance(self.collocation_state, dict) else []
+        if isinstance(drop_terms, list):
+            self.collocation_drop_terms = [str(term) for term in drop_terms if isinstance(term, str) and term.strip()]
+        else:
+            self.collocation_drop_terms = []
+        if isinstance(self.collocation_state, dict):
+            self.collocation_state['dropped_terms'] = list(self.collocation_drop_terms)
 
         search_log = data.get('search_log_history')
         if search_log is None:
@@ -584,6 +597,7 @@ class MainWindow(QMainWindow):
             'project_log': self.project_log_entries,
             'map_settings': dict(self.map_settings),
             'collocation_state': dict(self.collocation_state),
+            'collocation_drop_terms': list(self.collocation_drop_terms),
         }
 
         try:
@@ -1855,6 +1869,175 @@ class MapToolDialog(QDialog):
             parts.append(f"Table: {label} ({limit_text})")
         self.status_label.setText(html.escape('Map created successfully. ' + '; '.join(parts)))
 
+
+class TermDropDialog(QDialog):
+    def __init__(self, parent: Optional[QWidget], terms: List[dict], selected_terms: set):
+        super().__init__(parent)
+        self.setWindowTitle('Select Terms to Drop')
+        self.setMinimumSize(480, 620)
+        self.selected_terms: List[str] = list(selected_terms)
+        self._initializing = True
+
+        layout = QVBoxLayout(self)
+        info = QLabel('Select collocate terms to exclude from the analysis (top 150 shown).')
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText('Search terms...')
+        layout.addWidget(self.search_box)
+
+        length_row = QHBoxLayout()
+        length_label = QLabel('Select terms shorter than:')
+        self.length_spin = QSpinBox()
+        self.length_spin.setRange(0, 50)
+        self.length_spin.setSpecialValueText('Off')
+        length_row.addWidget(length_label)
+        length_row.addWidget(self.length_spin)
+        length_row.addStretch(1)
+        layout.addLayout(length_row)
+
+        controls = QHBoxLayout()
+        self.show_selected_btn = QPushButton('Show Selected Terms')
+        self.show_selected_btn.setCheckable(True)
+        controls.addWidget(self.show_selected_btn)
+        self.clear_btn = QPushButton('Clear Selection')
+        controls.addWidget(self.clear_btn)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setAlternatingRowColors(True)
+        layout.addWidget(self.list_widget, 1)
+
+        existing = set()
+        self.list_widget.blockSignals(True)
+        for info_row in terms:
+            term = str(info_row.get('term', '')).strip()
+            if not term or term in existing:
+                continue
+            existing.add(term)
+            rank = info_row.get('rank')
+            frequency = info_row.get('frequency')
+            parts = []
+            if isinstance(rank, int):
+                parts.append(f"#{rank}")
+            parts.append(term)
+            if frequency is not None:
+                freq_text = f"{frequency:g}" if isinstance(frequency, (float, int)) else str(frequency)
+                parts.append(f"({freq_text})")
+            if rank is None:
+                parts.append('(not in current metrics)')
+            item_text = ' '.join(parts)
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, term)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if term in selected_terms else Qt.Unchecked)
+            self.list_widget.addItem(item)
+        self.list_widget.blockSignals(False)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        self.drop_btn = QPushButton('Drop 0 Term(s)')
+        self.drop_btn.setDefault(True)
+        self.drop_btn.setAutoDefault(True)
+        self.cancel_btn = QPushButton('Cancel')
+        button_row.addWidget(self.drop_btn)
+        button_row.addWidget(self.cancel_btn)
+        layout.addLayout(button_row)
+
+        self.search_box.textChanged.connect(self._apply_filters)
+        self.show_selected_btn.toggled.connect(self._on_toggle_show_selected)
+        self.clear_btn.clicked.connect(self._clear_checks)
+        self.length_spin.valueChanged.connect(self._handle_length_selection)
+        self.list_widget.itemChanged.connect(self._handle_item_changed)
+        self.drop_btn.clicked.connect(self._accept_selection)
+        self.cancel_btn.clicked.connect(self.reject)
+
+        self._initializing = False
+
+        if self.selected_terms:
+            self.show_selected_btn.setChecked(True)
+        else:
+            self._update_show_selected_button_text(self.show_selected_btn.isChecked())
+
+        self._apply_filters()
+        self._update_drop_button_text()
+
+    def _gather_selected(self) -> List[str]:
+        terms: List[str] = []
+        seen = set()
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == Qt.Checked:
+                term = item.data(Qt.UserRole)
+                if term and term not in seen:
+                    seen.add(term)
+                    terms.append(term)
+        return terms
+
+    def _apply_filters(self):
+        search = self.search_box.text().strip().lower()
+        show_selected = self.show_selected_btn.isChecked()
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            term = item.data(Qt.UserRole) or ''
+            matches_search = search in term.lower()
+            matches_selection = (not show_selected) or item.checkState() == Qt.Checked
+            item.setHidden(not (matches_search and matches_selection))
+        self._update_show_selected_button_text(show_selected)
+        self._update_drop_button_text()
+
+    def _clear_checks(self):
+        self.list_widget.blockSignals(True)
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            item.setCheckState(Qt.Unchecked)
+        self.list_widget.blockSignals(False)
+        self.length_spin.blockSignals(True)
+        self.length_spin.setValue(0)
+        self.length_spin.blockSignals(False)
+        self.show_selected_btn.setChecked(False)
+        self._apply_filters()
+
+
+    def _handle_length_selection(self, value: int):
+        if self._initializing or value <= 0:
+            return
+        self.list_widget.blockSignals(True)
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            term = item.data(Qt.UserRole) or ''
+            if term and len(term) <= value:
+                item.setCheckState(Qt.Checked)
+        self.list_widget.blockSignals(False)
+        if not self.show_selected_btn.isChecked():
+            self.show_selected_btn.setChecked(True)
+        else:
+            self._apply_filters()
+
+    def _handle_item_changed(self, _item):
+        if self.show_selected_btn.isChecked():
+            self._apply_filters()
+        else:
+            self._update_drop_button_text()
+
+    def _accept_selection(self):
+        self.selected_terms = self._gather_selected()
+        self.accept()
+
+    def _update_drop_button_text(self):
+        count = len(self._gather_selected())
+        self.drop_btn.setText(f'Drop {count} Term(s)')
+        self.drop_btn.setEnabled(count > 0)
+
+    def _on_toggle_show_selected(self, checked: bool):
+        self._update_show_selected_button_text(checked)
+        self._apply_filters()
+
+    def _update_show_selected_button_text(self, checked: bool):
+        self.show_selected_btn.setText('Show All Terms' if checked else 'Show Selected Terms')
+
 class CollocationDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1947,11 +2130,54 @@ class CollocationDialog(QDialog):
             form.addRow(cb)
             self.checks[opt] = cb
 
-        layout.addLayout(form)
+        form_widget = QWidget()
+        form_widget.setLayout(form)
+
+        options_row = QHBoxLayout()
+        options_row.setContentsMargins(0, 0, 0, 0)
+        options_row.addWidget(form_widget, 1)
+
+        drop_column = QVBoxLayout()
+        drop_column.setContentsMargins(0, 0, 0, 0)
+        drop_column.setSpacing(6)
+        self.select_drop_terms_btn = QPushButton('Select Terms to Drop')
+        self.select_drop_terms_btn.clicked.connect(self.open_drop_terms_dialog)
+        drop_column.addWidget(self.select_drop_terms_btn)
+
+        summary_row = QHBoxLayout()
+        summary_row.setContentsMargins(0, 0, 0, 0)
+        self.drop_summary_label = QLabel()
+        self.drop_summary_label.setWordWrap(True)
+        self.drop_summary_label.setStyleSheet('color: #555555; font-size: 11px;')
+        summary_row.addWidget(self.drop_summary_label, 1)
+        self.clear_drop_btn = QPushButton('Clear')
+        self.clear_drop_btn.setFixedHeight(22)
+        self.clear_drop_btn.setMaximumWidth(70)
+        self.clear_drop_btn.clicked.connect(self.clear_dropped_terms)
+        summary_row.addWidget(self.clear_drop_btn, 0)
+        drop_column.addLayout(summary_row)
+
+        self.drop_terms_view = QTextBrowser()
+        self.drop_terms_view.setReadOnly(True)
+        self.drop_terms_view.setMinimumHeight(120)
+        self.drop_terms_view.setMaximumWidth(260)
+        self.drop_terms_view.setStyleSheet('font-size: 11px;')
+        drop_column.addWidget(self.drop_terms_view)
+
+        self.clear_notice_label = QLabel()
+        self.clear_notice_label.setStyleSheet('color: #c05621; font-size: 11px;')
+        self.clear_notice_label.hide()
+        drop_column.addWidget(self.clear_notice_label)
+        drop_column.addStretch(1)
+
+        options_row.addLayout(drop_column, 0)
+        layout.addLayout(options_row)
 
         self._loading_defaults = True
         self._restore_state_or_defaults()
         self._loading_defaults = False
+        self._update_drop_summary()
+        self._set_clear_notice('')
 
         self.bin_size.textEdited.connect(self._handle_bin_control_change)
         self.bin_unit.currentIndexChanged.connect(self._handle_bin_control_change)
@@ -2075,6 +2301,17 @@ class CollocationDialog(QDialog):
         for key, cb in self.checks.items():
             cb.setChecked(bool(opts.get(key, True)))
 
+        drop_terms_state = state.get('dropped_terms')
+        if parent is not None:
+            if isinstance(drop_terms_state, list):
+                parent.collocation_drop_terms = [str(term).strip() for term in drop_terms_state if isinstance(term, str) and term.strip()]
+            elif drop_terms_state is None:
+                # Leave as-is when state does not specify dropped terms
+                pass
+            else:
+                parent.collocation_drop_terms = []
+        self._update_drop_summary()
+
     def _prefill_from_current_source(self, reset_state: bool = False):
         parent = self.parent()
         source_path = None
@@ -2166,6 +2403,145 @@ class CollocationDialog(QDialog):
     def _collect_options(self) -> dict:
         return {opt: cb.isChecked() for opt, cb in self.checks.items()}
 
+    def _get_parent_drop_terms(self) -> List[str]:
+        parent = self.parent()
+        if parent is None:
+            return []
+        return list(getattr(parent, 'collocation_drop_terms', []))
+
+    def _update_drop_summary(self):
+        terms = self._get_parent_drop_terms()
+        count = len(terms)
+        if count:
+            self.drop_summary_label.setText(f'Dropped terms: {count}')
+            self.clear_drop_btn.setEnabled(True)
+        else:
+            self.drop_summary_label.setText('No terms dropped.')
+            self.clear_drop_btn.setEnabled(False)
+        if terms:
+            body = '<br/>'.join(html.escape(term) for term in terms)
+            self.drop_terms_view.setHtml(body)
+        else:
+            self.drop_terms_view.setHtml('<span style="color:#777777;">(none)</span>')
+
+    def _set_dropped_terms(self, terms: List[str], *, log_change: bool, show_notice: bool = False):
+        parent = self.parent()
+        if parent is None:
+            return
+        normalized: List[str] = []
+        seen = set()
+        for term in terms:
+            term_str = str(term).strip()
+            if term_str and term_str not in seen:
+                seen.add(term_str)
+                normalized.append(term_str)
+        previous = list(getattr(parent, 'collocation_drop_terms', []))
+        parent.collocation_drop_terms = normalized
+        state = dict(getattr(parent, 'collocation_state', {}) or {})
+        state['dropped_terms'] = list(normalized)
+        parent.collocation_state = state
+        self._update_drop_summary()
+        self._save_state()
+        if log_change and normalized != previous:
+            self._log_drop_terms_change(previous, normalized)
+        if show_notice:
+            self._set_clear_notice('Run the collocation analysis again to apply changes.')
+
+    def _log_drop_terms_change(self, previous: List[str], current: List[str]):
+        parent = self.parent()
+        if parent is None:
+            return
+        count = len(current)
+        if count == 0:
+            lines = ['<div>Dropped terms cleared.</div>']
+        else:
+            items = ''.join(f'<li>{html.escape(term)}</li>' for term in current)
+            lines = [
+                f'<div>Updated dropped terms ({count})</div>',
+                f'<div style="max-height:220px; overflow-y:auto;"><ul>{items}</ul></div>',
+            ]
+        parent.append_project_log('Collocation Analysis', lines)
+
+    def _set_clear_notice(self, text: str):
+        if not hasattr(self, 'clear_notice_label'):
+            return
+        if text:
+            self.clear_notice_label.setText(text)
+            self.clear_notice_label.show()
+        else:
+            self.clear_notice_label.clear()
+            self.clear_notice_label.hide()
+
+    def clear_dropped_terms(self):
+        if not self._get_parent_drop_terms():
+            return
+        self._set_dropped_terms([], log_change=True, show_notice=True)
+
+    def open_drop_terms_dialog(self):
+        term = self.term_input.text().strip()
+        if not term:
+            QMessageBox.warning(self, 'Search Term Required', 'Enter a search term before selecting terms to drop.')
+            return
+        city_text = self.city_combo.currentText()
+        state_text = self.state_combo.currentText()
+        city = None if not city_text or city_text == 'All Cities' else city_text.strip()
+        state = None if not state_text or state_text == 'All States' else state_text.strip()
+        paths = self._build_output_paths(
+            term,
+            self.start_input.text().strip(),
+            self.end_input.text().strip(),
+            city,
+            state,
+            self._collect_options(),
+        )
+        metrics_path = paths.get('metrics')
+        if not metrics_path or not os.path.exists(metrics_path):
+            QMessageBox.warning(self, 'Metrics Not Found', 'Run the collocation analysis before selecting terms to drop.')
+            return
+        try:
+            df = pd.read_csv(metrics_path)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Read Error', f'Unable to read metrics file:\n{exc}')
+            return
+        if df.empty or 'collocate_term' not in df.columns:
+            QMessageBox.information(self, 'No Collocates', 'No collocated terms are available to drop.')
+            return
+        df = df.dropna(subset=['collocate_term']).copy()
+        df['collocate_term'] = df['collocate_term'].astype(str)
+        freq_col = 'frequency' if 'frequency' in df.columns else None
+        if freq_col:
+            df = df.sort_values([freq_col, 'collocate_term'], ascending=[False, True]).reset_index(drop=True)
+        else:
+            df = df.sort_values(['collocate_term']).reset_index(drop=True)
+
+        term_infos: List[dict] = []
+        for idx, row in df.iterrows():
+            info = {
+                'term': row['collocate_term'],
+                'frequency': row.get(freq_col) if freq_col else None,
+                'rank': idx + 1,
+            }
+            term_infos.append(info)
+
+        selected_set = set(self._get_parent_drop_terms())
+        top_terms = term_infos[:150]
+        known_terms = {info['term'] for info in top_terms}
+
+        # Include selected terms beyond the top 150 and any missing from the file
+        for info in term_infos[150:]:
+            term_name = info['term']
+            if term_name in selected_set and term_name not in known_terms:
+                top_terms.append(info)
+                known_terms.add(term_name)
+        for term_name in selected_set:
+            if term_name not in known_terms:
+                top_terms.append({'term': term_name, 'frequency': None, 'rank': None})
+                known_terms.add(term_name)
+
+        dialog = TermDropDialog(self, top_terms, selected_set)
+        if dialog.exec_() == QDialog.Accepted:
+            self._set_dropped_terms(dialog.selected_terms, log_change=True)
+
     def _current_time_bin_unit(self) -> Optional[str]:
         if self.ignore_bin.isChecked():
             return None
@@ -2189,6 +2565,7 @@ class CollocationDialog(QDialog):
             time_bin_unit=time_bin_unit,
             ignore_bin=self.ignore_bin.isChecked(),
             options=options,
+            drop_terms=self._get_parent_drop_terms(),
         )
 
     def _register_preview(self, preview: QDialog):
@@ -2250,6 +2627,7 @@ class CollocationDialog(QDialog):
             'bin_unit': self.bin_unit.currentText(),
             'ignore_bin': self.ignore_bin.isChecked(),
             'options': self._collect_options(),
+            'dropped_terms': self._get_parent_drop_terms(),
         }
         parent.collocation_state = state
 
@@ -2372,6 +2750,7 @@ class CollocationDialog(QDialog):
                     write_occurrences_geojson=False,
                     ignore_bin=ignore_bin,
                     write_by_time=write_by_time,
+                    drop_terms=parent.collocation_drop_terms,
                     **opts,
                 )
             else:
@@ -2394,6 +2773,7 @@ class CollocationDialog(QDialog):
                     write_occurrences_geojson=True,
                     ignore_bin=ignore_bin,
                     write_by_time=write_by_time,
+                    drop_terms=parent.collocation_drop_terms,
                     **opts,
                 )
         except Exception as e:
@@ -2427,6 +2807,7 @@ class CollocationDialog(QDialog):
             opts,
             result,
         )
+        self._set_clear_notice('')
 
     def show_bar(self):
         term = self.term_input.text().strip()
@@ -2465,6 +2846,9 @@ class CollocationDialog(QDialog):
             summary_parts.append(f"Time bin: {time_bin_unit or 'default'}")
         enabled_opts = [name for name, enabled in options.items() if enabled]
         summary_parts.append(f"Options: {', '.join(enabled_opts) if enabled_opts else 'none'}")
+        drop_count = len(getattr(parent, 'collocation_drop_terms', []))
+        if drop_count:
+            summary_parts.append(f"Dropped terms: {drop_count}")
         lines = [f"<div>{html.escape('; '.join(summary_parts))}</div>"]
 
         def link_line(label: str, path: Optional[str]):
@@ -2484,6 +2868,14 @@ class CollocationDialog(QDialog):
         occ_line = link_line('Occurrences GeoJSON', paths.get('occurrences'))
         if occ_line:
             lines.append(occ_line)
+        if drop_count:
+            terms = getattr(parent, 'collocation_drop_terms', [])
+            if terms:
+                items = ''.join(f'<li>{html.escape(term)}</li>' for term in terms)
+                lines.append(
+                    f'<div><strong>Dropped terms list:</strong></div>'
+                    f'<div style="max-height:220px; overflow-y:auto;"><ul>{items}</ul></div>'
+                )
 
         parent.append_project_log('Collocation Analysis', lines)
 
