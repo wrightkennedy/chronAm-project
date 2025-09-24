@@ -12,7 +12,7 @@ The newspaper files are from AmericanStories (https://huggingface.co/datasets/de
 2. If you downloaded the zip archive with all years between 1900 and 1922 ("AmericanStories_parquet1900-1922.zip"), unzip the archive.
 3. In Finder/File Explorer, you should see parquet files for each year, roughly 2-3 GB each (for 1900-1910s)
 
-## Set up the App
+## Set up the App (macOS)
 VS Code Instructions for first-time use
 VS Code needs Git installed and logged in (github account), if not done so already
 1. Set folder location for program files using File > Open Folder... 
@@ -27,6 +27,39 @@ VS Code needs Git installed and logged in (github account), if not done so alrea
 6. Install dependencies `pip install -r requirements.txt`
 7. Run the python script `python app.py`
 8. The first start up is often slow, since the software downloads the dependencies
+
+## Set up the App (Windows)
+VS Code Instructions for first-time use
+1. Click Source Control tab on left
+2. Click "Download Git for Windows"
+    a. https://git-scm.com/downloads/win
+    b. Download and install
+    c. Choose the Default editor used by Git > "Use Visual Studio Code as Git's default editor"
+    d. Use default selections for everything else in installer
+3. In VS Code > Source Control (tab), click "Reload" to see Git
+4. Select "Initialize Repository"
+5. Cmd/Ctrl + Shift + P, then type "Clone"
+    a. https://github.com/wrightkennedy/chronAm-project.git
+    b. Select folder for clone
+    c. (if first time using Git in VS Code, you will be asked to 'Sign in [to GitHub] with your browser"
+    d. Would you like to open the repository or Add it to the Workspace > add it to the workspace.
+6. Select the Explorer tab on the left
+7. Top Menu > Terminal > New Terminal (or Ctrl + Shift + `)
+    a. Select chronAm-project as the workspace; we will install the python virtual environment in this folder, and the .gitignore will make sure it is not uploaded to GitHub
+    b. Windows (python -m venv venv)
+        i. We noticed a new virtual environment; would you like to select it > "Yes"
+8. To activate the venv on Windows, use `venv\Scripts\activate`
+    a. If terminal returns a security error, do the following:
+        i. Open PowerShell as Administrator
+            1) Right-click the Start button and select Windows PowerShell (Admin) or search for "PowerShell," then right-click and choose "Run as Administrator."
+        ii. Check current execution policy: Run the following command to check the current execution policy: `Get-ExecutionPolicy`
+        iii. Change execution policy: To allow scripts to run, you need to set the execution policy to RemoteSigned (which allows locally created scripts to run). Run this command: `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser`
+        iv. Return to VS Code and try activating the venv again: `.\venv\Scripts\Activate`
+    b. To undo the change made to the execution policy:
+        i. Open PowerShell as Administrator
+            1) Right-click the Start button and select Windows PowerShell (Admin) or search for "PowerShell," then right-click and choose "Run as Administrator."
+        ii. To set the execution policy back to its default value (Restricted), run the following command: `Set-ExecutionPolicy Restricted -Scope CurrentUser`
+        iii. Verify the change to the execution policy: Run the following command to verify the current execution policy: `Get-ExecutionPolicy`
 
 # Working in the app
 ## Create or Load a Project
