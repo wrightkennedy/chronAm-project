@@ -11,12 +11,19 @@
 # │   └── visualize.py              # plotting routines
 # ├── app.py                        # PyQt GUI, imports chronam.* modules
 # ├── requirements.txt
+# ├── chronam/resources/            # packaged reference data
+# │   └── ChronAm_newspapers_XY.csv # default locations table
 # └── data/                         # created under project root
 #     ├── raw/                      # raw JSON downloads
-#     ├── processed/                # merged geojson outputs
-#     └── ChronAm_newspapers_XY.csv # source CSV
+#     └── processed/                # merged geojson outputs
 
 import os
+from pathlib import Path
+
+try:  # Python 3.9+
+    from importlib.resources import files
+except ImportError:  # pragma: no cover
+    files = None
 
 # Default Hugging Face dataset parameters
 DATASET_NAME = "dell-research-harvard/AmericanStories"
@@ -27,6 +34,24 @@ DATASET_SPLIT = "train"
 DEFAULT_CSV_FILENAME = "ChronAm_newspapers_XY.csv"
 DEFAULT_MERGED_GEOJSON = "merged.geojson"
 DEFAULT_COLLATED_GEOJSON = "collocated.geojson"
+
+
+CSV_RESOURCE_PACKAGE = "chronam.resources"
+PACKAGE_ROOT = Path(__file__).resolve().parent
+_BUNDLED_CSV = PACKAGE_ROOT / "resources" / DEFAULT_CSV_FILENAME
+
+
+def default_csv_path() -> str:
+    """Return the packaged ChronAm CSV path, falling back to local resources."""
+    if _BUNDLED_CSV.exists():
+        return str(_BUNDLED_CSV)
+    if files:
+        try:
+            resource = files(CSV_RESOURCE_PACKAGE) / DEFAULT_CSV_FILENAME
+            return str(resource)
+        except ModuleNotFoundError:
+            pass
+    return str(_BUNDLED_CSV)
 
 
 def init_project(project_dir: str) -> dict:
@@ -48,7 +73,7 @@ def init_project(project_dir: str) -> dict:
         "data": data_dir,
         "raw": raw_dir,
         "processed": proc_dir,
-        "csv": os.path.join(data_dir, DEFAULT_CSV_FILENAME),
+        "csv": default_csv_path(),
         "merged_geojson": os.path.join(proc_dir, DEFAULT_MERGED_GEOJSON),
         "collocated_geojson": os.path.join(proc_dir, DEFAULT_COLLATED_GEOJSON)
     }

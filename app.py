@@ -54,6 +54,7 @@ from PyQt5.QtWidgets import (
 )
 
 from chronam import download_data
+from chronam.config import DEFAULT_CSV_FILENAME, default_csv_path
 from chronam.map_create import create_map
 from chronam.merge import merge_geojson
 from chronam.collocate import run_collocation, build_collocation_output_paths
@@ -1218,8 +1219,10 @@ class UpdateLocationsDialog(QDialog):
             candidates.append(explicit)
         dataset = getattr(parent, 'dataset_folder', None)
         if dataset:
-            candidates.append(os.path.join(os.path.dirname(dataset), 'ChronAm_newspapers_XY.csv'))
-        candidates.append(os.path.join(parent.project_folder, 'data', 'ChronAm_newspapers_XY.csv'))
+            candidates.append(os.path.join(os.path.dirname(dataset), DEFAULT_CSV_FILENAME))
+        if parent is not None:
+            candidates.append(os.path.join(parent.project_folder, 'data', DEFAULT_CSV_FILENAME))
+        candidates.append(default_csv_path())
         for cand in candidates:
             if cand and os.path.exists(cand):
                 return cand
@@ -1231,13 +1234,13 @@ class UpdateLocationsDialog(QDialog):
             QMessageBox.information(
                 self,
                 'Locate Locations CSV',
-                'Locate the newspaper locations table named "ChronAm_newspapers_XY.csv".'
+                f'Locate the newspaper locations table named "{DEFAULT_CSV_FILENAME}".'
             )
             self._csv_hint_shown = True
         start = parent.project_folder if parent else os.getcwd()
         path, _ = QFileDialog.getOpenFileName(
             self,
-            'Select Locations CSV (ChronAm_newspapers_XY.csv)',
+            f'Select Locations CSV ({DEFAULT_CSV_FILENAME})',
             start,
             'CSV Files (*.csv)'
         )
