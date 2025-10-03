@@ -25,9 +25,36 @@ except Exception:  # pragma: no cover
 from .config import init_project  # type: ignore
 
 
+class MergeResult(list):
+    """List of output paths annotated with merge statistics."""
+
+    def __init__(self, paths: List[str], stats: Dict[str, Any]):
+        super().__init__(paths)
+        self.stats = stats
+
+
 def _load_xy(csv_path: str) -> pd.DataFrame:
     """Load the ChronAm newspapers XY CSV and standardize column names."""
     df = pd.read_csv(csv_path)
+    df.columns = [str(col).strip().lstrip("\ufeff") for col in df.columns]
+    # Keep a single row per SN to avoid join blow-up
+    if "SN" in df.columns:
+        df = df.drop_duplicates(subset=["SN"], keep="first")
+    for col in ["Date_start", "Date_end"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    start_cols = [c for c in ["Date_start"] if c in df.columns]
+    end_cols = [c for c in ["Date_end"] if c in df.columns]
+    if start_cols:
+        start_frame = df[start_cols].copy()
+        df["_start"] = start_frame.bfill(axis=1).iloc[:, 0]
+    else:
+        df["_start"] = pd.NaT
+    if end_cols:
+        end_frame = df[end_cols].copy()
+        df["_end"] = end_frame.bfill(axis=1).iloc[:, 0]
+    else:
+        df["_end"] = pd.NaT
     # Normalize expected columns
     required = {"SN", "Long", "Lat"}
     missing = required - set(df.columns)
@@ -60,6 +87,17 @@ def _normalize_articles(payload: Dict[str, Any]) -> pd.DataFrame:
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
     return df
+
+
+def _parse_date(value: Any) -> Optional[pd.Timestamp]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value
+    try:
+        return pd.to_datetime(value, errors="coerce")
+    except Exception:
+        return None
 
 
 def _to_geodataframe(merged: pd.DataFrame) -> "gpd.GeoDataFrame":  # type: ignore
@@ -108,6 +146,7 @@ def merge_geojson(
     json_path: Optional[str] = None,
     search_term: Optional[str] = None,
     year: Optional[str] = None,
+    unmatched_csv_path: Optional[str] = None,
 ) -> List[str]:
     """
     Merge raw JSON search results with newspaper coordinates (XY) and output GeoJSON.
@@ -115,6 +154,7 @@ def merge_geojson(
     Otherwise merges all JSON files matching the search_term (and year, if specified).
 
     Returns a list of output GeoJSON file paths created.
+    If unmatched_csv_path is provided, writes a CSV of unmatched articles there.
     """
     paths = init_project(project_dir)
     raw_dir = paths["raw"]
@@ -146,6 +186,14 @@ def merge_geojson(
         raise FileNotFoundError("No JSON files found to merge.")
 
     outputs: List[str] = []
+    unmatched_frames: List[pd.DataFrame] = []
+    overall_stats: Dict[str, Any] = {
+        "matched_lccn": 0,
+        "matched_title": 0,
+        "total_articles": 0,
+        "unmatched": 0,
+        "files": [],
+    }
     for jfile in json_files:
         with open(jfile, "r", encoding="utf-8") as f:
             payload = json.load(f)
@@ -155,25 +203,125 @@ def merge_geojson(
         if df.empty:
             continue
 
-        # Merge with XY metadata
-        merged = df.copy()
-        joined = False
-        if "lccn" in df.columns and df["lccn"].notna().any():
-            merged = merged.merge(df_xy, left_on="lccn", right_on="SN", how="left")
-            joined = True
-        elif "newspaper_name" in df.columns and df["newspaper_name"].notna().any():
-            merged = merged.merge(df_xy, left_on="newspaper_name", right_on="Title", how="left")
-            joined = True
+        metadata_cols = [
+            col for col in ["SN", "Title", "City", "State", "Long", "Lat", "_start", "_end"]
+            if col in df_xy.columns
+        ]
 
-        if not joined:
-            for col in ["SN", "Title", "City", "State", "Long", "Lat"]:
+        merged = df.copy()
+        merged["_match_source"] = None
+        merged["_title_key"] = None
+        if "date" in merged.columns:
+            merged["_article_ts"] = pd.to_datetime(merged["date"], errors="coerce")
+        else:
+            merged["_article_ts"] = pd.NaT
+
+        search_start = _parse_date(payload.get("start_date"))
+        search_end = _parse_date(payload.get("end_date"))
+
+        if merged["_article_ts"].notna().any():
+            if search_start is None:
+                search_start = merged["_article_ts"].min()
+            if search_end is None:
+                search_end = merged["_article_ts"].max()
+
+        if "lccn" in merged.columns and merged["lccn"].notna().any():
+            merged = merged.merge(df_xy[metadata_cols], left_on="lccn", right_on="SN", how="left")
+            merged.loc[merged["SN"].notna(), "_match_source"] = "lccn"
+        else:
+            for col in metadata_cols:
                 if col not in merged.columns:
                     merged[col] = None
+
+        title_source_col = next((c for c in ("newspaper_name", "Title", "title") if c in merged.columns), None)
+        if title_source_col:
+            merged["_title_key"] = (
+                merged[title_source_col]
+                .astype(str)
+                .str.strip()
+                .str.casefold()
+            )
+            valid_titles = merged["_title_key"].astype(bool) & (merged["_title_key"] != "nan")
+            fallback_mask = merged["SN"].isna() & valid_titles
+            if fallback_mask.any():
+                df_xy_title = df_xy[df_xy["Title"].notna()].copy()
+                df_xy_title["_title_key"] = (
+                    df_xy_title["Title"]
+                    .astype(str)
+                    .str.strip()
+                    .str.casefold()
+                )
+                df_xy_title = df_xy_title[df_xy_title["_title_key"].astype(bool)]
+
+                if search_start is not None or search_end is not None:
+                    mask = pd.Series(True, index=df_xy_title.index)
+                    if search_start is not None:
+                        mask &= df_xy_title["_end"].isna() | (df_xy_title["_end"] >= search_start)
+                    if search_end is not None:
+                        mask &= df_xy_title["_start"].isna() | (df_xy_title["_start"] <= search_end)
+                    df_xy_title = df_xy_title[mask]
+
+                if not df_xy_title.empty:
+                    df_xy_title = df_xy_title.drop_duplicates(subset=["_title_key"], keep="first")
+                    metadata_lookup = df_xy_title.set_index("_title_key")[metadata_cols]
+                    title_keys = merged.loc[fallback_mask, "_title_key"]
+                    mapped = metadata_lookup.reindex(title_keys)
+                    mapped.index = title_keys.index
+
+                    if not mapped.empty:
+                        article_dates = merged.loc[fallback_mask, "_article_ts"]
+                        valid = pd.Series(True, index=mapped.index)
+                        if "_start" in mapped.columns:
+                            valid &= mapped["_start"].isna() | (article_dates >= mapped["_start"])
+                        if "_end" in mapped.columns:
+                            valid &= mapped["_end"].isna() | (article_dates <= mapped["_end"])
+                        if not valid.all():
+                            mapped.loc[~valid, metadata_cols] = None
+
+                        for col in metadata_cols:
+                            if col in mapped.columns:
+                                existing = merged.loc[fallback_mask, col]
+                                merged.loc[fallback_mask, col] = existing.where(existing.notna(), mapped[col])
+
+                        fallback_matched = fallback_mask & merged["SN"].notna()
+                        if fallback_matched.any():
+                            current_sources = merged.loc[fallback_matched, "_match_source"]
+                            merged.loc[fallback_matched, "_match_source"] = current_sources.where(
+                                current_sources.notna(), "title"
+                            )
+
+        if "article_id" in merged.columns:
+            merged = merged.drop_duplicates(subset=["article_id"], keep="first")
+
+        if "_match_source" in merged.columns:
+            merged.loc[merged["SN"].notna() & merged["_match_source"].isna(), "_match_source"] = "lccn"
+
+        match_counts = {"lccn": 0, "title": 0}
+        if "_match_source" in merged.columns:
+            for key in match_counts.keys():
+                mask = merged["_match_source"] == key
+                if mask.any():
+                    if "article_id" in merged.columns:
+                        match_counts[key] = int(merged.loc[mask & merged["article_id"].notna(), "article_id"].nunique())
+                    else:
+                        match_counts[key] = int(mask.sum())
 
         if "Title" in merged.columns and "newspaper_name" in merged.columns:
             merged["Title"] = merged["Title"].fillna(merged["newspaper_name"])
         if "newspaper_name" in merged.columns:
             merged = merged.drop(columns=["newspaper_name"])
+
+        if "_match_source" in merged.columns:
+            merged = merged.rename(columns={"_match_source": "match_source"})
+        if "match_source" in merged.columns:
+            unmatched_mask = merged["SN"].isna()
+            merged.loc[unmatched_mask & merged["match_source"].isna(), "match_source"] = "unmatched"
+        helper_cols = ["_article_ts", "_start", "_end", "_title_key"]
+        unmatched_rows = merged[merged["SN"].isna()].drop(columns=[c for c in helper_cols if c in merged.columns], errors="ignore")
+        if not unmatched_rows.empty:
+            unmatched_frames.append(unmatched_rows.copy())
+
+        merged = merged.drop(columns=[c for c in helper_cols if c in merged.columns], errors="ignore")
 
         # Convert to GeoDataFrame
         gdf = _to_geodataframe(merged)
@@ -204,4 +352,26 @@ def merge_geojson(
         gdf.to_file(out_path, driver="GeoJSON")
         outputs.append(out_path)
 
-    return outputs
+        overall_stats["matched_lccn"] += match_counts.get("lccn", 0)
+        overall_stats["matched_title"] += match_counts.get("title", 0)
+        total_articles = int(len(gdf))
+        overall_stats["total_articles"] += total_articles
+        unmatched_count = int(len(unmatched_rows))
+        overall_stats["unmatched"] += unmatched_count
+        overall_stats["files"].append({
+            "path": out_path,
+            "matched_lccn": match_counts.get("lccn", 0),
+            "matched_title": match_counts.get("title", 0),
+            "total_articles": total_articles,
+            "unmatched": unmatched_count,
+        })
+
+    unmatched_df = pd.concat(unmatched_frames, ignore_index=True) if unmatched_frames else pd.DataFrame()
+    overall_stats["unmatched"] = int(len(unmatched_df))
+    overall_stats["unmatched_path"] = None
+    if unmatched_csv_path and not unmatched_df.empty:
+        os.makedirs(os.path.dirname(unmatched_csv_path), exist_ok=True)
+        unmatched_df.to_csv(unmatched_csv_path, index=False)
+        overall_stats["unmatched_path"] = unmatched_csv_path
+
+    return MergeResult(outputs, overall_stats)

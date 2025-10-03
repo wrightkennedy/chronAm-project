@@ -398,6 +398,48 @@ def _feature_label(props: Dict[str, Any]) -> str:
     return label or "Feature"
 
 
+def _entry_payload(
+    entry: Dict[str, Any],
+    search_term: Optional[str],
+    *,
+    embed_article: bool = True,
+) -> Dict[str, Any]:
+    props = entry.get('props') or {}
+    article_text = props.get('article') or ''
+    first_line = _first_line_excerpt(article_text, 160)
+    snippet_html = _keyword_snippet(article_text, search_term)
+    url_val = (props.get('url') or '').strip()
+    pdf_url = url_val.replace('.jp2', '.pdf') if url_val else ''
+    date_val = _format_date_str(props.get('date') or '')
+    newspaper_val = (props.get('Title') or props.get('newspaper_name') or '').strip()
+    city_val = (props.get('City') or '').strip()
+    state_val = (props.get('State') or '').strip()
+    place_val = ', '.join([p for p in (city_val, state_val) if p])
+
+    payload = {
+        'first_line': _esc(first_line),
+        'context': snippet_html or '',
+        'pdf_url': _esc(pdf_url) if pdf_url else '',
+        'date': _esc(date_val),
+        'newspaper': _esc(newspaper_val),
+        'place': _esc(place_val),
+        'page': _esc((props.get('page') or '').strip()),
+        'article_html': _article_excerpt(article_text, search_term, max_chars=3000)
+        if (embed_article and article_text)
+        else '',
+        'article_preview': _article_excerpt(article_text, search_term, max_chars=600)
+        if article_text
+        else '',
+    }
+    label_value = _feature_label(props)
+    if label_value:
+        payload['label'] = label_value
+    row_id = entry.get('_popup_row_id')
+    if row_id:
+        payload['attr_row_id'] = row_id
+    return payload
+
+
 def _group_header(entries: List[Dict[str, Any]], stats: Dict[str, Any], search_term: Optional[str]) -> Tuple[str, int, str]:
     first_props = entries[0].get('props', {}) if entries else {}
     city_name = (first_props.get('City') or '').strip() or 'this location'
@@ -451,9 +493,12 @@ def _group_popup_html(
             if denominator_label:
                 metric_lines.append(f"Normalized by {denominator_label} per city")
         else:
-            formatted = _format_metric_value(metric_key, metric_value, False)
-            label = metric_display or 'Metric'
-            metric_lines.append(f"{label}: {formatted}")
+            if metric_key == 'article_count':
+                metric_lines = []
+            else:
+                formatted = _format_metric_value(metric_key, metric_value, False)
+                label = metric_display or 'Metric'
+                metric_lines.append(f"{label}: {formatted}")
 
     nav_buttons_html = (
         '<div data-nav-controls style="display:flex; align-items:center; gap:4px;">'
@@ -476,23 +521,30 @@ def _group_popup_html(
 
     select_html = '<select ' + ' '.join(select_attrs) + '>' + options_html + '</select>'
 
-    metric_text_html = ''
-    if metric_lines:
-        metric_text_html = ' | '.join(_esc(line) for line in metric_lines)
+    metric_text_html = ' | '.join(_esc(line) for line in metric_lines) if metric_lines else ''
     metrics_html = (
-        f'<div style="margin-top:2px; font-size:12px; color:#555;">{metric_text_html}</div>'
-        if metric_text_html else ''
+        f'<div data-popup-metrics style="margin-top:2px; font-size:12px; color:#555;">{metric_text_html}</div>'
+        if metric_text_html
+        else '<div data-popup-metrics style="margin-top:2px; font-size:12px; color:#555; display:none;"></div>'
+    )
+
+    summary_html = (
+        f'<div data-popup-summary style="font-size:12px; color:#555; margin-bottom:4px;">Articles: {article_count:,}</div>'
+        if article_count is not None else '<div data-popup-summary style="display:none;"></div>'
     )
 
     select_block = f'<div style="margin-top:6px;">{select_html}</div>'
     footer_html = (
-        '<div style="margin-top:6px; display:flex; justify-content:flex-end; align-items:center; gap:6px;">'
+        '<div style="margin-top:6px; display:flex; justify-content:space-between; align-items:center; gap:6px;">'
+        '<span data-location-progress style="font-size:12px; color:#555;"></span>'
+        '<div style="display:flex; align-items:center; gap:6px;">'
         '<span data-article-progress style="font-size:12px; color:#555;"></span>'
         f'{nav_buttons_html}'
         '</div>'
+        '</div>'
     )
 
-    header_html = f'<div style="margin-bottom:4px; font-weight:600;">{_esc(title_text)}</div>'
+    header_html = f'<div data-popup-header style="margin-bottom:4px; font-weight:600;">{_esc(title_text)}</div>'
 
     container_html = '<div data-detail-container style="margin-top:6px; font-size:14px; line-height:1.3; min-height:120px;">Loading…</div>'
 
@@ -501,6 +553,7 @@ def _group_popup_html(
         f'data-total-entries="{len(entries)}" '
         'style="font-size:14px; line-height:1.25; min-width:260px;">'
         f'{header_html}'
+        f'{summary_html}'
         f'{metrics_html}'
         f'{select_block}'
         f'{container_html}'
@@ -534,6 +587,8 @@ def _add_point_markers(
     popup_width: int = 360,
     lightweight: bool = False,
     popup_dataset: Optional[Dict[str, Any]] = None,
+    *,
+    ghost_markers: bool = False,
 ) -> None:
     """Add grouped point markers with selection popups to the map."""
     for idx, group in enumerate(groups):
@@ -561,21 +616,35 @@ def _add_point_markers(
             radius_value = max(1.0, float(radius))
         except (TypeError, ValueError):
             radius_value = 4.0
+        if ghost_markers:
+            radius_value = max(radius_value, 8.0)
+        marker_kwargs = {
+            'location': [lat, lon],
+            'radius': radius_value,
+            'weight': 0 if ghost_markers else 1,
+            'opacity': 0.0 if ghost_markers else 1.0,
+            'fill': True,
+            'fill_opacity': 0.0 if ghost_markers else 0.85,
+            'color': '#2b6cb0',
+            'fill_color': '#2b6cb0',
+            'interactive': True,
+        }
+        if popup_obj is not None:
+            marker_kwargs['popup'] = popup_obj
         marker = folium.CircleMarker(
-            location=[lat, lon],
-            radius=radius_value,
-            weight=0,
-            fill=True,
-            fill_opacity=0.85,
-            color="#2b6cb0",
-            fill_color="#2b6cb0",
-            popup=popup_obj,
+            **marker_kwargs,
         )
         try:
             metric_val = float(group.get('value', 0.0))
         except (TypeError, ValueError):
             metric_val = 0.0
-        marker.options.update({'groupId': group_id, 'metricValue': metric_val})
+        marker.options.update({
+            'groupId': group_id,
+            'metricValue': metric_val,
+            'baseOpacity': marker.options.get('opacity', 0.0 if ghost_markers else 1.0),
+            'baseFillOpacity': marker.options.get('fillOpacity', 0.0 if ghost_markers else 0.85),
+            'ghostMarker': bool(ghost_markers),
+        })
         marker.add_to(map_obj)
 
 
@@ -630,6 +699,44 @@ def _heat_slices(
             slices[j].append(point_entry)
 
     return slices
+
+
+def _assign_time_bins(
+    dt: Optional[datetime],
+    time_index: List[datetime],
+    linger_unit: str,
+    linger_step: int
+) -> List[int]:
+    if dt is None or not time_index:
+        return []
+
+    insert_i = 0
+    for i, t in enumerate(time_index):
+        if dt <= t:
+            insert_i = i
+            break
+    else:
+        insert_i = len(time_index) - 1
+
+    indices: List[int] = []
+    linger_duration = max(0, int(linger_step or 0))
+    linger_end = dt
+    if linger_duration > 0:
+        linger_end = _add_step(dt, linger_unit, linger_duration)
+
+    for j, t in enumerate(time_index):
+        if j < insert_i:
+            continue
+        if linger_duration > 0:
+            if t >= linger_end:
+                break
+            indices.append(j)
+        else:
+            if j == insert_i:
+                indices.append(j)
+                break
+
+    return indices
 
 
 def _graduated_radius_resolver(groups: List[Dict[str, Any]], min_radius: float, max_radius: float):
@@ -691,6 +798,21 @@ def _write_attribute_table(
 
     link_set = {str(col) for col in (hyperlink_columns or [])}
 
+    for entry in points:
+        if isinstance(entry, dict):
+            entry['_attr_in_table'] = False
+
+    def _attr_string(pairs: List[Tuple[str, Any]]) -> str:
+        parts = []
+        for name, value in pairs:
+            if value is None:
+                continue
+            parts.append(f'{name}="{html.escape(str(value), quote=True)}"')
+        return (' ' + ' '.join(parts)) if parts else ''
+
+    def _td(content: str, attrs: Optional[List[Tuple[str, Any]]] = None) -> str:
+        return f'<td{_attr_string(attrs or [])}>{content}</td>'
+
     rows: List[str] = []
     truncated = False
     for idx, entry in enumerate(points):
@@ -702,21 +824,31 @@ def _write_attribute_table(
             props = {}
         lat_cell = _esc(_format_coord(entry.get("lat")))
         lon_cell = _esc(_format_coord(entry.get("lon")))
-        cells = [f"<td>{lat_cell}</td>", f"<td>{lon_cell}</td>"]
+        row_attrs: List[Tuple[str, Any]] = []
+        row_id = entry.get('_popup_row_id')
+        if row_id:
+            row_attrs.append(('data-entry-key', row_id))
+            row_attrs.append(('id', row_id))
+
+        cells = [_td(lat_cell), _td(lon_cell)]
         for key in columns[2:]:
             value = props.get(key, '')
             cell_html: str
             if key == 'article':
                 value = _truncate_plain_text(value, max_chars=420)
                 cell_html = _esc(value)
+                cells.append(_td(cell_html, [('data-column', 'article')]))
+                continue
             elif key in link_set and value:
                 href = html.escape(str(value), quote=True)
                 text = html.escape(str(value))
                 cell_html = f'<a href="{href}" target="_blank" rel="noopener">{text}</a>'
             else:
                 cell_html = _esc(value)
-            cells.append(f"<td>{cell_html}</td>")
-        rows.append('<tr>' + ''.join(cells) + '</tr>')
+            cells.append(_td(cell_html))
+        rows.append(f'<tr{_attr_string(row_attrs)}>' + ''.join(cells) + '</tr>')
+        if isinstance(entry, dict):
+            entry['_attr_in_table'] = True
 
     if not rows:
         rows.append(
@@ -856,6 +988,8 @@ def create_map(
         raise ValueError("GeoJSON does not contain a valid 'features' list.")
 
     pts = _extract_points(features)
+    for idx, entry in enumerate(pts):
+        entry['_popup_row_id'] = _sanitize_element_id(f'feature-row-{idx}')
     groups = _group_points(pts)
     search_term = _detect_search_term(geojson_path, data)
 
@@ -893,13 +1027,62 @@ def create_map(
     normalize_flag = bool(normalize)
     denominator_key = metric_info['denominator'] if normalize_flag else None
 
+    time_enabled = mode == 'heatmap' and not disable_time
+
+    articles_count = len(pts)
+    city_set: set = set()
+    newspaper_ids: set = set()
+    dates_dt: List[datetime] = []
+    for p in pts:
+        props = p.get('props', {})
+        city = props.get('City')
+        if city not in (None, ""):
+            city_set.add(str(city))
+        sn = props.get('SN') or props.get('lccn')
+        if sn not in (None, ""):
+            newspaper_ids.add(str(sn))
+        else:
+            title = props.get('Title') or props.get('newspaper_name')
+            if title not in (None, ""):
+                newspaper_ids.add(str(title))
+        dt = p.get('date')
+        if isinstance(dt, datetime):
+            dates_dt.append(dt)
+
+    metadata = data.get('metadata') or data.get('properties') or {}
+    start_meta = metadata.get('start_date') or metadata.get('StartDate')
+    end_meta = metadata.get('end_date') or metadata.get('EndDate')
+
+    if dates_dt:
+        min_dt = min(dates_dt)
+        max_dt = max(dates_dt)
+    else:
+        min_dt = max_dt = None
+
+    dated_pts = [p for p in pts if p.get("date") is not None]
+    use_time_slider = bool(dated_pts) and time_enabled
+    time_index: List[datetime] = []
+    time_labels: List[str] = []
+    if use_time_slider and min_dt and max_dt:
+        time_index = _build_time_index(min_dt, max_dt, time_unit, max(1, int(time_step or 1)))
+        time_labels = [dt.strftime('%Y-%m-%dT%H:%M:%SZ') for dt in time_index]
+
+    start_str = start_meta or (min_dt.strftime('%Y-%m-%d') if min_dt else '')
+    end_str = end_meta or (max_dt.strftime('%Y-%m-%d') if max_dt else '')
+    if not start_str and end_str:
+        start_str = end_str
+    if not end_str and start_str:
+        end_str = start_str
+    date_range = (start_str, end_str) if start_str or end_str else ()
+
     popup_width = 320 if lightweight else 360
 
+    embed_articles = not lightweight
     values: List[float] = []
     popup_dataset: Dict[str, Any] = {}
     for group in groups:
         entries = group.get("entries", [])
-        stats = _compute_group_stats(group.get("entries", []), search_term)
+        stats = _compute_group_stats(entries, search_term)
         group["stats"] = stats
         value = _compute_group_value(stats, metric_key, normalize_flag, denominator_key)
         group["value"] = value
@@ -909,44 +1092,95 @@ def create_map(
         group["normalized"] = normalize_flag
         group["denominator_label"] = denom_label if normalize_flag else ''
 
-        entry_payloads: List[Dict[str, Any]] = []
+        location = group.get('location') or (
+            (entries[0]['lat'], entries[0]['lon']) if entries else (0.0, 0.0)
+        )
+        try:
+            loc_lat = float(location[0])
+        except (TypeError, ValueError, IndexError):
+            loc_lat = 0.0
+        try:
+            loc_lon = float(location[1])
+        except (TypeError, ValueError, IndexError):
+            loc_lon = 0.0
+
+        entry_payloads = [
+            _entry_payload(entry, search_term, embed_article=embed_articles)
+            for entry in entries
+        ]
+
         for entry in entries:
-            props = entry.get('props') or {}
-            article_text = props.get('article') or ''
-            first_line = _first_line_excerpt(article_text, 160)
-            snippet_html = _keyword_snippet(article_text, search_term)
-            url_val = (props.get('url') or '').strip()
-            pdf_url = url_val.replace('.jp2', '.pdf') if url_val else ''
-            date_val = _format_date_str(props.get('date') or '')
-            newspaper_val = (props.get('Title') or props.get('newspaper_name') or '').strip()
-            city_val = (props.get('City') or '').strip()
-            state_val = (props.get('State') or '').strip()
-            place_val = ', '.join([p for p in (city_val, state_val) if p])
-
-            payload = {
-                'first_line': _esc(first_line),
-                'context': snippet_html or '',
-                'pdf_url': _esc(pdf_url) if pdf_url else '',
-                'date': _esc(date_val),
-                'newspaper': _esc(newspaper_val),
-                'place': _esc(place_val),
-                'page': _esc((props.get('page') or '').strip()),
-            }
-            label_value = _feature_label(props)
-            if label_value:
-                payload['label'] = label_value
-
-            entry_payloads.append(payload)
-
             entry["value"] = value
 
+        first_props = entries[0].get('props', {}) if entries else {}
+        city_raw = str(first_props.get('City') or '').strip()
+        state_raw = str(first_props.get('State') or '').strip()
+        place_label = ', '.join([p for p in (city_raw, state_raw) if p])
+
         title_text, article_count, _ = _group_header(entries, stats, search_term)
-        popup_dataset[group['id']] = {
+        dataset_entry: Dict[str, Any] = {
             'entries': entry_payloads,
+            'full_entries': entry_payloads,
             'value': value,
+            'full_value': value,
             'article_count': article_count,
+            'full_article_count': article_count,
             'title': title_text,
+            'full_title': title_text,
+            'metric_display': metric_display,
+            'metric_normalized_display': metric_normalized_display,
+            'normalized': normalize_flag,
+            'denominator_label': denom_label if normalize_flag else '',
+            'lat': loc_lat,
+            'lon': loc_lon,
+            'coords': [{'lat': loc_lat, 'lon': loc_lon}],
+            'location_index': 1,
+            'location_total': 1,
+            'location_label': '',
+            'search_term': search_term or '',
+            'city': city_raw,
+            'state': state_raw,
+            'place_label': place_label,
         }
+
+        if time_enabled and use_time_slider and time_index:
+            time_bins: Dict[str, Dict[str, Any]] = {}
+            for idx_entry, entry in enumerate(entries):
+                dt = entry.get('date')
+                bin_indices = _assign_time_bins(dt, time_index, linger_unit, int(linger_step or 0))
+                for bin_idx in bin_indices:
+                    if bin_idx < len(time_labels):
+                        label = time_labels[bin_idx]
+                    else:
+                        label = time_index[bin_idx].strftime('%Y-%m-%dT%H:%M:%SZ')
+                    key = str(bin_idx + 1)
+                    bucket = time_bins.setdefault(key, {'indexes': [], 'label': label})
+                    bucket['indexes'].append(idx_entry)
+
+            if time_bins:
+                time_payload: Dict[str, Any] = {}
+                for bin_key, info in time_bins.items():
+                    indexes = info.get('indexes') or []
+                    if not indexes:
+                        continue
+                    bin_entries = [entries[i] for i in indexes if 0 <= i < len(entries)]
+                    if not bin_entries:
+                        continue
+                    bin_stats = _compute_group_stats(bin_entries, search_term)
+                    bin_value = _compute_group_value(bin_stats, metric_key, normalize_flag, denominator_key)
+                    bin_title, bin_count, _ = _group_header(bin_entries, bin_stats, search_term)
+                    label_value = info.get('label') or ''
+                    time_payload[bin_key] = {
+                        'indexes': indexes,
+                        'value': bin_value,
+                        'article_count': bin_count,
+                        'title': bin_title,
+                        'time_label': label_value,
+                    }
+                if time_payload:
+                    dataset_entry['time_bins'] = time_payload
+
+        popup_dataset[group['id']] = dataset_entry
         values.append(value)
 
     if groups and not any(v > 0 for v in values):
@@ -988,6 +1222,14 @@ def create_map(
     else:
         min_dt = max_dt = None
 
+    dated_pts = [p for p in pts if p.get("date") is not None]
+    use_time_slider = bool(dated_pts) and time_enabled
+    time_index: List[datetime] = []
+    time_labels: List[str] = []
+    if use_time_slider and min_dt and max_dt:
+        time_index = _build_time_index(min_dt, max_dt, time_unit, max(1, int(time_step or 1)))
+        time_labels = [dt.strftime('%Y-%m-%dT%H:%M:%SZ') for dt in time_index]
+
     start_str = start_meta or (min_dt.strftime('%Y-%m-%d') if min_dt else '')
     end_str = end_meta or (max_dt.strftime('%Y-%m-%d') if max_dt else '')
     if not start_str and end_str:
@@ -996,7 +1238,6 @@ def create_map(
         end_str = start_str
     date_range = (start_str, end_str) if start_str or end_str else ()
 
-    time_enabled = mode == 'heatmap' and not disable_time
     metric_display_summary = metric_normalized_display if normalize_flag else metric_display
 
     allowed_table_modes = {'full', 'article', 'minimal'}
@@ -1106,13 +1347,8 @@ def create_map(
         return 5 if count > 1 else 3
 
     if mode == "heatmap":
-        dated_pts = [p for p in pts if p.get("date") is not None]
-        use_time_slider = bool(dated_pts) and not disable_time
-
         if use_time_slider and dated_pts:
-            min_dt = min(p["date"] for p in dated_pts)
-            max_dt = max(p["date"] for p in dated_pts)
-            idx = _build_time_index(min_dt, max_dt, time_unit, max(1, int(time_step or 1)))
+            idx = time_index
             slices = _heat_slices(dated_pts, idx, linger_unit, int(linger_step or 0))
             heat_data: List[List[List[float]]] = []
             for frame in slices:
@@ -1128,7 +1364,7 @@ def create_map(
                     else:
                         frame_pts.append([lat, lon])
                 heat_data.append(frame_pts)
-            index_labels = [t.strftime("%Y-%m-%dT00:00:00Z") for t in idx]
+            index_labels = time_labels if time_labels else [t.strftime("%Y-%m-%dT00:00:00Z") for t in idx]
             HeatMapWithTime(
                 heat_data,
                 index=index_labels,
@@ -1158,6 +1394,7 @@ def create_map(
             popup_width=popup_width,
             lightweight=lightweight,
             popup_dataset=popup_dataset,
+            ghost_markers=True,
         )
 
     elif mode == "graduated":
@@ -1209,6 +1446,7 @@ def create_map(
             popup_width=popup_width,
             lightweight=lightweight,
             popup_dataset=popup_dataset,
+            ghost_markers=False,
         )
     else:
         _add_point_markers(
@@ -1225,6 +1463,48 @@ def create_map(
     attr_file = _write_attribute_table(pts, attr_path, **table_kwargs)
     if attr_file:
         summary['attribute_table'] = attr_file
+
+    valid_row_ids = {
+        entry.get('_popup_row_id')
+        for entry in pts
+        if isinstance(entry, dict) and entry.get('_attr_in_table')
+    }
+    if not attr_file:
+        valid_row_ids = set()
+
+    if popup_dataset:
+        def _prune_attr_ids(payloads: Optional[List[Dict[str, Any]]]) -> None:
+            if not payloads:
+                return
+            for payload in payloads:
+                if not isinstance(payload, dict):
+                    continue
+                row_id = payload.get('attr_row_id')
+                if row_id and row_id not in valid_row_ids:
+                    payload['attr_row_id'] = ''
+
+        for dataset_entry in popup_dataset.values():
+            if not isinstance(dataset_entry, dict):
+                continue
+            _prune_attr_ids(dataset_entry.get('entries'))
+            _prune_attr_ids(dataset_entry.get('full_entries'))
+
+    lazy_popup_mode = bool(attr_file and mode == 'heatmap' and lightweight)
+    if lazy_popup_mode and popup_dataset:
+        def _strip_inline_articles(payloads: Optional[List[Dict[str, Any]]]) -> None:
+            if not payloads:
+                return
+            for payload in payloads:
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get('attr_row_id'):
+                    payload['article_html'] = ''
+
+        for dataset_entry in popup_dataset.values():
+            if not isinstance(dataset_entry, dict):
+                continue
+            _strip_inline_articles(dataset_entry.get('entries'))
+            _strip_inline_articles(dataset_entry.get('full_entries'))
 
     header_lines = [f'<div><strong>File:</strong> {_esc(summary["geojson_name"])}</div>']
     if summary.get('term'):
@@ -1266,6 +1546,22 @@ def create_map(
         + '</div></div>'
     )
     m.get_root().html.add_child(folium.Element(header_html))
+
+    config_payload = {
+        'attribute_table': os.path.basename(attr_file) if attr_file else '',
+        'search_term': search_term or '',
+        'inline_articles': bool(embed_articles),
+        'time_labels': time_labels if use_time_slider and time_labels else [],
+        'map_mode': mode,
+        'click_radius_px': heat_radius_val,
+    }
+    config_json = json.dumps(config_payload, ensure_ascii=False).replace('</', '<\\/')
+    config_script = (
+        '<script id="map-config" type="application/json">'
+        f"{config_json}"
+        '</script>'
+    )
+    m.get_root().html.add_child(folium.Element(config_script))
 
     popup_json_js = json.dumps(popup_dataset, ensure_ascii=False).replace('</', '<\\/')
     data_script = (
@@ -1447,9 +1743,233 @@ def create_map(
     }});
   }});
 """
-    script_template = StrTemplate("""
+    script_template = StrTemplate(r"""
 (function() {
   var popupCache = null;
+  var config = {};
+  var attrTableUrl = '';
+  var searchTerm = '';
+  var timeLabels = [];
+  var mapMode = '';
+  var clickRadiusPx = 24;
+  var activeMap = null;
+  var highlightLayer = null;
+  var currentHighlightId = null;
+
+  (function parseConfig() {
+    var tag = document.getElementById('map-config');
+    if (!tag) {
+      return;
+    }
+    try {
+      config = JSON.parse(tag.textContent || tag.innerText || '{}') || {};
+    } catch (err) {
+      console.error('Failed to parse map config', err);
+      config = {};
+    }
+    if (config.attribute_table) {
+      attrTableUrl = String(config.attribute_table).trim();
+    }
+    if (attrTableUrl) {
+      try {
+        var resolvedAttrUrl = new URL(attrTableUrl, window.location && window.location.href ? window.location.href : undefined);
+        var pageProtocol = (window.location && window.location.protocol) || '';
+        if (pageProtocol === 'file:' && resolvedAttrUrl && resolvedAttrUrl.protocol === 'file:') {
+          console.warn('Attribute table loading disabled when viewing the map over file://. Use a local web server to enable full text.');
+          attrTableUrl = '';
+        }
+      } catch (cfgUrlErr) {
+        if (window.location && window.location.protocol === 'file:') {
+          console.warn('Attribute table loading disabled when viewing the map over file://. Use a local web server to enable full text.');
+          attrTableUrl = '';
+        }
+      }
+    }
+    if (config.search_term) {
+      searchTerm = String(config.search_term).trim();
+    }
+    if (Array.isArray(config.time_labels)) {
+      timeLabels = config.time_labels.filter(function(item) {
+        return item !== null && typeof item !== 'undefined';
+      });
+    }
+    if (config.map_mode) {
+      mapMode = String(config.map_mode).trim().toLowerCase();
+    }
+    if (typeof config.click_radius_px === 'number' && Number.isFinite(config.click_radius_px)) {
+      clickRadiusPx = Math.max(4, Number(config.click_radius_px));
+    }
+  })();
+
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function highlightAndEscape(raw) {
+    if (!raw) {
+      return '';
+    }
+    if (!searchTerm) {
+      return escapeHtml(raw);
+    }
+    var text = String(raw);
+    var lowerText = text.toLowerCase();
+    var termLower = searchTerm.toLowerCase();
+    if (!termLower) {
+      return escapeHtml(text);
+    }
+    var termLength = termLower.length;
+    var idx = 0;
+    var next = lowerText.indexOf(termLower, idx);
+    var pieces = '';
+    while (next !== -1) {
+      pieces += escapeHtml(text.slice(idx, next));
+      pieces += '<mark>' + escapeHtml(text.slice(next, next + termLength)) + '</mark>';
+      idx = next + termLength;
+      if (termLength === 0) {
+        idx += 1;
+      }
+      next = lowerText.indexOf(termLower, idx);
+    }
+    pieces += escapeHtml(text.slice(idx));
+    return pieces;
+  }
+
+  function cssEscapeValue(value) {
+    var str = String(value);
+    if (typeof CSS !== 'undefined' && CSS && typeof CSS.escape === 'function') {
+      return CSS.escape(str);
+    }
+    return str.replace(/[^a-zA-Z0-9_-]/g, function(ch) {
+      var hex = ch.charCodeAt(0).toString(16).toUpperCase();
+      return '\\\\' + hex + ' ';
+    });
+  }
+
+  var articleLoader = (function() {
+    var cache = {};
+    var doc = null;
+    var pending = null;
+
+    function loadHtml() {
+      if (!attrTableUrl) {
+        return Promise.reject(new Error('No attribute table.'));
+      }
+
+      function xhrPromise() {
+        return new Promise(function(resolve, reject) {
+          try {
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', attrTableUrl, true);
+            xhr.onreadystatechange = function() {
+              if (xhr.readyState === 4) {
+                if (xhr.status === 0 || (xhr.status >= 200 && xhr.status < 300)) {
+                  resolve(xhr.responseText);
+                } else {
+                  reject(new Error('status ' + xhr.status));
+                }
+              }
+            };
+            xhr.onerror = function() {
+              reject(new Error('network error'));
+            };
+            xhr.send();
+          } catch (xhrErr) {
+            reject(xhrErr);
+          }
+        });
+      }
+
+      if (typeof fetch === 'function') {
+        return fetch(attrTableUrl)
+          .then(function(resp) {
+            if (!resp.ok && resp.status !== 0) {
+              throw new Error('status ' + resp.status);
+            }
+            return resp.text();
+          })
+          .catch(function() {
+            return xhrPromise();
+          });
+      }
+
+      return xhrPromise();
+    }
+
+    function requestDocument(callback) {
+      if (!attrTableUrl) {
+        callback(null);
+        return;
+      }
+      if (doc) {
+        callback(doc);
+        return;
+      }
+      if (pending) {
+        pending.push(callback);
+        return;
+      }
+      pending = [callback];
+      loadHtml()
+        .then(function(html) {
+          if (!html) {
+            throw new Error('Empty attribute table response');
+          }
+          var parser = new DOMParser();
+          doc = parser.parseFromString(html, 'text/html');
+          var callbacks = pending || [];
+          pending = null;
+          callbacks.forEach(function(cb) {
+            cb(doc);
+          });
+        })
+        .catch(function(err) {
+          console.error('Failed to load attribute table', err);
+          var callbacks = pending || [];
+          pending = null;
+          callbacks.forEach(function(cb) {
+            cb(null);
+          });
+        });
+    }
+
+    function get(rowId, callback) {
+      if (!rowId) {
+        callback(null);
+        return;
+      }
+      if (Object.prototype.hasOwnProperty.call(cache, rowId)) {
+        callback(cache[rowId]);
+        return;
+      }
+      requestDocument(function(docNode) {
+        if (!docNode) {
+          callback(null);
+          return;
+        }
+        var selector = '[data-entry-key="' + cssEscapeValue(rowId) + '"] td[data-column="article"]';
+        var cell = docNode.querySelector(selector);
+        if (!cell) {
+          cache[rowId] = null;
+          callback(null);
+          return;
+        }
+        var text = cell.textContent || '';
+        cache[rowId] = text;
+        callback(text);
+      });
+    }
+
+    return {
+      get: get,
+    };
+  })();
+
   function loadData(callback) {
     if (popupCache) { callback(popupCache); return; }
     var tag = document.getElementById('popup-data');
@@ -1461,6 +1981,604 @@ def create_map(
       popupCache = {};
     }
     callback(popupCache);
+  }
+  function formatTimeKey(timeValue) {
+    if (timeValue === null || typeof timeValue === 'undefined') {
+      return null;
+    }
+    if (typeof timeValue === 'string') {
+      var trimmed = timeValue.replace(/\s+$$/, '');
+      if (/T/.test(trimmed)) {
+        return trimmed.replace('.000Z', 'Z');
+      }
+      var numeric = Number(trimmed);
+      if (Number.isFinite(numeric)) {
+        return formatTimeKey(numeric);
+      }
+    }
+    try {
+      var date = new Date(timeValue);
+      if (Number.isNaN(date.getTime())) {
+        return null;
+      }
+      var iso = date.toISOString();
+      return iso.replace('.000Z', 'Z');
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function resolveTimeKeys(timeValue) {
+    var keys = [];
+    if (timeValue === null || typeof timeValue === 'undefined') {
+      return keys;
+    }
+    var primary = String(timeValue);
+    keys.push(primary);
+    var formatted = formatTimeKey(timeValue);
+    if (formatted && keys.indexOf(formatted) === -1) {
+      keys.push(formatted);
+    }
+    if (typeof timeValue === 'number' && Array.isArray(timeLabels) && timeLabels.length) {
+      var idx = Math.round(timeValue);
+      if (Number.isFinite(idx) && idx >= 1 && idx <= timeLabels.length) {
+        var label = timeLabels[idx - 1];
+        if (label && keys.indexOf(label) === -1) {
+          keys.push(label);
+        }
+      }
+    }
+    if (typeof timeValue === 'string' && Array.isArray(timeLabels) && timeLabels.length) {
+      var parsed = Number(timeValue);
+      if (Number.isFinite(parsed) && parsed >= 1 && parsed <= timeLabels.length) {
+        var altLabel = timeLabels[parsed - 1];
+        if (altLabel && keys.indexOf(altLabel) === -1) {
+          keys.push(altLabel);
+        }
+      }
+    }
+    return keys;
+  }
+
+  function clearHighlight() {
+    if (highlightLayer && typeof highlightLayer.remove === 'function') {
+      highlightLayer.remove();
+    }
+    highlightLayer = null;
+    currentHighlightId = null;
+  }
+
+  function drawHighlight(points) {
+    if (!activeMap || !Array.isArray(points) || !points.length) {
+      clearHighlight();
+      return;
+    }
+    if (highlightLayer && typeof highlightLayer.remove === 'function') {
+      highlightLayer.remove();
+    }
+    var layer = L.layerGroup();
+    points.forEach(function(pt) {
+      if (!pt) {
+        return;
+      }
+      var lat = Number(pt.lat);
+      var lon = Number(pt.lon);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+        return;
+      }
+      var marker = L.circleMarker([lat, lon], {
+        radius: 8,
+        color: '#ff7e18',
+        weight: 2,
+        fillColor: '#ffd8a8',
+        fillOpacity: 0.6,
+        opacity: 1,
+        interactive: false,
+      });
+      layer.addLayer(marker);
+    });
+    if (!layer.getLayers().length) {
+      clearHighlight();
+      return;
+    }
+    highlightLayer = layer.addTo(activeMap);
+  }
+
+  function setHighlightForGroup(gid, groupData) {
+    if (!activeMap) {
+      return;
+    }
+    var coords = [];
+    if (groupData && Array.isArray(groupData.coords) && groupData.coords.length) {
+      groupData.coords.forEach(function(pt) {
+        if (pt && Number.isFinite(pt.lat) && Number.isFinite(pt.lon)) {
+          coords.push({ lat: pt.lat, lon: pt.lon });
+        }
+      });
+    } else if (groupData && Number.isFinite(groupData.lat) && Number.isFinite(groupData.lon)) {
+      coords.push({ lat: groupData.lat, lon: groupData.lon });
+    }
+    if (!coords.length) {
+      if (currentHighlightId === gid) {
+        clearHighlight();
+      }
+      return;
+    }
+    drawHighlight(coords);
+    currentHighlightId = gid;
+  }
+
+  function collectNearbyGroupIds(latlng, mapObj, dataset) {
+    if (!latlng || !mapObj || !dataset) {
+      return [];
+    }
+    if (!mapObj.latLngToLayerPoint || typeof mapObj.latLngToLayerPoint !== 'function') {
+      return [];
+    }
+    var centerPoint = mapObj.latLngToLayerPoint(latlng);
+    if (!centerPoint) {
+      return [];
+    }
+    var radius = Math.max(4, clickRadiusPx || 0);
+    var result = [];
+    Object.keys(dataset).forEach(function(gid) {
+      if (!gid) {
+        return;
+      }
+      var data = dataset[gid];
+      if (!data || !data.entries || !data.entries.length) {
+        return;
+      }
+      if (!Number.isFinite(data.lat) || !Number.isFinite(data.lon)) {
+        return;
+      }
+      var groupPoint = mapObj.latLngToLayerPoint(L.latLng(data.lat, data.lon));
+      if (!groupPoint) {
+        return;
+      }
+      var dx = centerPoint.x - groupPoint.x;
+      var dy = centerPoint.y - groupPoint.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist <= radius) {
+        result.push(gid);
+      }
+    });
+    return result;
+  }
+
+  function openGroupsPopup(latlng, mapObj) {
+    if (!mapObj) {
+      return;
+    }
+    clearHighlight();
+    loadData(function(dataset) {
+      var ids = collectNearbyGroupIds(latlng, mapObj, dataset);
+      if (!ids.length) {
+        return;
+      }
+      var groups = [];
+      ids.forEach(function(gid) {
+        var data = dataset[gid];
+        if (!data || !data.entries || !data.entries.length) {
+          return;
+        }
+        groups.push({ id: gid, data: data });
+      });
+      if (!groups.length) {
+        return;
+      }
+
+      if (groups.length > 1) {
+        var mergedId = '__multi__';
+        var mergedEntries = [];
+        var coordsList = [];
+        var totalValue = 0;
+        var sourceIds = groups.map(function(info) { return info.id; });
+        groups.forEach(function(info) {
+          var data = info.data;
+          if (!data) {
+            return;
+          }
+          if (Array.isArray(data.entries)) {
+            data.entries.forEach(function(entry) {
+              if (entry) {
+                mergedEntries.push(Object.assign({}, entry));
+              }
+            });
+          }
+          var valueVal = Number(data.value);
+          if (Number.isFinite(valueVal)) {
+            totalValue += valueVal;
+          }
+          if (Array.isArray(data.coords)) {
+            data.coords.forEach(function(pt) {
+              if (pt && Number.isFinite(pt.lat) && Number.isFinite(pt.lon)) {
+                coordsList.push({ lat: pt.lat, lon: pt.lon });
+              }
+            });
+          } else if (Number.isFinite(data.lat) && Number.isFinite(data.lon)) {
+            coordsList.push({ lat: data.lat, lon: data.lon });
+          }
+        });
+
+        if (mergedEntries.length) {
+          var baseTemplate = groups[0].data && groups[0].data.template ? groups[0].data.template : '';
+          if (baseTemplate) {
+            baseTemplate = baseTemplate.replace(/data-group-id="[^"]+"/, 'data-group-id="' + mergedId + '"');
+          }
+          var mergedTitle = searchTerm ? 'Articles mentioning "' + searchTerm + '" in selected area' : 'Articles in selected area';
+          var mergedData = {
+            entries: mergedEntries,
+            full_entries: mergedEntries.slice(),
+            value: totalValue,
+            full_value: totalValue,
+            article_count: mergedEntries.length,
+            full_article_count: mergedEntries.length,
+            title: mergedTitle,
+            full_title: mergedTitle,
+            metric_display: groups[0].data.metric_display,
+            metric_normalized_display: groups[0].data.metric_normalized_display,
+            normalized: groups[0].data.normalized,
+            denominator_label: groups[0].data.denominator_label,
+            lat: Number.NaN,
+            lon: Number.NaN,
+            coords: coordsList,
+            template: baseTemplate,
+            member_ids: sourceIds,
+            location_index: 0,
+            location_total: sourceIds.length || coordsList.length || 1,
+            location_label: '',
+            search_term: searchTerm || '',
+            city: '',
+            state: '',
+            place_label: '',
+          };
+          dataset[mergedId] = mergedData;
+          groups.unshift({ id: mergedId, data: mergedData });
+        }
+      }
+      var actualInfos = [];
+      for (var gi = 0; gi < groups.length; gi++) {
+        var infoNode = groups[gi];
+        if (!infoNode || !infoNode.data) {
+          continue;
+        }
+        if (infoNode.id !== '__multi__') {
+          actualInfos.push(infoNode);
+        }
+      }
+      var totalLocations = actualInfos.length;
+      if (!totalLocations) {
+        totalLocations = groups.length;
+      }
+      for (var ai = 0; ai < actualInfos.length; ai++) {
+        var infoItem = actualInfos[ai];
+        if (!infoItem || !infoItem.data) {
+          continue;
+        }
+        infoItem.data.location_index = ai + 1;
+        infoItem.data.location_total = totalLocations || 1;
+        infoItem.data.location_label = '';
+      }
+      for (var gi2 = 0; gi2 < groups.length; gi2++) {
+        var infoNode2 = groups[gi2];
+        if (!infoNode2 || !infoNode2.data) {
+          continue;
+        }
+        if (infoNode2.id === '__multi__') {
+          var dataNode = infoNode2.data;
+          dataNode.location_index = 0;
+          dataNode.location_total = totalLocations || dataNode.location_total || 1;
+          if (dataNode.location_total > 1) {
+            dataNode.location_label = 'All locations (' + dataNode.location_total + ')';
+          } else {
+            dataNode.location_label = 'All locations';
+          }
+        }
+      }
+      var popup = L.popup({ maxWidth: 360 }).setLatLng(latlng);
+      if (groups.length === 1) {
+        var singleInfo = groups[0];
+        var single = singleInfo ? singleInfo.data : null;
+        if (single && single.template) {
+          var wrapper = document.createElement('div');
+          wrapper.innerHTML = single.template;
+          var root = wrapper.firstElementChild;
+          if (root) {
+            attach(root);
+            popup.setContent(root);
+            popup.openOn(mapObj);
+          }
+        }
+        return;
+      }
+
+      var container = document.createElement('div');
+      container.style.minWidth = '300px';
+      container.style.fontSize = '14px';
+      container.style.lineHeight = '1.3';
+      var label = document.createElement('div');
+      label.style.fontWeight = '600';
+      label.textContent = 'Select a location';
+      container.appendChild(label);
+      var select = document.createElement('select');
+      select.style.width = '100%';
+      select.style.marginTop = '4px';
+      groups.forEach(function(info, idx) {
+        var data = info.data;
+        var option = document.createElement('option');
+        option.value = info.id;
+        if (idx === 0) {
+          option.selected = true;
+        }
+        if (info.id === '__multi__') {
+          if (data && data.article_count) {
+            var allCount = Number(data.article_count);
+            var countText = Number.isFinite(allCount) ? allCount + (allCount === 1 ? ' Article' : ' Articles') : 'All Articles';
+            var locTotal = Number(data.location_total);
+            var locText;
+            if (Number.isFinite(locTotal)) {
+              locText = locTotal === 1 ? '1 location' : locTotal + ' locations';
+            } else {
+              locText = 'multiple locations';
+            }
+            option.textContent = countText + ' across ' + locText;
+          } else {
+            option.textContent = 'All locations';
+          }
+          select.appendChild(option);
+          return;
+        }
+        if (!data) {
+          option.textContent = info.id;
+          select.appendChild(option);
+          return;
+        }
+        var countVal = Number(data.article_count);
+        var countLabel;
+        if (Number.isFinite(countVal)) {
+          countLabel = countVal + ' ' + (countVal === 1 ? 'Article' : 'Articles');
+        } else {
+          countLabel = 'Articles';
+        }
+        var termText = (data.search_term || '').toString().trim();
+        var locationParts = [];
+        if (data.city) {
+          locationParts.push(data.city);
+        }
+        if (data.state) {
+          locationParts.push(data.state);
+        }
+        var locationText = locationParts.filter(function(item) { return item; }).join(', ');
+        if (!locationText && data.place_label) {
+          locationText = data.place_label;
+        }
+        if (!locationText && data.title) {
+          locationText = data.title;
+        }
+        var pieces = [countLabel];
+        if (termText) {
+          pieces.push('w/ ' + termText);
+        }
+        if (locationText) {
+          pieces.push('in ' + locationText);
+        }
+        option.textContent = pieces.join(' ');
+        select.appendChild(option);
+      });
+      container.appendChild(select);
+      var detail = document.createElement('div');
+      detail.style.marginTop = '8px';
+      container.appendChild(detail);
+
+      function render(gid) {
+        detail.innerHTML = '';
+        var data = dataset[gid];
+        if (!data || !data.template) {
+          detail.textContent = 'No data.';
+          return;
+        }
+        var wrapper = document.createElement('div');
+        wrapper.innerHTML = data.template;
+        var root = wrapper.firstElementChild;
+        if (root) {
+          detail.appendChild(root);
+          attach(root);
+        } else {
+          detail.textContent = 'No data.';
+        }
+      }
+
+      select.addEventListener('change', function() {
+        render(select.value);
+      });
+
+      popup.setContent(container);
+      popup.openOn(mapObj);
+      render(select.value);
+    });
+  }
+
+  function applyTimeFilter(mapObj) {
+    if (!mapObj || !mapObj.timeDimension || typeof mapObj.timeDimension.getCurrentTime !== 'function') {
+      return;
+    }
+    var rawTime = mapObj.timeDimension.getCurrentTime();
+    var currentKeys = resolveTimeKeys(rawTime);
+    if (!currentKeys.length) {
+      return;
+    }
+    loadData(function(dataset) {
+      var keys = Object.keys(dataset || {});
+      if (!keys.length) {
+        return;
+      }
+      keys.forEach(function(key) {
+        var data = dataset[key] || {};
+        if (!data.full_entries) {
+          data.full_entries = data.entries ? data.entries.slice() : [];
+        }
+        if (typeof data.full_value === 'undefined') {
+          data.full_value = data.value;
+        }
+        if (typeof data.full_article_count === 'undefined') {
+          data.full_article_count = data.article_count;
+        }
+        if (typeof data.full_title === 'undefined') {
+          data.full_title = data.title || '';
+        }
+        if (!data.time_bins) {
+          data.entries = data.full_entries.slice();
+          data.value = data.full_value;
+          data.article_count = data.full_article_count;
+          data.title = data.full_title;
+          data.time_label = '';
+          data._hasTimeFilter = false;
+          return;
+        }
+        data._hasTimeFilter = true;
+        var bin = null;
+        for (var ck = 0; ck < currentKeys.length; ck++) {
+          var attempt = currentKeys[ck];
+          if (!attempt) {
+            continue;
+          }
+          if (data.time_bins && Object.prototype.hasOwnProperty.call(data.time_bins, attempt)) {
+            bin = data.time_bins[attempt];
+            if (bin) {
+              break;
+            }
+          }
+          if (Array.isArray(timeLabels) && timeLabels.length) {
+            var idxCandidate = Number(attempt);
+            if (Number.isFinite(idxCandidate) && idxCandidate >= 1 && idxCandidate <= timeLabels.length) {
+              var altKey = timeLabels[idxCandidate - 1];
+              if (altKey && data.time_bins && Object.prototype.hasOwnProperty.call(data.time_bins, altKey)) {
+                bin = data.time_bins[altKey];
+                if (bin) {
+                  break;
+                }
+              }
+            }
+          }
+        }
+        if (bin && Array.isArray(bin.indexes) && bin.indexes.length) {
+          var mapped = [];
+          bin.indexes.forEach(function(idx) {
+            if (idx >= 0 && idx < data.full_entries.length) {
+              var payload = data.full_entries[idx];
+              if (payload) mapped.push(payload);
+            }
+          });
+          data.entries = mapped;
+          data.value = (typeof bin.value !== 'undefined') ? bin.value : data.full_value;
+          data.article_count = (typeof bin.article_count !== 'undefined') ? bin.article_count : mapped.length;
+          data.title = bin.title || data.full_title;
+          data.time_label = bin.time_label || '';
+        } else {
+          data.entries = [];
+          data.value = 0;
+          data.article_count = 0;
+          data.title = data.full_title;
+          data.time_label = '';
+        }
+      });
+
+      keys.forEach(function(key) {
+        var data = dataset[key];
+        if (!data || !Array.isArray(data.member_ids)) {
+          return;
+        }
+        var combined = [];
+        var coords = [];
+        var combinedValue = 0;
+        data.member_ids.forEach(function(mid) {
+          var source = dataset[mid];
+          if (!source || !source.entries || !source.entries.length) {
+            return;
+          }
+          source.entries.forEach(function(entry) {
+            if (entry) {
+              combined.push(Object.assign({}, entry));
+            }
+          });
+          var val = Number(source.value);
+          if (Number.isFinite(val)) {
+            combinedValue += val;
+          }
+          if (Array.isArray(source.coords)) {
+            source.coords.forEach(function(pt) {
+              if (pt && Number.isFinite(pt.lat) && Number.isFinite(pt.lon)) {
+                coords.push({ lat: pt.lat, lon: pt.lon });
+              }
+            });
+          } else if (Number.isFinite(source.lat) && Number.isFinite(source.lon)) {
+            coords.push({ lat: source.lat, lon: source.lon });
+          }
+        });
+        data.entries = combined;
+        data.full_entries = combined.slice();
+        data.article_count = combined.length;
+        data.full_article_count = combined.length;
+        data.value = combinedValue;
+        data.full_value = combinedValue;
+        data.coords = coords;
+        var memberCount = Array.isArray(data.member_ids) ? data.member_ids.length : 0;
+        if (!Number.isFinite(Number(data.location_total)) || Number(data.location_total) < 1) {
+          data.location_total = memberCount || coords.length || 1;
+        }
+      });
+
+      if (typeof mapObj.eachLayer === 'function') {
+        mapObj.eachLayer(function(layer) {
+          if (!layer || !layer.options || !layer.options.groupId) {
+            return;
+          }
+          var layerId = layer.options.groupId;
+          var data = dataset[layerId];
+          if (!data || !data._hasTimeFilter) {
+            return;
+          }
+          var visible = data.entries && data.entries.length > 0;
+          var baseOpacity = (typeof layer.options.baseOpacity === 'number') ? layer.options.baseOpacity : (typeof layer.options.opacity === 'number' ? layer.options.opacity : 0.5);
+          var baseFill = (typeof layer.options.baseFillOpacity === 'number') ? layer.options.baseFillOpacity : (typeof layer.options.fillOpacity === 'number' ? layer.options.fillOpacity : 0.85);
+          if (typeof layer.setStyle === 'function') {
+            layer.setStyle({
+              opacity: visible ? baseOpacity : 0,
+              fillOpacity: visible ? baseFill : 0,
+            });
+          }
+          var isGhost = !!layer.options.ghostMarker;
+          layer.options.interactive = isGhost ? false : !!visible;
+          if (layer._path && layer._path.style) {
+            layer._path.style.pointerEvents = (visible && !isGhost) ? 'auto' : 'none';
+          }
+          if (!visible && typeof layer.closePopup === 'function') {
+            layer.closePopup();
+          }
+          if (!visible && currentHighlightId === layerId) {
+            clearHighlight();
+          }
+        });
+      }
+      if (mapObj._popup && typeof mapObj._popup.getElement === 'function') {
+        var popupEl = mapObj._popup.getElement();
+        if (popupEl) {
+          var root = popupEl.querySelector('[data-popup-root="1"]');
+          if (root) {
+            attach(root);
+          }
+        }
+      }
+      if (currentHighlightId && dataset[currentHighlightId]) {
+        var highlightedData = dataset[currentHighlightId];
+        if (highlightedData && highlightedData.entries && highlightedData.entries.length) {
+          setHighlightForGroup(currentHighlightId, highlightedData);
+        } else {
+          clearHighlight();
+        }
+      }
+    });
   }
   function updateProgress(root, groupData, index) {
     var progress = root.querySelector('[data-article-progress]');
@@ -1475,19 +2593,45 @@ def create_map(
     if (current > total) current = total;
     progress.textContent = 'Article ' + current + ' of ' + total;
   }
-  function renderEntry(root, groupData, index) {
+  function updateLocationProgress(root, groupData) {
+    var locationEl = root.querySelector('[data-location-progress]');
+    if (!locationEl) return;
+    if (!groupData) {
+      locationEl.textContent = '';
+      return;
+    }
+    if (groupData.location_label) {
+      locationEl.textContent = groupData.location_label;
+      return;
+    }
+    var idx = Number(groupData.location_index);
+    var total = Number(groupData.location_total);
+    if (!Number.isFinite(idx) || idx < 1) {
+      idx = 1;
+    }
+    if (!Number.isFinite(total) || total < 1) {
+      total = 1;
+    }
+    locationEl.textContent = 'Location ' + idx + ' of ' + total;
+  }
+function renderEntry(root, groupData, index) {
     var body = root.querySelector('[data-detail-container]');
     if (!body || !groupData || !groupData.entries) {
       if (body) { body.innerHTML = '<div style="color:#999;">No data.</div>'; }
       updateProgress(root, groupData, index || 0);
+      updateLocationProgress(root, groupData);
       return;
     }
     var entry = groupData.entries[index];
     if (!entry) {
       body.innerHTML = '<div style="color:#999;">No data.</div>';
       updateProgress(root, groupData, index || 0);
+      updateLocationProgress(root, groupData);
       return;
     }
+    groupData._lastIndex = index;
+    updateLocationProgress(root, groupData);
+    var gidForEntry = root.getAttribute('data-group-id') || ('group-' + Date.now());
     var parts = [];
     if (entry.first_line) {
       parts.push('<div style="margin-bottom:4px;"><span style="font-weight:600;">First line:</span> ' + entry.first_line + '</div>');
@@ -1504,40 +2648,163 @@ def create_map(
       parts.push('<div style="margin-top:4px; font-size:12px; color:#555;">' + metaParts.join(' | ') + '</div>');
     }
     if (entry.pdf_url) {
-      parts.push('<div><a href="' + entry.pdf_url + '" target="_blank" rel="noopener">Source Image</a></div>');
+      parts.push('<div><a href="' + entry.pdf_url + '" target="_blank" rel="noopener">Source Image (PDF)</a></div>');
+    }
+    var fullId = gidForEntry + '-article-' + index;
+    var previewHtml = entry.article_preview || '';
+    var canLoadArticle = !!entry.article_html || (entry.attr_row_id && attrTableUrl) || !!previewHtml;
+    if (canLoadArticle) {
+      parts.push(
+        '<div style="margin-top:6px;">'
+        + '<button type="button" data-load-text="' + fullId + '" style="padding:4px 8px;">Load text</button>'
+        + '</div>'
+      );
+      parts.push(
+        '<div id="' + fullId + '" data-article-full '
+        + 'style="display:none; margin-top:6px; max-height:240px; overflow:auto; border-top:1px solid #ddd; padding-top:6px;"></div>'
+      );
     }
     body.innerHTML = parts.join('');
+
+    if (canLoadArticle) {
+      var loadBtn = body.querySelector('button[data-load-text]');
+      var target = loadBtn ? document.getElementById(fullId) : null;
+      if (loadBtn && target) {
+        loadBtn.addEventListener('click', function() {
+          var isVisible = target.style.display !== 'none';
+          if (isVisible) {
+            target.style.display = 'none';
+            loadBtn.textContent = 'Load text';
+            return;
+          }
+          if (target.dataset.loaded === '1') {
+            target.style.display = 'block';
+            loadBtn.textContent = 'Hide text';
+            return;
+          }
+          if (entry.article_html) {
+            target.innerHTML = entry.article_html;
+            target.dataset.loaded = '1';
+            target.style.display = 'block';
+            loadBtn.textContent = 'Hide text';
+            return;
+          }
+          if (entry.attr_row_id && attrTableUrl) {
+            loadBtn.disabled = true;
+            loadBtn.textContent = 'Loading…';
+            articleLoader.get(entry.attr_row_id, function(rawText) {
+              loadBtn.disabled = false;
+              if (typeof rawText === 'string' && rawText.trim()) {
+                target.innerHTML = highlightAndEscape(rawText);
+                target.dataset.loaded = '1';
+                target.style.display = 'block';
+                loadBtn.textContent = 'Hide text';
+              } else if (previewHtml) {
+                target.innerHTML = previewHtml;
+                target.dataset.loaded = '1';
+                target.style.display = 'block';
+                loadBtn.textContent = 'Hide text';
+              } else if (rawText === '') {
+                target.innerHTML = '<div style="color:#999;">No text available.</div>';
+                target.dataset.loaded = '1';
+                target.style.display = 'block';
+                loadBtn.textContent = 'Hide text';
+              } else {
+                target.innerHTML = '<div style="color:#999;">Unable to load text from attribute table.</div>';
+                target.dataset.loaded = 'error';
+                target.style.display = 'block';
+                loadBtn.textContent = 'Load text';
+              }
+            });
+            return;
+          }
+          if (previewHtml) {
+            target.innerHTML = previewHtml;
+            target.dataset.loaded = '1';
+            target.style.display = 'block';
+            loadBtn.textContent = 'Hide text';
+            return;
+          }
+          target.innerHTML = '<div style="color:#999;">No text available.</div>';
+          target.dataset.loaded = '1';
+          target.style.display = 'block';
+          loadBtn.textContent = 'Hide text';
+        });
+      }
+    }
     updateProgress(root, groupData, index);
   }
-  function attach(root) {
+function attach(root) {
     var gid = root.getAttribute('data-group-id');
     if (!gid) return;
     loadData(function(data) {
       var groupData = data[gid];
       if (!groupData) return;
+      var header = root.querySelector('[data-popup-header]');
+      if (header && typeof groupData.title === 'string') {
+        header.textContent = groupData.title;
+      }
+      var summary = root.querySelector('[data-popup-summary]');
+      if (summary) {
+        if (typeof groupData.article_count === 'number') {
+          summary.textContent = 'Articles: ' + Number(groupData.article_count).toLocaleString();
+          summary.style.display = 'block';
+        } else {
+          summary.textContent = '';
+          summary.style.display = 'none';
+        }
+      }
+      var metricsEl = root.querySelector('[data-popup-metrics]');
+      if (metricsEl) {
+        var metricParts = [];
+        if (groupData.metric_display && typeof groupData.value === 'number') {
+          var metricValue = Number(groupData.value);
+          if (Number.isFinite(metricValue)) {
+            var metricText = groupData.normalized ? metricValue.toFixed(4) : Math.round(metricValue).toLocaleString();
+            metricParts.push(groupData.metric_display + ': ' + metricText);
+          }
+        }
+        if (groupData.normalized && groupData.denominator_label) {
+          metricParts.push('Normalized by ' + groupData.denominator_label);
+        }
+        if (metricParts.length) {
+          metricsEl.innerHTML = metricParts.join(' | ');
+          metricsEl.style.display = 'block';
+        } else {
+          metricsEl.innerHTML = '';
+          metricsEl.style.display = 'none';
+        }
+      }
       var select = root.querySelector('select[data-map-select]');
+      var startIndex = 0;
       if (select) {
-        if (select.dataset.optionsLoaded !== '1') {
-          if (select.dataset.optionsSource === 'json') {
-            select.innerHTML = '';
-            if (groupData.entries && groupData.entries.length) {
-              var frag = document.createDocumentFragment();
-              groupData.entries.forEach(function(entry, idx) {
-                var option = document.createElement('option');
-                option.value = String(idx);
-                option.textContent = entry.label || entry.date || ('Entry ' + (idx + 1));
-                frag.appendChild(option);
-              });
-              select.appendChild(frag);
-            }
+        var desiredIndex = (typeof groupData._lastIndex === 'number') ? groupData._lastIndex : 0;
+        var existing = select.options.length;
+        select.innerHTML = '';
+        if (groupData.entries && groupData.entries.length) {
+          var frag = document.createDocumentFragment();
+          groupData.entries.forEach(function(entry, idx) {
+            var option = document.createElement('option');
+            option.value = String(idx);
+            option.textContent = entry.label || entry.date || ('Entry ' + (idx + 1));
+            frag.appendChild(option);
+          });
+          select.appendChild(frag);
+        }
+        if (select.options.length) {
+          if (desiredIndex < 0 || desiredIndex >= select.options.length) {
+            desiredIndex = 0;
           }
-          if (select.options.length && select.selectedIndex < 0) {
-            select.selectedIndex = 0;
-          }
-          select.dataset.optionsLoaded = '1';
+          select.selectedIndex = desiredIndex;
+          startIndex = desiredIndex;
+        } else {
+          select.selectedIndex = -1;
+          startIndex = 0;
+          renderEntry(root, groupData, 0);
         }
         if (!select.dataset.listenerAttached) {
           select.addEventListener('change', function() {
+            groupData._lastIndex = select.selectedIndex;
             renderEntry(root, groupData, select.selectedIndex);
           });
           select.dataset.listenerAttached = '1';
@@ -1546,32 +2813,27 @@ def create_map(
       var buttons = root.querySelectorAll('button[data-step]');
       var hasOptions = !!(select && select.options && select.options.length);
       buttons.forEach(function(btn) {
-        if (!hasOptions) {
-          btn.disabled = true;
-        } else if (btn.disabled) {
-          btn.disabled = false;
-        }
+        btn.disabled = !hasOptions;
         if (btn.dataset.listenerAttached) return;
         btn.addEventListener('click', function() {
+          if (!select || !select.options.length) return;
           var step = parseInt(btn.getAttribute('data-step') || '0', 10);
-          var sel = root.querySelector('select[data-map-select]');
-          if (!sel || !sel.options.length) return;
-          var total = sel.options.length;
-          var idx = sel.selectedIndex + step;
+          var total = select.options.length;
+          var idx = select.selectedIndex + step;
           idx = (idx % total + total) % total;
-          sel.selectedIndex = idx;
+          select.selectedIndex = idx;
+          groupData._lastIndex = idx;
           renderEntry(root, groupData, idx);
         });
         btn.dataset.listenerAttached = '1';
       });
-      var startIndex = 0;
-      if (select && select.options.length) {
-        if (select.selectedIndex < 0) {
-          select.selectedIndex = 0;
-        }
-        startIndex = select.selectedIndex;
+      if (!hasOptions) {
+        groupData._lastIndex = 0;
+      } else if (typeof groupData._lastIndex !== 'number') {
+        groupData._lastIndex = startIndex;
       }
       renderEntry(root, groupData, startIndex);
+      setHighlightForGroup(gid, groupData);
     });
   }
   var mapVarName = "${map_var}";
@@ -1606,6 +2868,26 @@ def create_map(
   }
   function init() {
     whenMapReady(function(mapObj) {
+      activeMap = mapObj;
+      applyTimeFilter(mapObj);
+      if (mapObj.timeDimension && typeof mapObj.timeDimension.on === 'function') {
+        mapObj.timeDimension.on('timeload', function() { applyTimeFilter(mapObj); });
+        mapObj.timeDimension.on('timechange', function() { applyTimeFilter(mapObj); });
+      }
+      if (mapMode === 'heatmap') {
+        mapObj.on('click', function(e) {
+          if (!e || !e.latlng) {
+            return;
+          }
+          if (e.originalEvent && e.originalEvent.target) {
+            var target = e.originalEvent.target;
+            if (typeof target.closest === 'function' && target.closest('.leaflet-popup')) {
+              return;
+            }
+          }
+          openGroupsPopup(e.latlng, mapObj);
+        });
+      }
       mapObj.on('popupopen', function(e) {
         var root = e.popup.getElement();
         if (!root) return;
@@ -1613,6 +2895,9 @@ def create_map(
         if (container) {
           attach(container);
         }
+      });
+      mapObj.on('popupclose', function() {
+        clearHighlight();
       });
     });
   }

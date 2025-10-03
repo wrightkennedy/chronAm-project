@@ -83,13 +83,96 @@ DATASET_FOLDER_WARNING = (
 )
 
 
+def resolve_locations_csv(parent: Optional[QWidget]) -> Optional[str]:
+    candidates = []
+    if parent is not None:
+        explicit = getattr(parent, 'locations_csv_path', None)
+        if explicit:
+            candidates.append(explicit)
+    # Always prefer packaged default next
+    candidates.append(default_csv_path())
+    if parent is not None:
+        dataset = getattr(parent, 'dataset_folder', None)
+        if dataset:
+            candidates.append(os.path.join(os.path.dirname(dataset), DEFAULT_CSV_FILENAME))
+        project_folder = getattr(parent, 'project_folder', None)
+        if project_folder:
+            candidates.append(os.path.join(project_folder, 'data', DEFAULT_CSV_FILENAME))
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            return cand
+    return candidates[0] if candidates else None
+
+
+def _summarize_geojson_outputs(out_paths: List[str]):
+    total_articles = 0
+    places_all = set()
+    html_lines = []
+    for path in out_paths:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                geo = json.load(f)
+            features = geo.get('features', [])
+            total_articles += len(features)
+            for feat in features:
+                props = feat.get('properties', {})
+                places_all.add((props.get('Title'), props.get('SN')))
+            encoded = urllib.parse.quote(path)
+            html_lines.append(
+                f'<div>Output GeoJSON: <a href="chronam-open:{encoded}">{html.escape(path)}</a></div>'
+            )
+        except Exception:
+            continue
+    return total_articles, places_all, html_lines
+
+
+def append_geojson_project_log(parent: 'MainWindow', out_paths: List[str]):  # type: ignore
+    total_articles, places_all, html_lines = _summarize_geojson_outputs(out_paths)
+    if not html_lines:
+        html_lines = ['<div>No GeoJSON files created.</div>']
+    stats = getattr(out_paths, 'stats', None)
+    summary_lines = []
+    if stats:
+        total_articles_stat = stats.get("total_articles", total_articles)
+        matched_lccn = stats.get("matched_lccn", 0)
+        matched_title = stats.get("matched_title", 0)
+        matched_total = matched_lccn + matched_title
+        total_base = total_articles_stat or (matched_total + stats.get("unmatched", 0)) or 1
+        pct = lambda count: (count / total_base * 100.0) if total_base else 0.0
+        summary_lines.append(
+            f'<div>Added geographic info for {matched_total:,} articles across {len(places_all):,} locations.</div>'
+        )
+        summary_lines.append(
+            f'<div>Matched {matched_lccn:,} articles via LCCN ({pct(matched_lccn):.2f}%) and '
+            f'{matched_title:,} via title/date fallback ({pct(matched_title):.2f}%).</div>'
+        )
+        unmatched_total = stats.get("unmatched", max(total_articles_stat - matched_total, 0))
+        summary_lines.append(
+            f'<div>{unmatched_total:,} articles had no geographic match ({pct(unmatched_total):.2f}%).</div>'
+        )
+        unmatched_path = stats.get("unmatched_path")
+        if unmatched_path:
+            encoded = urllib.parse.quote(unmatched_path)
+            summary_lines.append(
+                f'<div>Unmatched table: <a href="chronam-open:{encoded}">{html.escape(unmatched_path)}</a></div>'
+            )
+        summary_lines.append(
+            f'<div>Total articles processed: {total_articles_stat:,}</div>'
+        )
+    else:
+        summary_lines.append(
+            f'<div>Added geographic info for {total_articles:,} articles across {len(places_all):,} locations.</div>'
+        )
+    parent.append_project_log('Add Geographic Info', summary_lines + html_lines)
+
+
 def _default_map_settings() -> dict:
     """Return a fresh copy of the map rendering defaults."""
     return {
         'mode': 'points',
-        'time_unit': 'week',
+        'time_unit': 'month',
         'time_step': 1,
-        'linger_unit': 'week',
+        'linger_unit': 'month',
         'linger_step': 2,
         'disable_time': False,
         'heat_radius': 15,
@@ -721,6 +804,7 @@ class DownloadDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle('Search Dataset')
         self.setMinimumSize(600, 400)
+        self._csv_hint_shown = False
 
         layout = QVBoxLayout(self)
 
@@ -762,9 +846,16 @@ class DownloadDialog(QDialog):
         self.clean_urls_cb = QCheckBox('Change article URLs to end in .pdf (replaces .jp2)')
         self.clean_urls_cb.setChecked(True)
         self.clean_hyphen_cb = QCheckBox('Collapse hyphenated breaks (remove "- " sequences)')
+        self.clean_geo_cb = QCheckBox('Add Geographic Info (create GeoJSON output)')
+        self.clean_geo_unmatched_cb = QCheckBox('Create table of unmatched articles')
+        self.clean_geo_unmatched_cb.setEnabled(False)
+        self.clean_geo_cb.toggled.connect(self.clean_geo_unmatched_cb.setEnabled)
+        self.clean_geo_cb.toggled.connect(lambda checked: None if checked else self.clean_geo_unmatched_cb.setChecked(False))
         cleaning_layout.addWidget(self.clean_lowercase_cb)
         cleaning_layout.addWidget(self.clean_urls_cb)
         cleaning_layout.addWidget(self.clean_hyphen_cb)
+        cleaning_layout.addWidget(self.clean_geo_cb)
+        cleaning_layout.addWidget(self.clean_geo_unmatched_cb)
         layout.addWidget(cleaning_group)
 
         self.log = QTextBrowser()
@@ -827,6 +918,81 @@ class DownloadDialog(QDialog):
         self.raise_()
         self.activateWindow()
         self.setFocus(Qt.ActiveWindowFocusReason)
+
+    def _store_csv_path(self, path: Optional[str]):
+        if not (path and os.path.exists(path)):
+            return
+        parent = self.parent()
+        if parent is not None:
+            parent.locations_csv_path = path
+
+    def _prompt_csv_path(self) -> Optional[str]:
+        parent = self.parent()
+        if not self._csv_hint_shown:
+            QMessageBox.information(
+                self,
+                'Locate Locations CSV',
+                f'Locate the newspaper locations table named "{DEFAULT_CSV_FILENAME}".'
+            )
+            self._csv_hint_shown = True
+        if parent and getattr(parent, 'project_folder', None):
+            start = resolve_locations_csv(parent)
+            if not start or not os.path.isfile(start):
+                start = parent.project_folder
+        else:
+            start = resolve_locations_csv(None) or os.getcwd()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            f'Select Locations CSV ({DEFAULT_CSV_FILENAME})',
+            start,
+            'CSV Files (*.csv)'
+        )
+        if path:
+            self._store_csv_path(path)
+        return path or None
+
+    def _ensure_geo_csv_path(self) -> Optional[str]:
+        candidate = resolve_locations_csv(self.parent())
+        if candidate and os.path.exists(candidate):
+            self._store_csv_path(candidate)
+            return candidate
+        return self._prompt_csv_path()
+
+    def _add_geo_after_search(self, json_path: str) -> List[str]:
+        parent = self.parent()
+        if parent is None:
+            return []
+        csv_path = self._ensure_geo_csv_path()
+        if not (csv_path and os.path.exists(csv_path)):
+            self._log_plain('Skipped geographic info — locations CSV not selected.')
+            return []
+        unmatched_csv_path = None
+        if self.clean_geo_unmatched_cb.isChecked():
+            base_name = os.path.splitext(os.path.basename(json_path))[0]
+            unmatched_csv_path = os.path.join(
+                parent.project_folder,
+                'data',
+                'processed',
+                f'unmatched_{base_name}.csv'
+            )
+        try:
+            out_paths = merge_geojson(
+                parent.project_folder,
+                csv_path=csv_path,
+                json_path=json_path,
+                unmatched_csv_path=unmatched_csv_path
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, 'Add Geographic Info', f'Could not add geographic info: {exc}')
+            self._log_plain(f'Adding geographic info failed: {exc}')
+            return []
+
+        if out_paths:
+            parent.geojson_file = out_paths[-1]
+            if parent.locations_csv_path and not os.path.samefile(parent.locations_csv_path, csv_path):
+                parent.locations_csv_path = csv_path
+            parent._update_loaded_file_labels()
+        return out_paths
 
     def _ensure_log_visible(self):
         self.log.moveCursor(QTextCursor.End)
@@ -1141,6 +1307,45 @@ class DownloadDialog(QDialog):
             self._log_plain(summary)
             self._log_plain('No JSON created.')
 
+        geojson_outputs: List[str] = []
+        if self.clean_geo_cb.isChecked() and result:
+            geojson_outputs = self._add_geo_after_search(result[-1])
+            if geojson_outputs:
+                total_articles_geo, places_all, _ = _summarize_geojson_outputs(geojson_outputs)
+                stats = getattr(geojson_outputs, 'stats', None)
+                if stats:
+                    total_articles_stat = stats.get('total_articles', total_articles_geo)
+                    matched_lccn = stats.get('matched_lccn', 0)
+                    matched_title = stats.get('matched_title', 0)
+                    matched_total = matched_lccn + matched_title
+                    total_base = total_articles_stat or (matched_total + stats.get('unmatched', 0)) or 1
+                    self._log_plain(
+                        f'Added geographic info for {matched_total:,} articles across {len(places_all):,} locations.'
+                    )
+                    pct = lambda count: (count / total_base * 100.0) if total_base else 0.0
+                    self._log_plain(
+                        f"Matched {matched_lccn:,} articles via LCCN ({pct(matched_lccn):.2f}%) and "
+                        f"{matched_title:,} via title/date fallback ({pct(matched_title):.2f}%)."
+                    )
+                    unmatched_total = stats.get('unmatched', max(total_articles_stat - matched_total, 0))
+                    self._log_plain(
+                        f"{unmatched_total:,} articles had no geographic match ({pct(unmatched_total):.2f}%)."
+                    )
+                    unmatched_path = stats.get('unmatched_path')
+                    if unmatched_path:
+                        self._log_link('Unmatched table saved to', unmatched_path)
+                    elif self.clean_geo_unmatched_cb.isChecked() and unmatched_total == 0:
+                        self._log_plain('No unmatched table created — all articles were matched.')
+                else:
+                    self._log_plain(
+                        f'Added geographic info for {total_articles_geo:,} articles across {len(places_all):,} locations.'
+                    )
+                for out_path in geojson_outputs:
+                    self._log_link('GeoJSON saved to', out_path)
+                parent_ref = self.parent()
+                if parent_ref is not None:
+                    append_geojson_project_log(parent_ref, geojson_outputs)
+
         self._cancel_event.clear()
         self._cancel_requested = False
         self._finalize_project_log()
@@ -1183,6 +1388,9 @@ class UpdateLocationsDialog(QDialog):
 
         layout.addLayout(form)
 
+        self.unmatched_checkbox = QCheckBox('Create table of unmatched articles')
+        layout.addWidget(self.unmatched_checkbox)
+
         layout.addStretch()
 
         btn_row = QHBoxLayout()
@@ -1212,21 +1420,7 @@ class UpdateLocationsDialog(QDialog):
         self.json_label.setText(self._display_name(path))
 
     def _default_csv_path(self) -> Optional[str]:
-        parent = self.parent()
-        candidates = []
-        explicit = getattr(parent, 'locations_csv_path', None)
-        if explicit:
-            candidates.append(explicit)
-        dataset = getattr(parent, 'dataset_folder', None)
-        if dataset:
-            candidates.append(os.path.join(os.path.dirname(dataset), DEFAULT_CSV_FILENAME))
-        if parent is not None:
-            candidates.append(os.path.join(parent.project_folder, 'data', DEFAULT_CSV_FILENAME))
-        candidates.append(default_csv_path())
-        for cand in candidates:
-            if cand and os.path.exists(cand):
-                return cand
-        return candidates[0] if candidates else None
+        return resolve_locations_csv(self.parent())
 
     def prompt_csv(self, show_hint: bool = False) -> Optional[str]:
         parent = self.parent()
@@ -1290,17 +1484,29 @@ class UpdateLocationsDialog(QDialog):
             QMessageBox.critical(self, 'Error', f'Could not read metadata: {exc}')
             return
 
+        unmatched_csv_path = None
+        if self.unmatched_checkbox.isChecked():
+            base_name = os.path.splitext(os.path.basename(self.json_path))[0]
+            unmatched_csv_path = os.path.join(
+                parent.project_folder,
+                'data',
+                'processed',
+                f'unmatched_{base_name}.csv'
+            )
         try:
             out_paths = merge_geojson(
                 parent.project_folder,
                 csv_path=self.csv_path,
                 search_term=term,
                 year=year,
-                json_path=self.json_path
+                json_path=self.json_path,
+                unmatched_csv_path=unmatched_csv_path
             )
             if out_paths:
                 last_geo = out_paths[-1]
                 parent.geojson_file = last_geo
+                if parent.locations_csv_path and not os.path.samefile(parent.locations_csv_path, self.csv_path):
+                    parent.locations_csv_path = self.csv_path
                 parent._update_loaded_file_labels()
             self._log_merge_stats(out_paths)
             self.accept()
@@ -1314,32 +1520,9 @@ class UpdateLocationsDialog(QDialog):
 
     def _log_merge_stats(self, out_paths):
         parent = self.parent()
-        lines = []
-        total_articles = 0
-        places_all = set()
-        for path in out_paths:
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    geo = json.load(f)
-                features = geo.get('features', [])
-                total_articles += len(features)
-                places = set()
-                for feat in features:
-                    props = feat.get('properties', {})
-                    places.add((props.get('Title'), props.get('SN')))
-                places_all.update(places)
-                encoded = urllib.parse.quote(path)
-                lines.append(
-                    f'<div>Output GeoJSON: <a href="chronam-open:{encoded}">{html.escape(path)}</a></div>'
-                )
-            except Exception:
-                continue
-
-        if not lines:
-            lines.append('<div>No GeoJSON files created.</div>')
-
-        summary = f'<div>Joined {len(places_all):,} places to {total_articles:,} articles.</div>'
-        parent.append_project_log('Add Geographic Info', [summary] + lines)
+        if parent is None:
+            return
+        append_geojson_project_log(parent, out_paths)
 
 class CSVPreviewDialog(QDialog):
     def __init__(self, csv_path, parent=None, max_rows=100):
@@ -1595,14 +1778,14 @@ class MapToolDialog(QDialog):
         self.normalize_check.setChecked(bool(defaults.get('normalize', False)))
 
         self.time_step.setValue(max(1, int(defaults.get('time_step', 1))))
-        idx = self.time_unit.findText(str(defaults.get('time_unit', 'week')), Qt.MatchFixedString)
+        idx = self.time_unit.findText(str(defaults.get('time_unit', 'month')), Qt.MatchFixedString)
         if idx >= 0:
             self.time_unit.setCurrentIndex(idx)
 
         self.disable_time.setChecked(bool(defaults.get('disable_time', False)))
 
         self.linger_step.setValue(max(0, int(defaults.get('linger_step', 2))))
-        idx = self.linger_unit.findText(str(defaults.get('linger_unit', 'week')), Qt.MatchFixedString)
+        idx = self.linger_unit.findText(str(defaults.get('linger_unit', 'month')), Qt.MatchFixedString)
         if idx >= 0:
             self.linger_unit.setCurrentIndex(idx)
 
