@@ -25,6 +25,7 @@ import re
 from collections import Counter, defaultdict
 
 from .config import init_project  # type: ignore
+from .utils import term_directory_name
 
 
 # A robust built-in English stopword list (no external deps)
@@ -199,6 +200,8 @@ def _collocate_from_df(df: pd.DataFrame, term: str, opts: CollocationOptions
     # Prepare by-time nested counters
     by_time_counts: Dict[str, Counter] = defaultdict(Counter)
 
+    track_pages = opts.include_page_count
+
     for _, row in df.iterrows():
         text = row.get("article", "")
         if not isinstance(text, str) or not text.strip():
@@ -213,9 +216,13 @@ def _collocate_from_df(df: pd.DataFrame, term: str, opts: CollocationOptions
             continue
         total_articles += 1
         aid = row.get("article_id") or row.get("filename") or f"row{_}"
-        page = row.get("page")
+        page = row.get("page") if track_pages else None
+        lccn_val = (row.get("lccn") or row.get("SN")) if track_pages else None
         dt = row.get("date")
         pd_dt = pd.to_datetime(dt, errors="coerce")
+        date_key = (
+            pd_dt.date().isoformat() if (track_pages and pd.notna(pd_dt)) else (str(dt).strip() if (track_pages and dt) else "")
+        )
 
         for st in starts:
             left = max(0, st - opts.window)
@@ -227,8 +234,18 @@ def _collocate_from_df(df: pd.DataFrame, term: str, opts: CollocationOptions
                     continue
                 per_collocate_count[tok] += 1
                 per_collocate_article_ids[tok].add(aid)
-                if page:
-                    per_collocate_pages[tok].add(str(page))
+                if track_pages:
+                    page_key: Optional[Tuple[str, str, str]] = None
+                    if page or lccn_val or date_key:
+                        page_key = (
+                            str(lccn_val or ""),
+                            date_key,
+                            str(page or ""),
+                        )
+                    elif aid:
+                        page_key = ("", "", f"article:{aid}")
+                    if page_key is not None:
+                        per_collocate_pages[tok].add(page_key)
                 if pd.notna(pd_dt):
                     per_collocate_dates[tok].append(pd_dt)
                 if opts.include_relative_position:
@@ -401,9 +418,10 @@ def _build_output_paths(
 ) -> Dict[str, Optional[str]]:
     stem = _build_output_stem(term, start_date, end_date, city, state, time_bin_unit, ignore_bin, options)
     stem_with_suffix = f"{stem}{filename_suffix}" if filename_suffix else stem
-    metrics = os.path.join(processed_dir, f"collocates_metrics_{stem_with_suffix}.csv")
-    by_time = None if ignore_bin or not time_bin_unit else os.path.join(processed_dir, f"collocates_by_time_{stem_with_suffix}.csv")
-    occurrences = os.path.join(processed_dir, f"occurrences_{stem_with_suffix}.geojson")
+    term_dir = os.path.join(processed_dir, term_directory_name(term))
+    metrics = os.path.join(term_dir, f"collocates_metrics_{stem_with_suffix}.csv")
+    by_time = None if ignore_bin or not time_bin_unit else os.path.join(term_dir, f"collocates_by_time_{stem_with_suffix}.csv")
+    occurrences = os.path.join(term_dir, f"occurrences_{stem_with_suffix}.geojson")
     return {
         "stem": stem_with_suffix,
         "metrics": metrics,
@@ -451,7 +469,7 @@ def run_collocation(
     drop_terms: Optional[List[str]] = None,
 ) -> Dict[str, Optional[str]]:
     """
-    Execute collocation analysis. Writes outputs into data/processed.
+    Execute collocation analysis. Writes outputs into data/processed/<term>/.
 
     Returns path to occurrences GeoJSON if write_occurrences_geojson is True, else None.
     """
@@ -506,6 +524,9 @@ def run_collocation(
     if df.empty:
         # Still write empty CSVs to keep UI predictable
         empty_paths = _build_output_paths(proc, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, opt_dict, suffix)
+        metrics_dir = os.path.dirname(empty_paths.get("metrics") or proc)
+        if metrics_dir:
+            os.makedirs(metrics_dir, exist_ok=True)
         pd.DataFrame(columns=["collocate_term","frequency"]).to_csv(empty_paths["metrics"], index=False)
         if write_by_time and empty_paths["by_time"]:
             pd.DataFrame(columns=["time_bin","collocate_term","frequency","ordinal_rank"]).to_csv(empty_paths["by_time"], index=False)
@@ -523,6 +544,9 @@ def run_collocation(
 
     # Write metrics CSV
     output_paths = _build_output_paths(proc, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, opt_dict, suffix)
+    metrics_dir = os.path.dirname(output_paths.get("metrics") or proc)
+    if metrics_dir:
+        os.makedirs(metrics_dir, exist_ok=True)
     metrics.to_csv(output_paths["metrics"], index=False)
 
     # Build by-time CSV if requested

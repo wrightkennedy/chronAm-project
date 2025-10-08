@@ -5,6 +5,7 @@ from datetime import datetime, date
 from datasets import load_dataset
 import pandas as pd
 from .config import init_project, DATASET_NAME, DATASET_CONFIG_NAME
+from .utils import term_directory_name
 
 def download_data(
     project_dir: str,
@@ -18,7 +19,10 @@ def download_data(
     cancel_event=None,
 ) -> list:
     paths = init_project(project_dir)
-    output_dir = paths['raw']
+    output_dir = paths['processed']
+    os.makedirs(output_dir, exist_ok=True)
+    term_dir = os.path.join(output_dir, term_directory_name(search_term))
+    os.makedirs(term_dir, exist_ok=True)
 
     start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
     end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
@@ -97,7 +101,7 @@ def download_data(
                     if max_saved_articles_per_year and len(matches) >= max_saved_articles_per_year:
                         break
 
-        out_file = os.path.join(output_dir, f"{search_term}_{year_str}.json")
+        out_file = os.path.join(term_dir, f"{search_term}_{year_str}.json")
         payload = {
             "year": year_str,
             "start_date": start_date_str,

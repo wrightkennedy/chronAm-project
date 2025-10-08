@@ -45,6 +45,7 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QStyle,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -57,6 +58,7 @@ from chronam import download_data
 from chronam.config import DEFAULT_CSV_FILENAME, default_csv_path
 from chronam.map_create import create_map
 from chronam.collocate import run_collocation, build_collocation_output_paths
+from chronam.utils import term_directory_name
 
 
 def reveal_in_file_manager(path: str):
@@ -783,7 +785,7 @@ class MainWindow(QMainWindow):
         return None
 
     def open_json_file(self):
-        start_dir = os.path.join(self.project_folder, 'data', 'raw') if self.project_folder else ''
+        start_dir = os.path.join(self.project_folder, 'data', 'processed') if self.project_folder else ''
         if not (start_dir and os.path.isdir(start_dir)):
             start_dir = self.project_folder or ''
         file_path, _ = QFileDialog.getOpenFileName(self, 'Load JSON File', start_dir, 'JSON Files (*.json)')
@@ -1014,6 +1016,8 @@ class DownloadDialog(QDialog):
             parent.geojson_file = out_paths[-1]
             if parent.locations_csv_path and not os.path.samefile(parent.locations_csv_path, csv_path):
                 parent.locations_csv_path = csv_path
+            parent.collocation_state = {}
+            parent.collocation_drop_terms = []
             parent._update_loaded_file_labels()
         return out_paths
 
@@ -1136,10 +1140,9 @@ class DownloadDialog(QDialog):
         self.refresh_dataset_label()
 
         # Single output path for the full range
-        out_path = os.path.join(
-            self.parent().project_folder, 'data', 'raw',
-            f"{term}_{start}_{end}.json"
-        )
+        processed_root = os.path.join(self.parent().project_folder, 'data', 'processed')
+        term_dir = os.path.join(processed_root, term_directory_name(term))
+        out_path = os.path.join(term_dir, f"{term}_{start}_{end}.json")
         if os.path.exists(out_path):
             if QMessageBox.warning(
                 self, 'Overwrite Warning', f'Will overwrite:\n{out_path}',
@@ -1302,6 +1305,8 @@ class DownloadDialog(QDialog):
             p = self.parent()
             p.json_file = last_json
             p._update_loaded_file_labels()
+            p.collocation_state = {}
+            p.collocation_drop_terms = []
 
         total_articles = 0
         total_years = len(self.logged_years)
@@ -2265,13 +2270,18 @@ class CollocationDialog(QDialog):
         self.mode_group.addButton(self.mode_geo)
         self.mode_group.addButton(self.mode_json)
 
-        # Default selection based on loaded files
-        if getattr(parent, 'geojson_file', None):
-            self.mode_geo.setChecked(True)
-        elif getattr(parent, 'json_file', None):
+        info_icon = QLabel()
+        info_icon.setToolTip('JSON results run much faster than GeoJSON for collocation analysis.')
+        info_icon.setPixmap(self.style().standardIcon(QStyle.SP_MessageBoxInformation).pixmap(16, 16))
+        mode_row.addWidget(info_icon, 0, Qt.AlignVCenter)
+
+        # Default selection based on loaded files (prefer JSON for speed)
+        if getattr(parent, 'json_file', None):
             self.mode_json.setChecked(True)
-        else:
+        elif getattr(parent, 'geojson_file', None):
             self.mode_geo.setChecked(True)
+        else:
+            self.mode_json.setChecked(True)
 
         mode_row.addWidget(self.mode_geo)
         mode_row.addWidget(self.mode_json)
@@ -2466,7 +2476,7 @@ class CollocationDialog(QDialog):
         elif getattr(parent, 'json_file', None):
             self.mode_json.setChecked(True)
         else:
-            self.mode_geo.setChecked(True)
+            self.mode_json.setChecked(True)
         self.mode_geo.blockSignals(False)
         self.mode_json.blockSignals(False)
         self.on_mode_toggle()

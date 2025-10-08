@@ -43,6 +43,7 @@ import os, json, re, threading
 import pandas as pd
 import duckdb
 from .config import init_project
+from .utils import term_directory_name
 
 DEFAULT_PARQUET_PREFIX = "AmericanStories"
 SEARCH_LOCATIONS_REL = ["data/parquet", "parquet"]
@@ -66,7 +67,7 @@ def download_data(
 ) -> List[str]:
     """
     Query local Parquet with DuckDB and write *one* JSON payload for the full date range
-    into data/raw/<term>_<start>_<end>.json.
+    into data/processed/<term>/<term>_<start>_<end>.json.
 
     Returns: [path_to_single_json]
     """
@@ -80,8 +81,10 @@ def download_data(
 
     # Resolve paths
     paths = init_project(project_dir)
-    raw_dir = paths["raw"]
-    os.makedirs(raw_dir, exist_ok=True)
+    processed_dir = paths["processed"]
+    os.makedirs(processed_dir, exist_ok=True)
+    term_dir = os.path.join(processed_dir, term_directory_name(search_term))
+    os.makedirs(term_dir, exist_ok=True)
 
     # Optional enrichment: lccn -> Title / newspaper_name map if available
     def _load_lccn_title_map(csv_path: str) -> Dict[str, str]:
@@ -206,7 +209,7 @@ def download_data(
                     record['url'] = jp2_pattern.sub('.pdf', url_val)
 
     # Write a single payload (empty-safe)
-    out_file = os.path.join(raw_dir, f"{search_term}_{start_date_str}_{end_date_str}.json")
+    out_file = os.path.join(term_dir, f"{search_term}_{start_date_str}_{end_date_str}.json")
     payload = {
         "start_date": start_date_str,
         "end_date": end_date_str,

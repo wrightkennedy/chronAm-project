@@ -167,15 +167,21 @@ def merge_geojson(
             raise FileNotFoundError(json_path)
         json_files = [json_path]
     else:
-        # Gather all JSONs in raw_dir; filter by search_term/year if provided
-        for name in os.listdir(raw_dir):
-            if not name.lower().endswith(".json"):
+        search_roots = [proc_dir, raw_dir]
+        seen_dirs = set()
+        for root in search_roots:
+            if not root or root in seen_dirs or not os.path.isdir(root):
                 continue
-            if search_term and not name.startswith(search_term + "_"):
-                continue
-            if year and not name.endswith(f"_{year}.json"):
-                continue
-            json_files.append(os.path.join(raw_dir, name))
+            seen_dirs.add(root)
+            for dirpath, _dirs, files in os.walk(root):
+                for name in files:
+                    if not name.lower().endswith(".json"):
+                        continue
+                    if search_term and not name.startswith(search_term + "_"):
+                        continue
+                    if year and not name.endswith(f"_{year}.json"):
+                        continue
+                    json_files.append(os.path.join(dirpath, name))
         json_files.sort()
 
     if not json_files:
