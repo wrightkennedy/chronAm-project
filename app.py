@@ -2495,8 +2495,8 @@ class CollocationDialog(QDialog):
 
         # --- Source selection & status line ---
         mode_row = QHBoxLayout()
-        self.mode_geo = QRadioButton('Use GeoJSON')
         self.mode_json = QRadioButton('Use JSON results')
+        self.mode_geo = QRadioButton('Use GeoJSON')
         self.mode_group = QButtonGroup(self)
         self.mode_group.addButton(self.mode_geo)
         self.mode_group.addButton(self.mode_json)
@@ -2507,15 +2507,17 @@ class CollocationDialog(QDialog):
         mode_row.addWidget(info_icon, 0, Qt.AlignVCenter)
 
         # Default selection based on loaded files (prefer JSON for speed)
-        if getattr(parent, 'json_file', None):
+        json_available = getattr(parent, 'json_file', None)
+        geo_available = getattr(parent, 'geojson_file', None)
+        if json_available:
             self.mode_json.setChecked(True)
-        elif getattr(parent, 'geojson_file', None):
+        elif geo_available:
             self.mode_geo.setChecked(True)
         else:
             self.mode_json.setChecked(True)
 
-        mode_row.addWidget(self.mode_geo)
         mode_row.addWidget(self.mode_json)
+        mode_row.addWidget(self.mode_geo)
 
         self.choose_btn = QPushButton('Choose File…')
         mode_row.addWidget(self.choose_btn)
@@ -2838,14 +2840,22 @@ class CollocationDialog(QDialog):
     def choose_source_file(self):
         parent = self.parent()
         if self.mode_geo.isChecked():
-            p, _ = QFileDialog.getOpenFileName(self, 'Select GeoJSON File', parent.project_folder, 'GeoJSON Files (*.geojson *.json)')
+            start_dir = parent.project_folder if parent else os.getcwd()
+            processed_dir = os.path.join(start_dir, 'data', 'processed')
+            if os.path.isdir(processed_dir):
+                start_dir = processed_dir
+            p, _ = QFileDialog.getOpenFileName(self, 'Select GeoJSON File', start_dir, 'GeoJSON Files (*.geojson *.json)')
             if p:
                 parent.geojson_file = p
                 parent._update_loaded_file_labels()
                 # Update city/state lists for new GeoJSON
                 self.populate_city_state()
         else:
-            p, _ = QFileDialog.getOpenFileName(self, 'Select JSON Results', parent.project_folder, 'JSON Files (*.json)')
+            start_dir = parent.project_folder if parent else os.getcwd()
+            processed_dir = os.path.join(start_dir, 'data', 'processed')
+            if os.path.isdir(processed_dir):
+                start_dir = processed_dir
+            p, _ = QFileDialog.getOpenFileName(self, 'Select JSON Results', start_dir, 'JSON Files (*.json)')
             if p:
                 parent.json_file = p
                 parent._update_loaded_file_labels()
@@ -2867,26 +2877,42 @@ class CollocationDialog(QDialog):
             self._apply_state(state)
         else:
             # Prefer JSON by default if available; else GeoJSON; else JSON
-            if getattr(parent, 'json_file', None):
+            json_available = getattr(parent, 'json_file', None) if parent is not None else None
+            geo_available = getattr(parent, 'geojson_file', None) if parent is not None else None
+            if json_available and not geo_available:
                 self.mode_json.setChecked(True)
-            elif getattr(parent, 'geojson_file', None):
+            elif geo_available and not json_available:
                 self.mode_geo.setChecked(True)
+            elif json_available and geo_available:
+                self.mode_json.setChecked(True)
             else:
                 self.mode_json.setChecked(True)
             self.on_mode_toggle()
             self._prefill_from_current_source()
+        self.source_label.setText(self._source_text())
 
     def _apply_state(self, state: dict):
         parent = self.parent()
         mode = state.get('mode', 'geo')
         self.mode_geo.blockSignals(True)
         self.mode_json.blockSignals(True)
-        if mode == 'json' and getattr(parent, 'json_file', None):
-            self.mode_json.setChecked(True)
-        elif mode == 'geo' and getattr(parent, 'geojson_file', None):
+        json_available = getattr(parent, 'json_file', None) if parent is not None else None
+        geo_available = getattr(parent, 'geojson_file', None) if parent is not None else None
+        chosen = None
+        if mode == 'json' and json_available:
+            chosen = 'json'
+        elif mode == 'geo' and geo_available:
+            chosen = 'geo'
+        elif json_available and not geo_available:
+            chosen = 'json'
+        elif geo_available and not json_available:
+            chosen = 'geo'
+        elif json_available:
+            chosen = 'json'
+        elif geo_available:
+            chosen = 'geo'
+        if chosen == 'geo':
             self.mode_geo.setChecked(True)
-        elif getattr(parent, 'json_file', None):
-            self.mode_json.setChecked(True)
         else:
             self.mode_json.setChecked(True)
         self.mode_geo.blockSignals(False)
@@ -2895,6 +2921,7 @@ class CollocationDialog(QDialog):
 
         # Prefill term/date from current source if missing in saved state
         self._prefill_from_current_source()
+        self.source_label.setText(self._source_text())
 
         city = state.get('city')
         if city:
