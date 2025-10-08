@@ -8,7 +8,7 @@ import threading
 import time
 import urllib.parse
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from PyQt5.QtCore import (
@@ -125,6 +125,14 @@ def _import_plot_rank_changes():
         from chronam.visualize import plot_rank_changes as _plot
     except Exception as exc:  # pragma: no cover
         raise RuntimeError('Collocation rank charts require matplotlib. Install it to view charts.') from exc
+    return _plot
+
+
+def _import_plot_articles_by_year():
+    try:
+        from chronam.visualize import plot_articles_by_year as _plot
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError('Yearly article charts require matplotlib. Install it to view charts.') from exc
     return _plot
 
 
@@ -882,6 +890,15 @@ class DownloadDialog(QDialog):
         cleaning_layout.addWidget(self.clean_geo_unmatched_cb)
         layout.addWidget(cleaning_group)
 
+        outputs_group = QGroupBox('Summary Outputs')
+        outputs_layout = QVBoxLayout(outputs_group)
+        outputs_layout.setContentsMargins(9, 9, 9, 9)
+        self.yearly_csv_cb = QCheckBox('Create yearly summary CSV')
+        self.yearly_chart_cb = QCheckBox('Show yearly article chart')
+        outputs_layout.addWidget(self.yearly_csv_cb)
+        outputs_layout.addWidget(self.yearly_chart_cb)
+        layout.addWidget(outputs_group)
+
         self.log = QTextBrowser()
         self.log.setOpenLinks(False)
         self.log.anchorClicked.connect(self._handle_log_link)
@@ -913,6 +930,11 @@ class DownloadDialog(QDialog):
         self._restore_log_history()
         self.refresh_dataset_label()
         self._current_run_lines = []
+
+        self._current_term = ''
+        self._current_start = ''
+        self._current_end = ''
+        self._current_term_dir: Optional[str] = None
 
     def showEvent(self, event):
         self.refresh_dataset_label()
@@ -1142,6 +1164,7 @@ class DownloadDialog(QDialog):
         # Single output path for the full range
         processed_root = os.path.join(self.parent().project_folder, 'data', 'processed')
         term_dir = os.path.join(processed_root, term_directory_name(term))
+        os.makedirs(term_dir, exist_ok=True)
         out_path = os.path.join(term_dir, f"{term}_{start}_{end}.json")
         if os.path.exists(out_path):
             if QMessageBox.warning(
@@ -1151,6 +1174,11 @@ class DownloadDialog(QDialog):
                 self._log_plain('Search cancelled — existing file retained.')
                 self._finalize_project_log()
                 return
+
+        self._current_term = term
+        self._current_start = start
+        self._current_end = end
+        self._current_term_dir = term_dir
 
         if self.log.toPlainText().strip():
             self._log_blank()
@@ -1261,7 +1289,32 @@ class DownloadDialog(QDialog):
         else:
             self._log_plain(f"Found {count:,} articles — elapsed {elapsed:.1f}s")
 
-
+    def _collect_year_counts(self, result_paths: List[str]) -> Tuple[Dict[str, int], Optional[str]]:
+        counts: Dict[str, int] = {}
+        detected_term: Optional[str] = None
+        for path in result_paths:
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+            except Exception as exc:
+                self._log_plain(f'Yearly summary skipped for {os.path.basename(path)}: {exc}')
+                continue
+            if not isinstance(payload, dict):
+                continue
+            term_val = payload.get('search_term')
+            if isinstance(term_val, str) and term_val.strip() and not detected_term:
+                detected_term = term_val.strip()
+            articles = payload.get('articles') or []
+            if not isinstance(articles, list):
+                continue
+            for article in articles:
+                if not isinstance(article, dict):
+                    continue
+                date_val = str(article.get('date') or '')
+                year = date_val[:4]
+                if year.isdigit():
+                    counts[year] = counts.get(year, 0) + 1
+        return counts, detected_term
 
     def cancel_download(self):
         if self._search_running and self.thread and self.thread.isRunning():
@@ -1334,6 +1387,55 @@ class DownloadDialog(QDialog):
             summary += f" and finished in {elapsed:.1f}s"
             self._log_plain(summary)
             self._log_plain('No JSON created.')
+
+        yearly_counts: Dict[str, int] = {}
+        summary_term: Optional[str] = None
+        if result and (self.yearly_csv_cb.isChecked() or self.yearly_chart_cb.isChecked()):
+            yearly_counts, summary_term = self._collect_year_counts(result)
+
+        if yearly_counts:
+            rows: List[Tuple[int, int]] = []
+            for year_str, count in yearly_counts.items():
+                try:
+                    year_int = int(year_str)
+                except ValueError:
+                    continue
+                rows.append((year_int, int(count)))
+            rows.sort()
+
+            if rows:
+                df_counts = pd.DataFrame(rows, columns=['year', 'article_count'])
+                term_label = summary_term or self._current_term or self.search_input.text().strip() or 'term'
+                start_label = self._current_start or self.start_input.text().strip() or 'start'
+                end_label = self._current_end or self.end_input.text().strip() or 'end'
+                df_counts.insert(0, 'search_term', term_label)
+
+                term_dir = self._current_term_dir or (os.path.dirname(result[-1]) if result else None)
+                if term_dir:
+                    os.makedirs(term_dir, exist_ok=True)
+
+                if self.yearly_csv_cb.isChecked() and term_dir:
+                    csv_name = f"{term_label}_{start_label}_{end_label}_yearly_counts.csv"
+                    csv_path = os.path.join(term_dir, csv_name)
+                    try:
+                        df_counts.to_csv(csv_path, index=False)
+                    except Exception as exc:
+                        self._log_plain(f'Yearly summary CSV failed: {exc}')
+                    else:
+                        self._log_link('Yearly summary CSV', csv_path)
+
+                if self.yearly_chart_cb.isChecked():
+                    try:
+                        plot_year = _import_plot_articles_by_year()
+                        title = f'Articles per Year — {term_label}'
+                        plot_year(df_counts, title=title)
+                        self._log_plain('Opened yearly article chart.')
+                    except Exception as exc:
+                        self._log_plain(f'Yearly chart failed: {exc}')
+            else:
+                self._log_plain('Yearly summaries skipped — no dated articles found.')
+        elif result and (self.yearly_csv_cb.isChecked() or self.yearly_chart_cb.isChecked()):
+            self._log_plain('Yearly summaries skipped — no articles with valid dates.')
 
         geojson_outputs: List[str] = []
         if self.clean_geo_cb.isChecked() and result:
@@ -2416,10 +2518,12 @@ class CollocationDialog(QDialog):
         btn_run = QPushButton('Run Collocation')
         btn_bar = QPushButton('Show Bar Chart')
         btn_rank = QPushButton('Show Rank Changes')
+        btn_map_collocate = QPushButton('Create Collocate‑Rank Map (lightweight)')
         btn_run.clicked.connect(self.run_collocate)
         btn_bar.clicked.connect(self.show_bar)
         btn_rank.clicked.connect(self.show_rank)
-        for b in (btn_run, btn_bar, btn_rank):
+        btn_map_collocate.clicked.connect(self.create_collocate_rank_map)
+        for b in (btn_run, btn_bar, btn_rank, btn_map_collocate):
             layout.addWidget(b)
 
     def _source_text(self):
@@ -2428,7 +2532,80 @@ class CollocationDialog(QDialog):
             return f"GeoJSON: {os.path.basename(p) if p else '<none selected>'}"
         else:
             p = getattr(self.parent(), 'json_file', None)
-            return f"JSON: {os.path.basename(p) if p else '<none selected>'}"
+        return f"JSON: {os.path.basename(p) if p else '<none selected>'}"
+
+    def create_collocate_rank_map(self):
+        parent = self.parent()
+        if parent is None:
+            QMessageBox.warning(self, 'Unavailable', 'Parent window not available.')
+            return
+        # Require a GeoJSON source to derive per‑city ranks
+        geo_path = getattr(parent, 'geojson_file', None)
+        if not geo_path or not os.path.exists(geo_path):
+            # Try to prompt for a GeoJSON
+            p, _ = QFileDialog.getOpenFileName(self, 'Select GeoJSON File', parent.project_folder or os.getcwd(), 'GeoJSON Files (*.geojson *.json)')
+            if p:
+                parent.geojson_file = p
+                parent._update_loaded_file_labels()
+                geo_path = p
+        if not geo_path or not os.path.exists(geo_path):
+            QMessageBox.warning(self, 'GeoJSON Required', 'Please add geographic info and select a GeoJSON file first.')
+            return
+
+        term = self.term_input.text().strip()
+        if not term:
+            QMessageBox.warning(self, 'Search Term Required', 'Enter a search term to build the collocate‑rank map.')
+            return
+
+        # Time configuration
+        ignore_bin = self.ignore_bin.isChecked()
+        size_text = self.bin_size.text().strip()
+        bin_unit = self.bin_unit.currentText().lower()
+        if not ignore_bin and (not size_text or not size_text.isdigit()):
+            QMessageBox.warning(self, 'Invalid Bin Size', 'Please enter an integer ≥ 1.')
+            return
+        time_unit = bin_unit if not ignore_bin else 'month'
+        time_step = int(size_text) if (not ignore_bin and size_text.isdigit()) else 1
+
+        # Collocation options influence tokenization
+        opts = self._collect_options()
+        drop_stop = bool(opts.get('drop_stopwords', False))
+
+        try:
+            # Create lightweight map with embedded collocate rank index
+            result = create_map(
+                geo_path,
+                mode='points',
+                time_unit=time_unit,
+                time_step=time_step,
+                linger_unit='week',
+                linger_step=0,
+                disable_time=False,
+                lightweight=True,
+                table_mode='minimal',
+                table_row_limit=1000,
+                # Extended kwargs consumed by map_create
+                collocate_rank_mode=True,
+                collocate_drop_stopwords=drop_stop,
+                collocate_window=5,
+                collocate_drop_terms=self._get_parent_drop_terms(),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, 'Map Error', str(exc))
+            return
+
+        map_path = (result or {}).get('map_path')
+        if map_path and os.path.exists(map_path):
+            self._set_clear_notice('')
+            encoded = urllib.parse.quote(map_path)
+            log_lines = [
+                f'<div>Created map: <a href="chronam-open:{encoded}">{html.escape(map_path)}</a></div>'
+            ]
+            if parent and hasattr(parent, 'append_project_log'):
+                parent.append_project_log('Collocate‑Rank Map', log_lines)
+            reveal_in_file_manager(map_path)
+        else:
+            QMessageBox.information(self, 'No Map Created', 'The map was not created.')
 
     def choose_source_file(self):
         parent = self.parent()
@@ -2461,6 +2638,13 @@ class CollocationDialog(QDialog):
         if state:
             self._apply_state(state)
         else:
+            # Prefer JSON by default if available; else GeoJSON; else JSON
+            if getattr(parent, 'json_file', None):
+                self.mode_json.setChecked(True)
+            elif getattr(parent, 'geojson_file', None):
+                self.mode_geo.setChecked(True)
+            else:
+                self.mode_json.setChecked(True)
             self.on_mode_toggle()
             self._prefill_from_current_source()
 

@@ -8,7 +8,7 @@ Plotting utilities for collocation analysis.
 These functions are GUI-agnostic and can be called from PyQt handlers.
 """
 
-from typing import Optional, Union, List
+from typing import Optional, Union, List, Dict
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -171,6 +171,49 @@ def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
                 fig.canvas.draw_idle()
 
         fig.canvas.mpl_connect('motion_notify_event', hover)
+
+    if output_path:
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
+        return fig
+    else:
+        plt.show(block=False)
+        return fig
+
+
+def plot_articles_by_year(data: Union[str, pd.DataFrame, Dict[str, int]],
+                          output_path: Optional[str] = None,
+                          title: Optional[str] = None):
+    """Plot a simple line chart of article counts by year."""
+    plt = _ensure_pyplot()
+    if isinstance(data, dict):
+        items = sorted(
+            [(int(year), int(count)) for year, count in data.items() if str(year).isdigit()],
+            key=lambda pair: pair[0]
+        )
+        df = pd.DataFrame(items, columns=['year', 'article_count'])
+    else:
+        df = _load_df(data)
+        if 'year' not in df.columns or 'article_count' not in df.columns:
+            raise ValueError("Data must contain 'year' and 'article_count' columns.")
+        df = df[['year', 'article_count']].copy()
+        df['year'] = pd.to_numeric(df['year'], errors='coerce')
+        df['article_count'] = pd.to_numeric(df['article_count'], errors='coerce')
+        df = df.dropna(subset=['year', 'article_count'])
+        df.sort_values('year', inplace=True)
+
+    if df.empty:
+        raise ValueError("No yearly data to plot.")
+
+    fig, ax = plt.subplots()
+    ax.plot(df['year'], df['article_count'], marker='o')
+    ax.set_xlabel('Year')
+    ax.set_ylabel('Articles')
+    ax.set_title(title or 'Articles per Year')
+    ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
+    if len(df) > 12:
+        ax.set_xticks(df['year'][:: max(1, len(df)//12)])
+    plt.tight_layout()
 
     if output_path:
         fig.savefig(output_path, dpi=150)
