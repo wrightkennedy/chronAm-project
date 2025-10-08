@@ -15,13 +15,6 @@ from typing import List, Dict, Any, Optional
 
 import pandas as pd
 
-try:
-    import geopandas as gpd  # type: ignore
-    from shapely.geometry import Point  # type: ignore
-except Exception:  # pragma: no cover
-    gpd = None  # type: ignore
-    Point = None  # type: ignore
-
 from .config import init_project  # type: ignore
 
 
@@ -100,10 +93,13 @@ def _parse_date(value: Any) -> Optional[pd.Timestamp]:
         return None
 
 
-def _to_geodataframe(merged: pd.DataFrame) -> "gpd.GeoDataFrame":  # type: ignore
+def _to_geodataframe(merged: pd.DataFrame) -> "geopandas.GeoDataFrame":  # type: ignore
     """Convert merged DataFrame with Long/Lat columns to a GeoDataFrame."""
-    if gpd is None or Point is None:
-        raise RuntimeError("geopandas/shapely is required to write GeoJSON.")
+    try:
+        import geopandas as gpd  # type: ignore
+        from shapely.geometry import Point  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("geopandas/shapely is required to write GeoJSON.") from exc
     geometry = [
         Point(lon, lat) if pd.notna(lon) and pd.notna(lat) else None
         for lon, lat in zip(merged["Long"], merged["Lat"])

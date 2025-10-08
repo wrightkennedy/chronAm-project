@@ -56,9 +56,7 @@ from PyQt5.QtWidgets import (
 from chronam import download_data
 from chronam.config import DEFAULT_CSV_FILENAME, default_csv_path
 from chronam.map_create import create_map
-from chronam.merge import merge_geojson
 from chronam.collocate import run_collocation, build_collocation_output_paths
-from chronam.visualize import plot_bar, plot_rank_changes
 
 
 def reveal_in_file_manager(path: str):
@@ -102,6 +100,30 @@ def resolve_locations_csv(parent: Optional[QWidget]) -> Optional[str]:
         if cand and os.path.exists(cand):
             return cand
     return candidates[0] if candidates else None
+
+
+def _import_merge_geojson():
+    try:
+        from chronam.merge import merge_geojson as _merge
+    except Exception as exc:  # pragma: no cover - import-time failure surfaced to UI
+        raise RuntimeError('Add Geographic Info requires geopandas/shapely. Please install the geospatial stack.') from exc
+    return _merge
+
+
+def _import_plot_bar():
+    try:
+        from chronam.visualize import plot_bar as _plot
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError('Collocation bar charts require matplotlib. Install it to view charts.') from exc
+    return _plot
+
+
+def _import_plot_rank_changes():
+    try:
+        from chronam.visualize import plot_rank_changes as _plot
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError('Collocation rank charts require matplotlib. Install it to view charts.') from exc
+    return _plot
 
 
 def _summarize_geojson_outputs(out_paths: List[str]):
@@ -976,6 +998,7 @@ class DownloadDialog(QDialog):
                 f'unmatched_{base_name}.csv'
             )
         try:
+            merge_geojson = _import_merge_geojson()
             out_paths = merge_geojson(
                 parent.project_folder,
                 csv_path=csv_path,
@@ -1494,6 +1517,7 @@ class UpdateLocationsDialog(QDialog):
                 f'unmatched_{base_name}.csv'
             )
         try:
+            merge_geojson = _import_merge_geojson()
             out_paths = merge_geojson(
                 parent.project_folder,
                 csv_path=self.csv_path,
@@ -3009,7 +3033,12 @@ class CollocationDialog(QDialog):
         if not metrics_path or not os.path.exists(metrics_path):
             QMessageBox.warning(self, 'File Not Found', 'Metrics file not found. Please run the collocation analysis first.')
             return
-        fig = plot_bar(metrics_path)
+        try:
+            plot_bar = _import_plot_bar()
+            fig = plot_bar(metrics_path)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Plot Error', str(exc))
+            return
         if fig is not None:
             fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
 
@@ -3149,7 +3178,12 @@ class CollocationDialog(QDialog):
         else:
             legend_order = top_terms
 
-        fig = plot_rank_changes(df_top, legend_order=legend_order, show_term_labels=show_labels)
+        try:
+            plot_rank_changes = _import_plot_rank_changes()
+            fig = plot_rank_changes(df_top, legend_order=legend_order, show_term_labels=show_labels)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Plot Error', str(exc))
+            return
         fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
 
 if __name__ == '__main__':

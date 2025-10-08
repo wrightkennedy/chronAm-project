@@ -11,7 +11,27 @@ These functions are GUI-agnostic and can be called from PyQt handlers.
 from typing import Optional, Union, List
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import matplotlib
+
+
+_PLOT_BACKEND_INITIALIZED = False
+
+
+def _ensure_pyplot():
+    """Return matplotlib.pyplot with a Qt-friendly backend, falling back to Agg."""
+    global _PLOT_BACKEND_INITIALIZED
+    if not _PLOT_BACKEND_INITIALIZED:
+        try:
+            matplotlib.use("Qt5Agg", force=True)
+        except Exception:
+            try:
+                matplotlib.use("Agg", force=True)
+            except Exception:
+                # If even Agg failed we still attempt to import pyplot; it may already be set up.
+                pass
+        _PLOT_BACKEND_INITIALIZED = True
+    import matplotlib.pyplot as plt  # local import to avoid early backend init
+    return plt
 
 
 def _load_df(obj: Union[str, pd.DataFrame]) -> pd.DataFrame:
@@ -28,6 +48,7 @@ def _load_df(obj: Union[str, pd.DataFrame]) -> pd.DataFrame:
 
 def plot_bar(collocation_results: Union[str, pd.DataFrame], output_path: Optional[str] = None, top_n: int = 20):
     """Show or save a bar chart of the top-N collocates by frequency."""
+    plt = _ensure_pyplot()
     df = _load_df(collocation_results)
     if df.empty:
         raise ValueError("No data to plot.")
@@ -63,6 +84,7 @@ def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
     If top_n and home_bin_index are provided, the set of terms displayed is taken
     from the top-N terms in the specified bin index (1-based).
     """
+    plt = _ensure_pyplot()
     df = _load_df(df_or_path)
     required = {"time_bin","collocate_term","ordinal_rank"}
     if not required.issubset(df.columns):
