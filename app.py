@@ -1816,30 +1816,42 @@ class CollocateMapSettingsDialog(QDialog):
     def values(self) -> dict:
         term_scope = 'global'
         time_key = None
+        time_label = ''
         if self.time_radio.isChecked() and self.time_combo.count() > 0:
             term_scope = 'time'
             data = self.time_combo.currentData()
             time_key = str(data if data is not None else self.time_combo.currentText()).strip()
+            display_text = str(self.time_combo.currentText()).strip()
+            if display_text:
+                if ':' in display_text:
+                    time_label = display_text.split(':', 1)[1].strip()
+                else:
+                    time_label = display_text
 
         location_scope = 'all'
         city_val = ''
         state_val = ''
+        location_label = 'All cities'
         if self.loc_city_radio.isChecked() and self.city_combo.count() > 0:
             data = self.city_combo.currentData()
             if isinstance(data, tuple):
                 city_val, state_val = data
             location_scope = 'city'
+            location_label = str(self.city_combo.currentText()).strip() or 'Selected city'
         elif self.loc_state_radio.isChecked() and self.state_combo.count() > 0:
             location_scope = 'state'
             state_val = str(self.state_combo.currentText()).strip()
+            location_label = f'State: {state_val}' if state_val else 'Selected state'
 
         return {
             'top_n': self.top_spin.value(),
             'term_scope': term_scope,
             'time_key': time_key,
+            'time_label': time_label,
             'location_scope': location_scope,
             'location_city': str(city_val or ''),
             'location_state': str(state_val or ''),
+            'location_label': location_label,
         }
 
 
@@ -2791,9 +2803,11 @@ class CollocationDialog(QDialog):
         top_n = int(map_settings.get('top_n', 25))
         term_scope = map_settings.get('term_scope', 'global')
         time_key = map_settings.get('time_key') or None
+        time_label = map_settings.get('time_label') or ''
         location_scope = map_settings.get('location_scope', 'all')
         location_city = map_settings.get('location_city') or ''
         location_state = map_settings.get('location_state') or ''
+        location_label = map_settings.get('location_label') or ''
 
         try:
             # Create lightweight map with embedded collocate rank index
@@ -2819,6 +2833,8 @@ class CollocationDialog(QDialog):
                 collocate_rank_focus=location_scope,
                 collocate_rank_focus_city=location_city or None,
                 collocate_rank_focus_state=location_state or None,
+                collocate_rank_time_label=time_label or None,
+                collocate_rank_focus_label=location_label or None,
             )
         except Exception as exc:
             QMessageBox.critical(self, 'Map Error', str(exc))

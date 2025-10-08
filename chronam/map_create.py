@@ -66,12 +66,12 @@ def _build_collocate_rank_index(
     focus_state: Optional[str] = None,
     rank_limit: int = COLLOCATE_RANK_LIMIT,
     selector_limit: int = COLLOCATE_SELECTOR_LIMIT,
-) -> Tuple[List[str], Dict[str, Dict[str, Dict[str, int]]], int]:
+) -> Tuple[List[str], Dict[str, Dict[str, Dict[str, int]]], int, Dict[str, Dict[str, Set[int]]]]:
     term_tokens = [tok for tok in _tok(search_term or '', drop_stop=False) if tok]
     if drop_stopwords:
         term_tokens = [tok for tok in term_tokens if tok not in _STOPWORDS]
     if not term_tokens:
-        return [], {}, 0
+        return [], {}, 0, {}
 
     try:
         window_size = int(window)
@@ -104,6 +104,7 @@ def _build_collocate_rank_index(
     focus_state_counter: Counter = Counter()
     focus_state_time: Dict[str, Counter] = defaultdict(Counter)
     group_rank_data: Dict[str, Dict[str, Any]] = {}
+    city_term_hits: Dict[str, Dict[str, Set[int]]] = defaultdict(lambda: defaultdict(set))
     rank_max = 0
 
     for group in groups:
@@ -146,6 +147,7 @@ def _build_collocate_rank_index(
         group_counter: Counter = Counter()
         time_counters: Dict[str, Counter] = defaultdict(Counter)
         term_length = len(term_tokens)
+        term_hits = city_term_hits.setdefault(city_key, defaultdict(set))
 
         for idx, entry in enumerate(entries):
             article_text = entry.get('_article_full') or entry.get('props', {}).get('article')
@@ -166,6 +168,7 @@ def _build_collocate_rank_index(
                         continue
                     group_counter[tok] += 1
                     global_counts[tok] += 1
+                    term_hits[tok].add(idx)
                     for time_key in index_time_keys.get(idx, ()):  # time-specific accumulation
                         time_counters[time_key][tok] += 1
 
@@ -198,7 +201,7 @@ def _build_collocate_rank_index(
         }
 
     if not global_counts:
-        return [], {}, 0
+        return [], {}, 0, {}
 
     base_counter = global_counts
     base_time = aggregate_time_global
@@ -223,6 +226,18 @@ def _build_collocate_rank_index(
 
     selected_terms_set = set(selected_terms_ordered)
     selector_cap = min(selector_limit, max(top_limit, len(selected_terms_ordered)))
+
+    hits_result: Dict[str, Dict[str, Set[int]]] = {}
+    for city_key, term_map in city_term_hits.items():
+        filtered_terms: Dict[str, Set[int]] = {}
+        for term, indexes in term_map.items():
+            if not indexes:
+                continue
+            if selected_terms_set and term not in selected_terms_set:
+                continue
+            filtered_terms[term] = set(indexes)
+        if filtered_terms:
+            hits_result[city_key] = filtered_terms
 
     for city_key, data in group_rank_data.items():
         ordered_terms = data.get('ordered') or []
@@ -254,10 +269,10 @@ def _build_collocate_rank_index(
                 rank_max = max(rank_max, len(rank_map_time))
 
     if not selected_terms_ordered:
-        return [], rank_index, rank_max
+        return [], rank_index, rank_max, hits_result
 
     collocate_terms_list = selected_terms_ordered[:selector_cap]
-    return collocate_terms_list, rank_index, rank_max
+    return collocate_terms_list, rank_index, rank_max, hits_result
 
 
 # ----------------------------
@@ -320,6 +335,15 @@ def _sanitize_element_id(raw: str) -> str:
     if not safe:
         safe = f"id_{uuid.uuid4().hex}"
     return safe
+
+
+def _slug(value: Any) -> str:
+    text = str(value or '').strip().lower()
+    if not text:
+        return 'value'
+    text = re.sub(r'[^a-z0-9]+', '-', text)
+    text = text.strip('-')
+    return text or 'value'
 
 
 def _highlight_term(text: str, term: Optional[str]) -> str:
@@ -1209,6 +1233,8 @@ def create_map(
     collocate_rank_focus: str = 'all',
     collocate_rank_focus_city: Optional[str] = None,
     collocate_rank_focus_state: Optional[str] = None,
+    collocate_rank_time_label: Optional[str] = None,
+    collocate_rank_focus_label: Optional[str] = None,
 ) -> Dict[str, Optional[str]]:
     """
     Create a leaflet map next to the GeoJSON.
@@ -1380,10 +1406,16 @@ def create_map(
         except (TypeError, ValueError, IndexError):
             loc_lon = 0.0
 
-        entry_payloads = [
-            _entry_payload(entry, search_term, embed_article=embed_articles, lightweight=lightweight)
-            for entry in entries
-        ]
+        entry_payloads = []
+        for entry_idx, entry in enumerate(entries):
+            payload = _entry_payload(
+                entry,
+                search_term,
+                embed_article=embed_articles,
+                lightweight=lightweight,
+            )
+            payload['full_index'] = entry_idx
+            entry_payloads.append(payload)
 
         for entry in entries:
             entry["value"] = value
@@ -1462,8 +1494,9 @@ def create_map(
     collocate_terms_list: List[str] = []
     rank_index: Dict[str, Dict[str, Dict[str, int]]] = {}
     rank_max_value = 0
+    collocate_hits_by_city: Dict[str, Dict[str, Set[int]]] = {}
     if collocate_rank_mode:
-        collocate_terms_list, rank_index, rank_max_value = _build_collocate_rank_index(
+        collocate_terms_list, rank_index, rank_max_value, collocate_hits_by_city = _build_collocate_rank_index(
             groups,
             popup_dataset,
             search_term,
@@ -1477,6 +1510,34 @@ def create_map(
             focus_city=collocate_rank_focus_city,
             focus_state=collocate_rank_focus_state,
         )
+        if collocate_hits_by_city:
+            for group in groups:
+                group_id = group.get('id')
+                if not group_id:
+                    continue
+                dataset_entry = popup_dataset.get(group_id)
+                if not isinstance(dataset_entry, dict):
+                    continue
+                city_val = dataset_entry.get('city')
+                state_val = dataset_entry.get('state')
+                city_key = _city_state_key(city_val, state_val)
+                term_map = collocate_hits_by_city.get(city_key)
+                if not term_map:
+                    continue
+                hits_for_dataset: Dict[str, List[int]] = {}
+                for term, indexes in term_map.items():
+                    if not indexes:
+                        continue
+                    normalized_indexes: Set[int] = set()
+                    for idx in indexes:
+                        try:
+                            normalized_indexes.add(int(idx))
+                        except (TypeError, ValueError):
+                            continue
+                    if normalized_indexes:
+                        hits_for_dataset[term] = sorted(normalized_indexes)
+                if hits_for_dataset:
+                    dataset_entry['collocate_hits'] = hits_for_dataset
 
     if groups and not any(v > 0 for v in values):
         for group in groups:
@@ -1577,6 +1638,23 @@ def create_map(
         suffix_parts.append('norm')
     if lightweight:
         suffix_parts.append('lite')
+    if collocate_rank_mode:
+        scope_tag = 'global'
+        if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time'):
+            key_val = (collocate_rank_time_key or '').strip()
+            scope_tag = f'time-{key_val}' if key_val else 'time'
+        suffix_parts.append(f'scope-{_slug(scope_tag)}')
+
+        focus_mode_norm = (collocate_rank_focus or 'all').strip().lower()
+        focus_tag = focus_mode_norm or 'all'
+        if focus_mode_norm == 'city':
+            components = [collocate_rank_focus_city or '']
+            if collocate_rank_focus_state:
+                components.append(collocate_rank_focus_state)
+            focus_tag = 'city-' + '-'.join(filter(None, components))
+        elif focus_mode_norm == 'state':
+            focus_tag = f"state-{collocate_rank_focus_state or ''}"
+        suffix_parts.append(f'focus-{_slug(focus_tag)}')
     suffix_parts.append(timestamp)
     suffix = '_'.join(suffix_parts)
 
@@ -1843,6 +1921,36 @@ def create_map(
             '<div style="font-size:12px; color:#555;">Lightweight mode: popups and table trimmed for size.</div>'
         )
 
+    if collocate_rank_mode:
+        scope_desc = 'Entire period'
+        if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time'):
+            key_text = collocate_rank_time_key or ''
+            if collocate_rank_time_label:
+                scope_desc = f'Time bin {key_text}: {collocate_rank_time_label}'
+            elif key_text:
+                scope_desc = f'Time bin {key_text}'
+            else:
+                scope_desc = 'Selected time bin'
+        header_lines.append(
+            f'<div><strong>Selected time bin:</strong> {_esc(scope_desc)}</div>'
+        )
+
+        focus_mode_norm = (collocate_rank_focus or '').strip().lower()
+        if collocate_rank_focus_label:
+            focus_desc = collocate_rank_focus_label
+        elif focus_mode_norm == 'city' and collocate_rank_focus_city:
+            if collocate_rank_focus_state:
+                focus_desc = f'City — {collocate_rank_focus_city}, {collocate_rank_focus_state}'
+            else:
+                focus_desc = f'City — {collocate_rank_focus_city}'
+        elif focus_mode_norm == 'state' and collocate_rank_focus_state:
+            focus_desc = f'State — {collocate_rank_focus_state}'
+        else:
+            focus_desc = 'All cities'
+        header_lines.append(
+            f'<div><strong>Geography filter:</strong> {_esc(focus_desc)}</div>'
+        )
+
     # Add collocate term selector when rank index is available
     if collocate_terms_list:
         select_opts = ''.join(f'<option value="{_esc(t)}">{_esc(t)}</option>' for t in collocate_terms_list[:200])
@@ -1879,6 +1987,30 @@ def create_map(
     )
     m.get_root().html.add_child(folium.Element(header_html))
 
+    if rank_index:
+        label_style = (
+            '<style>'
+            '.collocate-rank-label { '
+            'background: transparent; '
+            'border: none; '
+            'box-shadow: none; '
+            'color: #ffffff; '
+            'font-weight: 600; '
+            'pointer-events: none; '
+            'padding: 0; '
+            'margin: 0; '
+            'text-shadow: 0 1px 2px rgba(0,0,0,0.55); '
+            '}'
+            '.collocate-rank-label:before { display: none; }'
+            '.collocate-rank-label .leaflet-tooltip-content { '
+            'margin: 0 !important; '
+            'padding: 0 !important; '
+            'line-height: 1; '
+            '}'
+            '</style>'
+        )
+        m.get_root().html.add_child(folium.Element(label_style))
+
     config_payload = {
         'attribute_table': os.path.basename(attr_file) if attr_file else '',
         'search_term': search_term or '',
@@ -1901,6 +2033,8 @@ def create_map(
             'focus': collocate_rank_focus,
             'focus_city': collocate_rank_focus_city or '',
             'focus_state': collocate_rank_focus_state or '',
+            'time_label': collocate_rank_time_label or '',
+            'focus_label': collocate_rank_focus_label or '',
         }
     config_json = json.dumps(config_payload, ensure_ascii=False).replace('</', '<\\/')
     config_script = (
@@ -2353,22 +2487,34 @@ def create_map(
     return Math.max(rMin, Math.min(rMax, rMin + t * (rMax - rMin)));
   }
   function refreshCollocateSizes(mapObj) {
-    if (!collocateRanks || !selectedCollocate || !mapObj || typeof mapObj.eachLayer !== 'function') return;
-    var timeKey = currentTimeKey(mapObj);
-    loadData(function(dataset){
-      mapObj.eachLayer(function(layer){
-        if (!layer || !layer.options || !layer.options.groupId) return;
+    if (!mapObj || typeof mapObj.eachLayer !== 'function') {
+      return;
+    }
+    loadData(function(dataset) {
+      if (!dataset) {
+        return;
+      }
+      applyCollocateFilterToDataset(dataset);
+      var timeKey = currentTimeKey(mapObj);
+      mapObj.eachLayer(function(layer) {
+        if (!layer || !layer.options || !layer.options.groupId) {
+          return;
+        }
         var gid = layer.options.groupId;
         var data = dataset[gid];
-        if (!data) return;
-        var ck = cityKey(data.city, data.state);
+        if (!data) {
+          return;
+        }
         var rank = null;
-        var byCity = collocateRanks[ck];
-        if (byCity) {
-          if (timeKey && byCity[timeKey] && Object.prototype.hasOwnProperty.call(byCity[timeKey], selectedCollocate)) {
-            rank = byCity[timeKey][selectedCollocate];
-          } else if (byCity[''] && Object.prototype.hasOwnProperty.call(byCity[''], selectedCollocate)) {
-            rank = byCity[''][selectedCollocate];
+        if (collocateRanks && selectedCollocate) {
+          var ck = cityKey(data.city, data.state);
+          var byCity = collocateRanks[ck];
+          if (byCity) {
+            if (timeKey && byCity[timeKey] && Object.prototype.hasOwnProperty.call(byCity[timeKey], selectedCollocate)) {
+              rank = byCity[timeKey][selectedCollocate];
+            } else if (byCity[''] && Object.prototype.hasOwnProperty.call(byCity[''], selectedCollocate)) {
+              rank = byCity[''][selectedCollocate];
+            }
           }
         }
         var radius = rankToRadius(rank);
@@ -2376,9 +2522,75 @@ def create_map(
           layer.setRadius(radius);
         } else if (layer.options) {
           layer.options.radius = radius;
-          if (layer._radius && typeof layer.redraw === 'function') { try { layer.redraw(); } catch(e){} }
+          if (layer._radius && typeof layer.redraw === 'function') {
+            try { layer.redraw(); } catch (e) {}
+          }
+        }
+        if (layer.options) {
+          layer.options.collocateRank = rank;
+        }
+        var labelText = '';
+        if (Number.isFinite(rank) && rank > 0) {
+          labelText = String(Math.round(rank));
+        }
+        if (typeof layer.bindTooltip === 'function') {
+          var tooltip = (typeof layer.getTooltip === 'function') ? layer.getTooltip() : null;
+          if (!tooltip) {
+            try {
+              layer.bindTooltip(labelText, {
+                permanent: true,
+                direction: 'center',
+                className: 'collocate-rank-label',
+                opacity: 1,
+              });
+              tooltip = (typeof layer.getTooltip === 'function') ? layer.getTooltip() : null;
+            } catch (tooltipErr) {
+              tooltip = null;
+            }
+          }
+          if (typeof layer.setTooltipContent === 'function') {
+            try { layer.setTooltipContent(labelText); } catch (setErr) {}
+          } else if (tooltip && typeof tooltip.setContent === 'function') {
+            tooltip.setContent(labelText);
+          }
+          var tooltipEl = null;
+          if (tooltip && typeof tooltip.getElement === 'function') {
+            tooltipEl = tooltip.getElement();
+          } else {
+            var tmpTooltip = (typeof layer.getTooltip === 'function') ? layer.getTooltip() : null;
+            if (tmpTooltip && typeof tmpTooltip.getElement === 'function') {
+              tooltipEl = tmpTooltip.getElement();
+            }
+          }
+          if (tooltipEl) {
+            tooltipEl.style.display = labelText ? '' : 'none';
+            var fontSize = Math.max(11, Math.round(radius * 1.05));
+            tooltipEl.style.fontSize = fontSize + 'px';
+          }
+        }
+        var visible = data.entries && data.entries.length > 0;
+        var baseOpacity = (typeof layer.options.baseOpacity === 'number') ? layer.options.baseOpacity : (typeof layer.options.opacity === 'number' ? layer.options.opacity : 0.5);
+        var baseFill = (typeof layer.options.baseFillOpacity === 'number') ? layer.options.baseFillOpacity : (typeof layer.options.fillOpacity === 'number' ? layer.options.fillOpacity : 0.85);
+        if (typeof layer.setStyle === 'function') {
+          layer.setStyle({
+            opacity: visible ? baseOpacity : 0,
+            fillOpacity: visible ? baseFill : 0,
+          });
+        }
+        var isGhost = !!layer.options.ghostMarker;
+        layer.options.interactive = isGhost ? false : !!visible;
+        if (layer._path && layer._path.style) {
+          layer._path.style.pointerEvents = (visible && !isGhost) ? 'auto' : 'none';
+        }
+        if (!visible && typeof layer.closePopup === 'function') {
+          layer.closePopup();
+        }
+        if (!visible && currentHighlightId === gid) {
+          clearHighlight();
         }
       });
+      refreshPopupAfterFilter(mapObj);
+      updateHighlightFromDataset(dataset);
     });
   }
 
@@ -2391,6 +2603,21 @@ def create_map(
     } catch (err) {
       console.error('Failed to parse map popup data', err);
       popupCache = {};
+    }
+    if (popupCache && typeof popupCache === 'object') {
+      Object.keys(popupCache).forEach(function(key) {
+        var data = popupCache[key];
+        if (!data) {
+          return;
+        }
+        if (!Array.isArray(data.full_entries) && Array.isArray(data.entries)) {
+          data.full_entries = data.entries.slice();
+        }
+        var baseSource = Array.isArray(data.full_entries) ? data.full_entries : (Array.isArray(data.entries) ? data.entries : []);
+        var baseCount = Number.isFinite(data.full_article_count) ? Number(data.full_article_count) : (Array.isArray(baseSource) ? baseSource.length : 0);
+        setBaseEntries(data, baseSource, baseCount);
+      });
+      applyCollocateFilterToDataset(popupCache);
     }
     callback(popupCache);
   }
@@ -2450,6 +2677,135 @@ def create_map(
       }
     }
     return keys;
+  }
+
+  function setBaseEntries(data, entries, articleCount) {
+    if (!data) {
+      return;
+    }
+    var base = Array.isArray(entries) ? entries.slice() : [];
+    data._baseEntries = base;
+    if (Number.isFinite(articleCount)) {
+      data._baseArticleCount = Number(articleCount);
+    } else if (typeof data._baseArticleCount === 'number' && Number.isFinite(data._baseArticleCount)) {
+      // keep existing base article count
+    } else {
+      data._baseArticleCount = base.length;
+    }
+  }
+
+  function ensureBaseEntries(data) {
+    if (!data) {
+      return;
+    }
+    if (!Array.isArray(data._baseEntries)) {
+      var source = [];
+      if (Array.isArray(data.entries)) {
+        source = data.entries.slice();
+      } else if (Array.isArray(data.full_entries)) {
+        source = data.full_entries.slice();
+      }
+      data._baseEntries = source;
+      if (!Number.isFinite(data._baseArticleCount)) {
+        if (Number.isFinite(data.article_count)) {
+          data._baseArticleCount = Number(data.article_count);
+        } else if (Number.isFinite(data.full_article_count)) {
+          data._baseArticleCount = Number(data.full_article_count);
+        } else {
+          data._baseArticleCount = source.length;
+        }
+      }
+    }
+  }
+
+  function applyCollocateFilterToData(data) {
+    if (!data) {
+      return;
+    }
+    ensureBaseEntries(data);
+    var baseEntries = Array.isArray(data._baseEntries) ? data._baseEntries : [];
+    var baseCount = Number.isFinite(data._baseArticleCount) ? Number(data._baseArticleCount) : baseEntries.length;
+    if (!selectedCollocate) {
+      data.entries = baseEntries.slice();
+      data.article_count = baseCount;
+      return;
+    }
+    if (!data.collocate_hits || !Object.prototype.hasOwnProperty.call(data.collocate_hits, selectedCollocate)) {
+      data.entries = [];
+      data.article_count = 0;
+      return;
+    }
+    var hitsList = data.collocate_hits[selectedCollocate];
+    if (!Array.isArray(hitsList) || !hitsList.length) {
+      data.entries = [];
+      data.article_count = 0;
+      return;
+    }
+    var allowed = new Set();
+    hitsList.forEach(function(idx) {
+      var num = Number(idx);
+      if (Number.isFinite(num)) {
+        allowed.add(num);
+      }
+    });
+    if (!allowed.size) {
+      data.entries = [];
+      data.article_count = 0;
+      return;
+    }
+    var filtered = [];
+    baseEntries.forEach(function(entry) {
+      if (!entry) {
+        return;
+      }
+      var idx = Number(entry.full_index);
+      if (Number.isFinite(idx) && allowed.has(idx)) {
+        filtered.push(entry);
+      }
+    });
+    data.entries = filtered;
+    data.article_count = filtered.length;
+  }
+
+  function applyCollocateFilterToDataset(dataset) {
+    if (!dataset) {
+      return;
+    }
+    Object.keys(dataset).forEach(function(key) {
+      applyCollocateFilterToData(dataset[key]);
+    });
+  }
+
+  function refreshPopupAfterFilter(mapObj) {
+    if (!mapObj) {
+      return;
+    }
+    if (mapObj._popup && typeof mapObj._popup.getElement === 'function') {
+      var popupEl = mapObj._popup.getElement();
+      if (popupEl) {
+        var root = popupEl.querySelector('[data-popup-root="1"]');
+        if (root) {
+          attach(root);
+          attachDockToggle(root, mapObj, mapObj._popup);
+        }
+      }
+    }
+    var dockPanel = document.querySelector('[data-dock-panel]');
+    if (dockPanel && dockPanel.style.display !== 'none') {
+      var dockRoot = dockPanel.querySelector('[data-popup-root="1"]');
+      if (dockRoot) {
+        attach(dockRoot);
+        var dockBtn = dockRoot.querySelector('[data-dock-toggle="1"]');
+        updateDockButtonState(dockRoot, dockBtn);
+        if (dockState.root === dockRoot) {
+          var latNum = dockRoot.dataset && dockRoot.dataset.lat ? Number(dockRoot.dataset.lat) : NaN;
+          var lonNum = dockRoot.dataset && dockRoot.dataset.lon ? Number(dockRoot.dataset.lon) : NaN;
+          dockState.lat = Number.isFinite(latNum) ? latNum : dockState.lat;
+          dockState.lon = Number.isFinite(lonNum) ? lonNum : dockState.lon;
+        }
+      }
+    }
+    refreshPinnedEntries();
   }
 
   function clearHighlight() {
@@ -2518,6 +2874,19 @@ def create_map(
     }
     drawHighlight(coords);
     currentHighlightId = gid;
+  }
+
+  function updateHighlightFromDataset(dataset) {
+    if (currentHighlightId && dataset && dataset[currentHighlightId]) {
+      var highlightedData = dataset[currentHighlightId];
+      if (highlightedData && highlightedData.entries && highlightedData.entries.length) {
+        setHighlightForGroup(currentHighlightId, highlightedData);
+        return;
+      }
+    }
+    if (currentHighlightId) {
+      clearHighlight();
+    }
   }
 
   function collectNearbyGroupIds(latlng, mapObj, dataset) {
@@ -2840,61 +3209,79 @@ def create_map(
         if (typeof data.full_title === 'undefined') {
           data.full_title = data.title || '';
         }
-        if (!data.time_bins) {
-          data.entries = data.full_entries.slice();
-          data.value = data.full_value;
-          data.article_count = data.full_article_count;
-          data.title = data.full_title;
-          data.time_label = '';
-          data._hasTimeFilter = false;
-          return;
-        }
-        data._hasTimeFilter = true;
-        var bin = null;
-        for (var ck = 0; ck < currentKeys.length; ck++) {
-          var attempt = currentKeys[ck];
-          if (!attempt) {
-            continue;
-          }
-          if (data.time_bins && Object.prototype.hasOwnProperty.call(data.time_bins, attempt)) {
-            bin = data.time_bins[attempt];
-            if (bin) {
-              break;
+        var entriesResult = [];
+        var valueResult = data.full_value;
+        var countResult = data.full_article_count;
+        var titleResult = data.full_title;
+        var timeLabelResult = '';
+        var hasTimeFilter = false;
+        if (data.time_bins) {
+          hasTimeFilter = true;
+          var bin = null;
+          for (var ck = 0; ck < currentKeys.length; ck++) {
+            var attempt = currentKeys[ck];
+            if (!attempt) {
+              continue;
             }
-          }
-          if (Array.isArray(timeLabels) && timeLabels.length) {
-            var idxCandidate = Number(attempt);
-            if (Number.isFinite(idxCandidate) && idxCandidate >= 1 && idxCandidate <= timeLabels.length) {
-              var altKey = timeLabels[idxCandidate - 1];
-              if (altKey && data.time_bins && Object.prototype.hasOwnProperty.call(data.time_bins, altKey)) {
-                bin = data.time_bins[altKey];
-                if (bin) {
-                  break;
+            if (data.time_bins && Object.prototype.hasOwnProperty.call(data.time_bins, attempt)) {
+              bin = data.time_bins[attempt];
+              if (bin) {
+                break;
+              }
+            }
+            if (Array.isArray(timeLabels) && timeLabels.length) {
+              var idxCandidate = Number(attempt);
+              if (Number.isFinite(idxCandidate) && idxCandidate >= 1 && idxCandidate <= timeLabels.length) {
+                var altKey = timeLabels[idxCandidate - 1];
+                if (altKey && data.time_bins && Object.prototype.hasOwnProperty.call(data.time_bins, altKey)) {
+                  bin = data.time_bins[altKey];
+                  if (bin) {
+                    break;
+                  }
                 }
               }
             }
           }
-        }
-        if (bin && Array.isArray(bin.indexes) && bin.indexes.length) {
-          var mapped = [];
-          bin.indexes.forEach(function(idx) {
-            if (idx >= 0 && idx < data.full_entries.length) {
-              var payload = data.full_entries[idx];
-              if (payload) mapped.push(payload);
-            }
-          });
-          data.entries = mapped;
-          data.value = (typeof bin.value !== 'undefined') ? bin.value : data.full_value;
-          data.article_count = (typeof bin.article_count !== 'undefined') ? bin.article_count : mapped.length;
-          data.title = bin.title || data.full_title;
-          data.time_label = bin.time_label || '';
+          if (bin && Array.isArray(bin.indexes) && bin.indexes.length) {
+            var mapped = [];
+            bin.indexes.forEach(function(idx) {
+              if (idx >= 0 && idx < data.full_entries.length) {
+                var payload = data.full_entries[idx];
+                if (payload) {
+                  mapped.push(payload);
+                }
+              }
+            });
+            entriesResult = mapped;
+            valueResult = (typeof bin.value !== 'undefined') ? bin.value : data.full_value;
+            countResult = (typeof bin.article_count !== 'undefined') ? bin.article_count : mapped.length;
+            titleResult = bin.title || data.full_title;
+            timeLabelResult = bin.time_label || '';
+          } else {
+            entriesResult = [];
+            valueResult = 0;
+            countResult = 0;
+            titleResult = data.full_title;
+            timeLabelResult = '';
+          }
         } else {
-          data.entries = [];
-          data.value = 0;
-          data.article_count = 0;
-          data.title = data.full_title;
-          data.time_label = '';
+          entriesResult = data.full_entries.slice();
+          if (!entriesResult.length && Array.isArray(data.entries)) {
+            entriesResult = data.entries.slice();
+          }
+          valueResult = data.full_value;
+          countResult = data.full_article_count;
+          titleResult = data.full_title;
+          timeLabelResult = '';
         }
+        data.entries = entriesResult;
+        if (typeof valueResult !== 'undefined') {
+          data.value = valueResult;
+        }
+        data.article_count = Number.isFinite(countResult) ? Number(countResult) : entriesResult.length;
+        data.title = titleResult;
+        data.time_label = timeLabelResult;
+        data._hasTimeFilter = hasTimeFilter;
       });
 
       keys.forEach(function(key) {
@@ -2907,7 +3294,7 @@ def create_map(
         var combinedValue = 0;
         data.member_ids.forEach(function(mid) {
           var source = dataset[mid];
-          if (!source || !source.entries || !source.entries.length) {
+          if (!source || !Array.isArray(source.entries) || !source.entries.length) {
             return;
           }
           source.entries.forEach(function(entry) {
@@ -2942,6 +3329,15 @@ def create_map(
         }
       });
 
+      keys.forEach(function(key) {
+        var data = dataset[key];
+        if (!data) {
+          return;
+        }
+        setBaseEntries(data, data.entries, data.article_count);
+      });
+      applyCollocateFilterToDataset(dataset);
+
       if (typeof mapObj.eachLayer === 'function') {
         mapObj.eachLayer(function(layer) {
           if (!layer || !layer.options || !layer.options.groupId) {
@@ -2974,41 +3370,11 @@ def create_map(
           }
         });
       }
-      if (mapObj._popup && typeof mapObj._popup.getElement === 'function') {
-        var popupEl = mapObj._popup.getElement();
-        if (popupEl) {
-          var root = popupEl.querySelector('[data-popup-root="1"]');
-          if (root) {
-            attach(root);
-            attachDockToggle(root, mapObj, mapObj._popup);
-          }
-        }
-      }
-      var dockPanel = document.querySelector('[data-dock-panel]');
-      if (dockPanel && dockPanel.style.display !== 'none') {
-        var dockRoot = dockPanel.querySelector('[data-popup-root="1"]');
-        if (dockRoot) {
-          attach(dockRoot);
-          var dockBtn = dockRoot.querySelector('[data-dock-toggle="1"]');
-          updateDockButtonState(dockRoot, dockBtn);
-          if (dockState.root === dockRoot) {
-            var latNum = dockRoot.dataset && dockRoot.dataset.lat ? Number(dockRoot.dataset.lat) : NaN;
-            var lonNum = dockRoot.dataset && dockRoot.dataset.lon ? Number(dockRoot.dataset.lon) : NaN;
-            dockState.lat = Number.isFinite(latNum) ? latNum : dockState.lat;
-            dockState.lon = Number.isFinite(lonNum) ? lonNum : dockState.lon;
-          }
-        }
-      }
-      refreshPinnedEntries();
-      // Update sizes for collocate selection
-      if (collocateRanks && selectedCollocate) { refreshCollocateSizes(mapObj); }
-      if (currentHighlightId && dataset[currentHighlightId]) {
-        var highlightedData = dataset[currentHighlightId];
-        if (highlightedData && highlightedData.entries && highlightedData.entries.length) {
-          setHighlightForGroup(currentHighlightId, highlightedData);
-        } else {
-          clearHighlight();
-        }
+      refreshPopupAfterFilter(mapObj);
+      if (collocateRanks && selectedCollocate) {
+        refreshCollocateSizes(mapObj);
+      } else {
+        updateHighlightFromDataset(dataset);
       }
     });
   }
