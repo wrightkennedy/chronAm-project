@@ -58,6 +58,12 @@ def _build_collocate_rank_index(
     drop_stopwords: bool,
     window: int,
     drop_terms: Optional[List[str]],
+    top_n: int = COLLOCATE_RANK_LIMIT,
+    term_scope: str = 'global',
+    time_key: Optional[str] = None,
+    focus_mode: str = 'all',
+    focus_city: Optional[str] = None,
+    focus_state: Optional[str] = None,
     rank_limit: int = COLLOCATE_RANK_LIMIT,
     selector_limit: int = COLLOCATE_SELECTOR_LIMIT,
 ) -> Tuple[List[str], Dict[str, Dict[str, Dict[str, int]]], int]:
@@ -79,9 +85,25 @@ def _build_collocate_rank_index(
         if isinstance(term, str) and str(term).strip()
     }
 
+    try:
+        requested_top = int(top_n)
+    except (TypeError, ValueError):
+        requested_top = rank_limit
+    top_limit = max(1, min(requested_top, rank_limit))
+
+    term_scope_norm = str(term_scope or 'global').strip().lower()
+    focus_mode_norm = str(focus_mode or 'all').strip().lower()
+    focus_city_norm = str(focus_city or '').strip().lower()
+    focus_state_norm = str(focus_state or '').strip().lower()
+
     rank_index: Dict[str, Dict[str, Dict[str, int]]] = {}
-    collocate_terms_used: Set[str] = set()
     global_counts: Counter = Counter()
+    aggregate_time_global: Dict[str, Counter] = defaultdict(Counter)
+    focus_city_counter: Counter = Counter()
+    focus_city_time: Dict[str, Counter] = defaultdict(Counter)
+    focus_state_counter: Counter = Counter()
+    focus_state_time: Dict[str, Counter] = defaultdict(Counter)
+    group_rank_data: Dict[str, Dict[str, Any]] = {}
     rank_max = 0
 
     for group in groups:
@@ -116,7 +138,11 @@ def _build_collocate_rank_index(
                             bucket.add(key_variant)
 
         first_props = entries[0].get('props', {}) if entries else {}
-        city_key = _city_state_key(first_props.get('City'), first_props.get('State'))
+        city_raw = first_props.get('City')
+        state_raw = first_props.get('State')
+        city_key = _city_state_key(city_raw, state_raw)
+        city_norm = str(city_raw or '').strip().lower()
+        state_norm = str(state_raw or '').strip().lower()
         group_counter: Counter = Counter()
         time_counters: Dict[str, Counter] = defaultdict(Counter)
         term_length = len(term_tokens)
@@ -146,41 +172,91 @@ def _build_collocate_rank_index(
         if not group_counter:
             continue
 
-        ordered_terms = _sorted_counter_terms(group_counter)
-        limited_terms = ordered_terms[:max(1, rank_limit)]
-        rank_map = {term: pos + 1 for pos, (term, _freq) in enumerate(limited_terms)}
-        if not rank_map:
-            continue
+        for key, counter in time_counters.items():
+            if counter:
+                aggregate_time_global[key].update(counter)
 
-        city_entry = rank_index.setdefault(city_key, {})
-        city_entry[''] = rank_map
-        collocate_terms_used.update(rank_map.keys())
-        rank_max = max(rank_max, len(rank_map))
+        if focus_mode_norm == 'city' and focus_city_norm:
+            city_match = city_norm == focus_city_norm and (
+                not focus_state_norm or state_norm == focus_state_norm
+            )
+            if city_match:
+                focus_city_counter.update(group_counter)
+                for key, counter in time_counters.items():
+                    if counter:
+                        focus_city_time[key].update(counter)
+        elif focus_mode_norm == 'state' and focus_state_norm:
+            if state_norm == focus_state_norm and state_norm:
+                focus_state_counter.update(group_counter)
+                for key, counter in time_counters.items():
+                    if counter:
+                        focus_state_time[key].update(counter)
 
-        for time_key, counter in time_counters.items():
-            if not counter:
-                continue
-            ordered_time_terms = _sorted_counter_terms(counter)
-            limited_time_terms = ordered_time_terms[:max(1, rank_limit)]
-            if not limited_time_terms:
-                continue
-            rank_map_time = {term: pos + 1 for pos, (term, _freq) in enumerate(limited_time_terms)}
-            if rank_map_time:
-                city_entry[time_key] = rank_map_time
-                collocate_terms_used.update(rank_map_time.keys())
-                rank_max = max(rank_max, len(rank_map_time))
+        group_rank_data[city_key] = {
+            'ordered': _sorted_counter_terms(group_counter),
+            'time': time_counters,
+        }
 
-    if not collocate_terms_used:
+    if not global_counts:
         return [], {}, 0
 
-    ordered_global = [
-        term
-        for term, _freq in _sorted_counter_terms(global_counts)
-        if term in collocate_terms_used
-    ]
-    selector_cap = max(rank_limit, selector_limit)
-    collocate_terms_list = ordered_global[:selector_cap]
+    base_counter = global_counts
+    base_time = aggregate_time_global
+    if focus_mode_norm == 'city' and focus_city_counter:
+        base_counter = focus_city_counter
+        base_time = focus_city_time
+    elif focus_mode_norm == 'state' and focus_state_counter:
+        base_counter = focus_state_counter
+        base_time = focus_state_time
 
+    selected_terms_ordered = [term for term, _freq in _sorted_counter_terms(base_counter) if term][:top_limit]
+    if term_scope_norm.startswith('time') and time_key:
+        selected_counter = base_time.get(str(time_key)) or base_time.get(str(time_key).strip())
+        if not selected_counter:
+            selected_counter = aggregate_time_global.get(str(time_key))
+        if selected_counter:
+            scoped_terms = [term for term, _freq in _sorted_counter_terms(selected_counter) if term][:top_limit]
+            if scoped_terms:
+                selected_terms_ordered = scoped_terms
+    if not selected_terms_ordered:
+        selected_terms_ordered = [term for term, _freq in _sorted_counter_terms(global_counts) if term][:top_limit]
+
+    selected_terms_set = set(selected_terms_ordered)
+    selector_cap = min(selector_limit, max(top_limit, len(selected_terms_ordered)))
+
+    for city_key, data in group_rank_data.items():
+        ordered_terms = data.get('ordered') or []
+        limited_terms = ordered_terms[:rank_limit]
+        if selected_terms_set:
+            limited_terms = [item for item in limited_terms if item[0] in selected_terms_set]
+        limited_terms = limited_terms[:top_limit]
+        if limited_terms:
+            rank_map = {term: pos + 1 for pos, (term, _freq) in enumerate(limited_terms)}
+            if rank_map:
+                city_entry = rank_index.setdefault(city_key, {})
+                city_entry[''] = rank_map
+                rank_max = max(rank_max, len(rank_map))
+        time_counters = data.get('time') or {}
+        for key, counter in time_counters.items():
+            if not counter:
+                continue
+            ordered_time = _sorted_counter_terms(counter)
+            ordered_time = ordered_time[:rank_limit]
+            if selected_terms_set:
+                ordered_time = [item for item in ordered_time if item[0] in selected_terms_set]
+            ordered_time = ordered_time[:top_limit]
+            if not ordered_time:
+                continue
+            rank_map_time = {term: pos + 1 for pos, (term, _freq) in enumerate(ordered_time)}
+            if rank_map_time:
+                city_entry = rank_index.setdefault(city_key, {})
+                city_entry[key] = rank_map_time
+                rank_max = max(rank_max, len(rank_map_time))
+
+    if not selected_terms_ordered:
+        return [], rank_index, rank_max
+
+    collocate_terms_list = selected_terms_ordered[:selector_cap]
     return collocate_terms_list, rank_index, rank_max
 
 
@@ -1127,6 +1203,12 @@ def create_map(
     collocate_drop_stopwords: bool = False,
     collocate_window: int = 5,
     collocate_drop_terms: Optional[List[str]] = None,
+    collocate_rank_top_n: int = COLLOCATE_RANK_LIMIT,
+    collocate_rank_term_scope: str = 'global',
+    collocate_rank_time_key: Optional[str] = None,
+    collocate_rank_focus: str = 'all',
+    collocate_rank_focus_city: Optional[str] = None,
+    collocate_rank_focus_state: Optional[str] = None,
 ) -> Dict[str, Optional[str]]:
     """
     Create a leaflet map next to the GeoJSON.
@@ -1156,6 +1238,11 @@ def create_map(
       - table_row_limit: optional max rows in attribute table (None/<=0 for all rows).
       - collocate_rank_mode / collocate_drop_stopwords / collocate_window / collocate_drop_terms: configure
         lightweight collocate rank visualisation on point maps.
+      - collocate_rank_top_n: limit collocate list and rank output to the top-N terms (default 150).
+      - collocate_rank_term_scope: 'global' to rank across entire period, 'time' to use a specific time bin.
+      - collocate_rank_time_key: time-bin key (1-based index) when collocate_rank_term_scope='time'.
+      - collocate_rank_focus: 'all' (default), 'city', or 'state' to control which locations determine the top terms.
+      - collocate_rank_focus_city / collocate_rank_focus_state: labels used when collocate_rank_focus filters by city or state.
 
     Returns:
         dict with 'map_path' and optional 'attribute_table'.
@@ -1383,6 +1470,12 @@ def create_map(
             drop_stopwords=collocate_drop_stopwords,
             window=collocate_window,
             drop_terms=collocate_drop_terms,
+            top_n=collocate_rank_top_n,
+            term_scope=collocate_rank_term_scope,
+            time_key=collocate_rank_time_key,
+            focus_mode=collocate_rank_focus,
+            focus_city=collocate_rank_focus_city,
+            focus_state=collocate_rank_focus_state,
         )
 
     if groups and not any(v > 0 for v in values):
@@ -1753,6 +1846,22 @@ def create_map(
     # Add collocate term selector when rank index is available
     if collocate_terms_list:
         select_opts = ''.join(f'<option value="{_esc(t)}">{_esc(t)}</option>' for t in collocate_terms_list[:200])
+        scope_desc = 'entire period'
+        if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time') and collocate_rank_time_key:
+            scope_desc = f'time bin {collocate_rank_time_key}'
+        focus_desc = ''
+        focus_mode_norm = (collocate_rank_focus or '').strip().lower()
+        if focus_mode_norm == 'city' and collocate_rank_focus_city:
+            focus_desc = f' for {collocate_rank_focus_city}'
+            if collocate_rank_focus_state:
+                focus_desc += f', {collocate_rank_focus_state}'
+        elif focus_mode_norm == 'state' and collocate_rank_focus_state:
+            focus_desc = f' for {collocate_rank_focus_state}'
+        scope_text = _esc(scope_desc)
+        focus_text = _esc(focus_desc)
+        header_lines.append(
+            f'<div>Top {len(collocate_terms_list)} collocates based on {scope_text}{focus_text}</div>'
+        )
         header_lines.append(
             '<div style="margin-top:6px;">'
             '<label style="font-weight:600; margin-right:6px;">Collocate term:</label>'
@@ -1784,6 +1893,15 @@ def create_map(
         config_payload['collocate_ranks'] = rank_index
         config_payload['collocate_terms'] = collocate_terms_list
         config_payload['rank_max'] = rank_max_value or COLLOCATE_RANK_LIMIT
+        config_payload['collocate_settings'] = {
+            'requested_top_n': collocate_rank_top_n,
+            'terms_returned': len(collocate_terms_list),
+            'term_scope': collocate_rank_term_scope,
+            'time_key': collocate_rank_time_key or '',
+            'focus': collocate_rank_focus,
+            'focus_city': collocate_rank_focus_city or '',
+            'focus_state': collocate_rank_focus_state or '',
+        }
     config_json = json.dumps(config_payload, ensure_ascii=False).replace('</', '<\\/')
     config_script = (
         '<script id="map-config" type="application/json">'

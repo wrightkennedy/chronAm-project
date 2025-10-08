@@ -8,7 +8,7 @@ import threading
 import time
 import urllib.parse
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 from PyQt5.QtCore import (
@@ -21,7 +21,7 @@ from PyQt5.QtCore import (
     pyqtProperty,
     pyqtSignal,
 )
-from PyQt5.QtGui import QIntValidator, QKeySequence, QPainter, QPen, QTextCursor
+from PyQt5.QtGui import QDesktopServices, QIntValidator, QKeySequence, QPainter, QPen, QTextCursor
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -56,7 +56,7 @@ from PyQt5.QtWidgets import (
 
 from chronam import download_data
 from chronam.config import DEFAULT_CSV_FILENAME, default_csv_path
-from chronam.map_create import create_map
+from chronam.map_create import create_map, _build_time_index, _parse_date
 from chronam.collocate import run_collocation, build_collocation_output_paths
 from chronam.utils import term_directory_name
 
@@ -1715,6 +1715,134 @@ class CollocationRankSettingsDialog(QDialog):
 
 
 
+class CollocateMapSettingsDialog(QDialog):
+    def __init__(
+        self,
+        parent,
+        *,
+        time_bins: List[Tuple[str, str]],
+        cities: List[Tuple[str, str]],
+        states: List[str],
+        default_top_n: int = 25,
+        max_top_n: int = 150,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle('Collocate Map Settings')
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+
+        self.top_spin = QSpinBox()
+        self.top_spin.setRange(1, max_top_n)
+        self.top_spin.setValue(max(1, min(default_top_n, max_top_n)))
+        form.addRow('Top collocates:', self.top_spin)
+
+        layout.addLayout(form)
+
+        scope_box = QGroupBox('Term selection scope')
+        scope_layout = QVBoxLayout(scope_box)
+        self.global_radio = QRadioButton('Use entire time period')
+        self.time_radio = QRadioButton('Use specific time bin')
+        self.global_radio.setChecked(True)
+        self.time_radio.setEnabled(bool(time_bins))
+        scope_layout.addWidget(self.global_radio)
+        scope_layout.addWidget(self.time_radio)
+        self.time_combo = QComboBox()
+        for key, label in time_bins:
+            display = f'{key}: {label}' if label else str(key)
+            self.time_combo.addItem(display, key)
+        self.time_combo.setEnabled(False)
+        scope_layout.addWidget(self.time_combo)
+        layout.addWidget(scope_box)
+
+        def _update_time_enabled():
+            self.time_combo.setEnabled(self.time_radio.isChecked() and self.time_combo.count() > 0)
+
+        self.global_radio.toggled.connect(lambda _checked: _update_time_enabled())
+        self.time_radio.toggled.connect(lambda _checked: _update_time_enabled())
+
+        location_box = QGroupBox('Location weighting')
+        location_layout = QVBoxLayout(location_box)
+        self.loc_all_radio = QRadioButton('All cities')
+        self.loc_city_radio = QRadioButton('Specific city')
+        self.loc_state_radio = QRadioButton('Specific state')
+        self.loc_all_radio.setChecked(True)
+        location_layout.addWidget(self.loc_all_radio)
+        location_layout.addWidget(self.loc_city_radio)
+        self.city_combo = QComboBox()
+        for city, state in cities:
+            label = city or ''
+            if state:
+                label = f'{label}, {state}' if label else state
+            self.city_combo.addItem(label, (city or '', state or ''))
+        self.city_combo.setEnabled(False)
+        if not cities:
+            self.loc_city_radio.setEnabled(False)
+        location_layout.addWidget(self.city_combo)
+        location_layout.addWidget(self.loc_state_radio)
+        self.state_combo = QComboBox()
+        for state in states:
+            self.state_combo.addItem(state)
+        self.state_combo.setEnabled(False)
+        if not states:
+            self.loc_state_radio.setEnabled(False)
+        location_layout.addWidget(self.state_combo)
+        layout.addWidget(location_box)
+
+        def _update_location_controls():
+            self.city_combo.setEnabled(
+                self.loc_city_radio.isEnabled()
+                and self.loc_city_radio.isChecked()
+                and self.city_combo.count() > 0
+            )
+            self.state_combo.setEnabled(
+                self.loc_state_radio.isEnabled()
+                and self.loc_state_radio.isChecked()
+                and self.state_combo.count() > 0
+            )
+
+        self.loc_all_radio.toggled.connect(lambda _checked: _update_location_controls())
+        self.loc_city_radio.toggled.connect(lambda _checked: _update_location_controls())
+        self.loc_state_radio.toggled.connect(lambda _checked: _update_location_controls())
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        _update_time_enabled()
+        _update_location_controls()
+
+    def values(self) -> dict:
+        term_scope = 'global'
+        time_key = None
+        if self.time_radio.isChecked() and self.time_combo.count() > 0:
+            term_scope = 'time'
+            data = self.time_combo.currentData()
+            time_key = str(data if data is not None else self.time_combo.currentText()).strip()
+
+        location_scope = 'all'
+        city_val = ''
+        state_val = ''
+        if self.loc_city_radio.isChecked() and self.city_combo.count() > 0:
+            data = self.city_combo.currentData()
+            if isinstance(data, tuple):
+                city_val, state_val = data
+            location_scope = 'city'
+        elif self.loc_state_radio.isChecked() and self.state_combo.count() > 0:
+            location_scope = 'state'
+            state_val = str(self.state_combo.currentText()).strip()
+
+        return {
+            'top_n': self.top_spin.value(),
+            'term_scope': term_scope,
+            'time_key': time_key,
+            'location_scope': location_scope,
+            'location_city': str(city_val or ''),
+            'location_state': str(state_val or ''),
+        }
+
+
 class MapToolDialog(QDialog):
     METRIC_OPTIONS = [
         {
@@ -2363,6 +2491,7 @@ class CollocationDialog(QDialog):
         layout = QVBoxLayout(self)
         self._last_output_paths = None
         self._preview_windows = []
+        self._collocate_map_settings: Optional[dict] = None
 
         # --- Source selection & status line ---
         mode_row = QHBoxLayout()
@@ -2571,6 +2700,99 @@ class CollocationDialog(QDialog):
         opts = self._collect_options()
         drop_stop = bool(opts.get('drop_stopwords', False))
 
+        # Gather geo metadata for settings dialog
+        try:
+            with open(geo_path, 'r', encoding='utf-8') as f:
+                geo_payload = json.load(f)
+        except Exception as exc:
+            QMessageBox.critical(self, 'GeoJSON Error', f'Unable to read GeoJSON file:\n{exc}')
+            return
+
+        features = geo_payload.get('features') or []
+        city_pairs: Set[Tuple[str, str]] = set()
+        state_set: Set[str] = set()
+        date_values: List[datetime] = []
+        for feat in features:
+            if not isinstance(feat, dict):
+                continue
+            props = feat.get('properties') or {}
+            if not isinstance(props, dict):
+                continue
+            city_val = str(props.get('City') or '').strip()
+            state_val = str(props.get('State') or '').strip()
+            if city_val:
+                city_pairs.add((city_val, state_val))
+            if state_val:
+                state_set.add(state_val)
+            if not ignore_bin:
+                dt = _parse_date(props.get('date'))
+                if dt:
+                    date_values.append(dt)
+
+        time_bin_pairs: List[Tuple[str, str]] = []
+        if not ignore_bin and date_values:
+            try:
+                index_list = _build_time_index(min(date_values), max(date_values), time_unit, max(1, time_step))
+                for idx, dt in enumerate(index_list, start=1):
+                    label = dt.strftime('%Y-%m-%d')
+                    time_bin_pairs.append((str(idx), label))
+            except Exception:
+                time_bin_pairs = []
+
+        sorted_cities = sorted(
+            [pair for pair in city_pairs if pair[0]],
+            key=lambda p: (p[0].lower(), p[1].lower()),
+        )
+        sorted_states = sorted(state_set, key=lambda s: s.lower())
+
+        default_top = self._collocate_map_settings.get('top_n') if isinstance(self._collocate_map_settings, dict) else 25
+        settings_dialog = CollocateMapSettingsDialog(
+            self,
+            time_bins=time_bin_pairs,
+            cities=sorted_cities,
+            states=sorted_states,
+            default_top_n=max(1, min(int(default_top or 25), 150)),
+            max_top_n=150,
+        )
+        if self._collocate_map_settings:
+            prev = self._collocate_map_settings
+            if prev.get('term_scope') == 'time' and settings_dialog.time_combo.count() > 0:
+                desired = prev.get('time_key')
+                if desired is not None:
+                    for idx in range(settings_dialog.time_combo.count()):
+                        if str(settings_dialog.time_combo.itemData(idx)) == str(desired):
+                            settings_dialog.time_radio.setChecked(True)
+                            settings_dialog.time_combo.setCurrentIndex(idx)
+                            break
+            if prev.get('location_scope') == 'city' and settings_dialog.city_combo.count() > 0:
+                city_val = prev.get('location_city') or ''
+                state_val = prev.get('location_state') or ''
+                for idx in range(settings_dialog.city_combo.count()):
+                    data = settings_dialog.city_combo.itemData(idx)
+                    if isinstance(data, tuple) and data == (city_val, state_val):
+                        settings_dialog.loc_city_radio.setChecked(True)
+                        settings_dialog.city_combo.setCurrentIndex(idx)
+                        break
+            elif prev.get('location_scope') == 'state' and settings_dialog.state_combo.count() > 0:
+                state_val = prev.get('location_state') or ''
+                index = settings_dialog.state_combo.findText(state_val, Qt.MatchFixedString)
+                if index >= 0:
+                    settings_dialog.loc_state_radio.setChecked(True)
+                    settings_dialog.state_combo.setCurrentIndex(index)
+
+        if settings_dialog.exec_() != QDialog.Accepted:
+            return
+
+        map_settings = settings_dialog.values()
+        self._collocate_map_settings = map_settings
+
+        top_n = int(map_settings.get('top_n', 25))
+        term_scope = map_settings.get('term_scope', 'global')
+        time_key = map_settings.get('time_key') or None
+        location_scope = map_settings.get('location_scope', 'all')
+        location_city = map_settings.get('location_city') or ''
+        location_state = map_settings.get('location_state') or ''
+
         try:
             # Create lightweight map with embedded collocate rank index
             result = create_map(
@@ -2589,6 +2811,12 @@ class CollocationDialog(QDialog):
                 collocate_drop_stopwords=drop_stop,
                 collocate_window=5,
                 collocate_drop_terms=self._get_parent_drop_terms(),
+                collocate_rank_top_n=top_n,
+                collocate_rank_term_scope=term_scope,
+                collocate_rank_time_key=time_key,
+                collocate_rank_focus=location_scope,
+                collocate_rank_focus_city=location_city or None,
+                collocate_rank_focus_state=location_state or None,
             )
         except Exception as exc:
             QMessageBox.critical(self, 'Map Error', str(exc))
@@ -2603,7 +2831,7 @@ class CollocationDialog(QDialog):
             ]
             if parent and hasattr(parent, 'append_project_log'):
                 parent.append_project_log('Collocate‑Rank Map', log_lines)
-            reveal_in_file_manager(map_path)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(map_path))
         else:
             QMessageBox.information(self, 'No Map Created', 'The map was not created.')
 
