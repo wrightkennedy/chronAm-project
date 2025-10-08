@@ -365,7 +365,7 @@ class MainWindow(QMainWindow):
         self.btn_download.clicked.connect(self.action_download)
         self.btn_update = QPushButton('B) Add Geographic Info')
         self.btn_update.clicked.connect(self.action_update_locations)
-        self.btn_collocate = QPushButton('C) Run Collocation Analysis')
+        self.btn_collocate = QPushButton('C) Collocation Analysis')
         self.btn_collocate.clicked.connect(self.action_collocate)
         self.btn_map = QPushButton('D) Create Map')
         self.btn_map.clicked.connect(self.open_create_map_dialog)
