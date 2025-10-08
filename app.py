@@ -883,6 +883,7 @@ class DownloadDialog(QDialog):
         self.clean_geo_unmatched_cb.setEnabled(False)
         self.clean_geo_cb.toggled.connect(self.clean_geo_unmatched_cb.setEnabled)
         self.clean_geo_cb.toggled.connect(lambda checked: None if checked else self.clean_geo_unmatched_cb.setChecked(False))
+        self.clean_geo_cb.setChecked(True)
         cleaning_layout.addWidget(self.clean_lowercase_cb)
         cleaning_layout.addWidget(self.clean_urls_cb)
         cleaning_layout.addWidget(self.clean_hyphen_cb)
@@ -895,6 +896,7 @@ class DownloadDialog(QDialog):
         outputs_layout.setContentsMargins(9, 9, 9, 9)
         self.yearly_csv_cb = QCheckBox('Create yearly summary CSV')
         self.yearly_chart_cb = QCheckBox('Show yearly article chart')
+        self.yearly_chart_cb.setChecked(True)
         outputs_layout.addWidget(self.yearly_csv_cb)
         outputs_layout.addWidget(self.yearly_chart_cb)
         layout.addWidget(outputs_group)
@@ -952,6 +954,7 @@ class DownloadDialog(QDialog):
         self.dataset_label.setText(folder_text)
         self.dataset_change_btn.setEnabled(True)
         self.dataset_years_label.setText(self._format_year_summary(years))
+        self._apply_year_defaults(years)
 
     def _change_dataset_folder(self):
         start_dir = getattr(self.parent(), 'dataset_folder', None) or self.parent().project_folder
@@ -1083,6 +1086,35 @@ class DownloadDialog(QDialog):
             else:
                 text_parts.append(f"{start}-{end}")
         return "Years available: " + ", ".join(text_parts)
+
+    def _apply_year_defaults(self, years: List[int]):
+        if not years:
+            return
+        if self.start_input.text().strip() or self.end_input.text().strip():
+            return
+
+        sorted_years = sorted(set(years))
+        if not sorted_years:
+            return
+
+        best_start = best_end = sorted_years[0]
+        current_start = current_end = sorted_years[0]
+
+        for year in sorted_years[1:]:
+            if year == current_end + 1:
+                current_end = year
+            else:
+                if (current_end - current_start) > (best_end - best_start):
+                    best_start, best_end = current_start, current_end
+                current_start = current_end = year
+
+        if (current_end - current_start) > (best_end - best_start):
+            best_start, best_end = current_start, current_end
+
+        start_date = f"{best_start:04d}-01-01"
+        end_date = f"{best_end:04d}-12-31"
+        self.start_input.setText(start_date)
+        self.end_input.setText(end_date)
 
     def _log_plain(self, text: str):
         safe = html.escape(text)
@@ -1737,6 +1769,9 @@ class CollocateMapSettingsDialog(QDialog):
         self.top_spin.setValue(max(1, min(default_top_n, max_top_n)))
         form.addRow('Top collocates:', self.top_spin)
 
+        self.colorize_check = QCheckBox('Color markers by collocate article count')
+        form.addRow(self.colorize_check)
+
         layout.addLayout(form)
 
         scope_box = QGroupBox('Term selection scope')
@@ -1851,6 +1886,7 @@ class CollocateMapSettingsDialog(QDialog):
             'location_scope': location_scope,
             'location_city': str(city_val or ''),
             'location_state': str(state_val or ''),
+            'colorize': self.colorize_check.isChecked(),
             'location_label': location_label,
         }
 
@@ -2770,6 +2806,7 @@ class CollocationDialog(QDialog):
         )
         if self._collocate_map_settings:
             prev = self._collocate_map_settings
+            settings_dialog.colorize_check.setChecked(bool(prev.get('colorize')))
             if prev.get('term_scope') == 'time' and settings_dialog.time_combo.count() > 0:
                 desired = prev.get('time_key')
                 if desired is not None:
@@ -2835,6 +2872,7 @@ class CollocationDialog(QDialog):
                 collocate_rank_focus_state=location_state or None,
                 collocate_rank_time_label=time_label or None,
                 collocate_rank_focus_label=location_label or None,
+                collocate_rank_colorize=bool(map_settings.get('colorize')),
             )
         except Exception as exc:
             QMessageBox.critical(self, 'Map Error', str(exc))
@@ -3643,13 +3681,65 @@ class CollocationDialog(QDialog):
         else:
             legend_order = top_terms
 
+        if use_global:
+            home_label_display = 'All time (global)'
+        else:
+            try:
+                home_label_display = str(bins_ordered[home_idx])
+            except Exception:
+                home_label_display = 'Selected bin'
+
+        city_display = city_text if city else 'All Cities'
+        state_display = state_text if state else 'All States'
+        start_display = self.start_input.text().strip() or 'All dates'
+        end_display = self.end_input.text().strip() or 'All dates'
+        if self.ignore_bin.isChecked():
+            time_unit_display = 'Time Bin: none'
+        else:
+            bin_size = self.bin_size.text().strip() or '1'
+            unit_text = self.bin_unit.currentText().strip() or 'unit'
+            time_unit_display = f"Time Bin: {bin_size} {unit_text}".strip()
+        settings_text = self._build_rank_chart_summary(
+            term_count=len(top_terms),
+            home_label=home_label_display,
+            city_label=city_display,
+            state_label=state_display,
+            start_label=start_display,
+            end_label=end_display,
+            time_unit=time_unit_display,
+            keyword=term,
+        )
+
         try:
             plot_rank_changes = _import_plot_rank_changes()
-            fig = plot_rank_changes(df_top, legend_order=legend_order, show_term_labels=show_labels)
+            fig = plot_rank_changes(
+                df_top,
+                legend_order=legend_order,
+                show_term_labels=show_labels,
+                settings_text=settings_text,
+            )
         except Exception as exc:
             QMessageBox.critical(self, 'Plot Error', str(exc))
             return
         fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
+
+    def _build_rank_chart_summary(
+        self,
+        *,
+        term_count: int,
+        home_label: str,
+        city_label: str,
+        state_label: str,
+        start_label: str,
+        end_label: str,
+        time_unit: str,
+        keyword: str,
+    ) -> str:
+        keyword_display = keyword or '(none)'
+        line1 = f"Terms plotted: {term_count} | Home bin: {home_label} | Keyword: {keyword_display}"
+        line2 = f"City filter: {city_label} | State filter: {state_label}"
+        line3 = f"Dates: {start_label} – {end_label} | Time unit: {time_unit or 'n/a'}"
+        return '\n'.join([line1, line2, line3])
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

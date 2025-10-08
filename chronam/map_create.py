@@ -1235,6 +1235,7 @@ def create_map(
     collocate_rank_focus_state: Optional[str] = None,
     collocate_rank_time_label: Optional[str] = None,
     collocate_rank_focus_label: Optional[str] = None,
+    collocate_rank_colorize: bool = False,
 ) -> Dict[str, Optional[str]]:
     """
     Create a leaflet map next to the GeoJSON.
@@ -1269,6 +1270,7 @@ def create_map(
       - collocate_rank_time_key: time-bin key (1-based index) when collocate_rank_term_scope='time'.
       - collocate_rank_focus: 'all' (default), 'city', or 'state' to control which locations determine the top terms.
       - collocate_rank_focus_city / collocate_rank_focus_state: labels used when collocate_rank_focus filters by city or state.
+      - collocate_rank_colorize: when True, apply a graduated color ramp based on collocate article counts.
 
     Returns:
         dict with 'map_path' and optional 'attribute_table'.
@@ -1294,6 +1296,8 @@ def create_map(
         entry['_popup_row_id'] = _sanitize_element_id(f'feature-row-{idx}')
     groups = _group_points(pts)
     search_term = _detect_search_term(geojson_path, data)
+
+    city_entries_map: Dict[str, List[Dict[str, Any]]] = {}
 
     allowed_metrics = {"article_count", "page_count", "key_term_frequency"}
     metric_key = (metric or "article_count").strip().lower()
@@ -1423,7 +1427,10 @@ def create_map(
         first_props = entries[0].get('props', {}) if entries else {}
         city_raw = str(first_props.get('City') or '').strip()
         state_raw = str(first_props.get('State') or '').strip()
+        city_key = _city_state_key(city_raw, state_raw)
         place_label = ', '.join([p for p in (city_raw, state_raw) if p])
+
+        city_entries_map.setdefault(city_key, entries)
 
         title_text, article_count, _ = _group_header(entries, stats, search_term)
         dataset_entry: Dict[str, Any] = {
@@ -1494,7 +1501,10 @@ def create_map(
     collocate_terms_list: List[str] = []
     rank_index: Dict[str, Dict[str, Dict[str, int]]] = {}
     rank_max_value = 0
+    collocate_term_stats: Dict[str, Dict[str, int]] = {}
     collocate_hits_by_city: Dict[str, Dict[str, Set[int]]] = {}
+    initial_collocate_term: str = ''
+    initial_collocate_summary_text: str = ''
     if collocate_rank_mode:
         collocate_terms_list, rank_index, rank_max_value, collocate_hits_by_city = _build_collocate_rank_index(
             groups,
@@ -1538,6 +1548,61 @@ def create_map(
                         hits_for_dataset[term] = sorted(normalized_indexes)
                 if hits_for_dataset:
                     dataset_entry['collocate_hits'] = hits_for_dataset
+
+        if collocate_hits_by_city:
+            term_article_counts: Dict[str, int] = defaultdict(int)
+            term_cities: Dict[str, Set[str]] = defaultdict(set)
+            term_newspapers: Dict[str, Set[str]] = defaultdict(set)
+
+            for city_key, term_map in collocate_hits_by_city.items():
+                entries = city_entries_map.get(city_key) or []
+                for term, indexes in term_map.items():
+                    if not indexes:
+                        continue
+                    term_article_counts[term] += len(indexes)
+                    term_cities[term].add(city_key)
+                    for idx in indexes:
+                        try:
+                            idx_int = int(idx)
+                        except (TypeError, ValueError):
+                            continue
+                        if idx_int < 0 or idx_int >= len(entries):
+                            continue
+                        entry_obj = entries[idx_int]
+                        props = entry_obj.get('props', {}) if isinstance(entry_obj, dict) else {}
+                        paper_id = (
+                            props.get('SN')
+                            or props.get('lccn')
+                            or props.get('Title')
+                            or props.get('newspaper_name')
+                            or ''
+                        )
+                        paper_str = str(paper_id).strip()
+                        if paper_str:
+                            term_newspapers[term].add(paper_str)
+
+            for term, total_articles in term_article_counts.items():
+                collocate_term_stats[term] = {
+                    'articles': int(total_articles),
+                    'newspapers': len(term_newspapers.get(term, set())),
+                    'cities': len(term_cities.get(term, set())),
+                }
+
+        initial_collocate_term = collocate_terms_list[0] if collocate_terms_list else ''
+
+        def _format_collocate_summary(term: str) -> str:
+            if not term:
+                return 'Collocate term: none selected'
+            stats = collocate_term_stats.get(term) or {}
+            articles_val = stats.get('articles', 0)
+            newspapers_val = stats.get('newspapers', 0)
+            cities_val = stats.get('cities', 0)
+            return (
+                f'Collocate term "{term}": '
+                f'{articles_val:,} articles | {newspapers_val:,} newspapers | {cities_val:,} cities'
+            )
+
+        initial_collocate_summary_text = _format_collocate_summary(initial_collocate_term)
 
     if groups and not any(v > 0 for v in values):
         for group in groups:
@@ -1922,6 +1987,10 @@ def create_map(
         )
 
     if collocate_rank_mode:
+        summary_line_text = initial_collocate_summary_text or 'Collocate term: none selected'
+        header_lines.append(
+            f'<div id="collocateSummaryLine" style="color:#c53030; margin-top:4px;">{_esc(summary_line_text)}</div>'
+        )
         scope_desc = 'Entire period'
         if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time'):
             key_text = collocate_rank_time_key or ''
@@ -1953,7 +2022,12 @@ def create_map(
 
     # Add collocate term selector when rank index is available
     if collocate_terms_list:
-        select_opts = ''.join(f'<option value="{_esc(t)}">{_esc(t)}</option>' for t in collocate_terms_list[:200])
+        select_opts_parts = []
+        for idx, term in enumerate(collocate_terms_list[:200], start=1):
+            select_opts_parts.append(
+                f'<option value="{_esc(term)}">({_esc(str(idx))}) {_esc(term)}</option>'
+            )
+        select_opts = ''.join(select_opts_parts)
         scope_desc = 'entire period'
         if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time') and collocate_rank_time_key:
             scope_desc = f'time bin {collocate_rank_time_key}'
@@ -2018,6 +2092,9 @@ def create_map(
         'time_labels': time_labels if use_time_slider and time_labels else [],
         'map_mode': mode,
         'click_radius_px': heat_radius_val,
+        'collocate_summary': collocate_term_stats if collocate_term_stats else {},
+        'collocate_colorize': bool(collocate_rank_colorize),
+        'initial_collocate_term': initial_collocate_term,
     }
 
     # Embed collocate rank index when available
@@ -2035,6 +2112,7 @@ def create_map(
             'focus_state': collocate_rank_focus_state or '',
             'time_label': collocate_rank_time_label or '',
             'focus_label': collocate_rank_focus_label or '',
+            'colorize': bool(collocate_rank_colorize),
         }
     config_json = json.dumps(config_payload, ensure_ascii=False).replace('</', '<\\/')
     config_script = (
@@ -2237,6 +2315,9 @@ def create_map(
   var collocateRanks = null;
   var collocateTerms = [];
   var rankMax = 0;
+  var collocateSummary = {};
+  var collocateColorize = false;
+  var initialCollocateTerm = '';
   var selectedCollocate = '';
   var activeMap = null;
   var highlightLayer = null;
@@ -2296,7 +2377,24 @@ def create_map(
     if (config.collocate_ranks) { collocateRanks = config.collocate_ranks; }
     if (Array.isArray(config.collocate_terms)) { collocateTerms = config.collocate_terms.slice(); }
     if (typeof config.rank_max === 'number' && Number.isFinite(config.rank_max)) { rankMax = config.rank_max|0; }
+    if (config.collocate_summary && typeof config.collocate_summary === 'object') {
+      collocateSummary = config.collocate_summary;
+    }
+    if (typeof config.collocate_colorize === 'boolean') {
+      collocateColorize = config.collocate_colorize;
+    }
+    if (typeof config.initial_collocate_term === 'string') {
+      initialCollocateTerm = String(config.initial_collocate_term).trim();
+    }
   })();
+
+  if (!selectedCollocate) {
+    if (initialCollocateTerm) {
+      selectedCollocate = initialCollocateTerm;
+    } else if (collocateTerms.length) {
+      selectedCollocate = String(collocateTerms[0] || '').trim();
+    }
+  }
 
   function escapeHtml(str) {
     return String(str)
@@ -2495,6 +2593,11 @@ def create_map(
         return;
       }
       applyCollocateFilterToDataset(dataset);
+      var colorScale = null;
+      var baseColor = '#2b6cb0';
+      if (collocateColorize) {
+        colorScale = createColorScale(dataset);
+      }
       var timeKey = currentTimeKey(mapObj);
       mapObj.eachLayer(function(layer) {
         if (!layer || !layer.options || !layer.options.groupId) {
@@ -2568,14 +2671,31 @@ def create_map(
             tooltipEl.style.fontSize = fontSize + 'px';
           }
         }
-        var visible = data.entries && data.entries.length > 0;
+        var collocateCount = Array.isArray(data.entries) ? data.entries.length : 0;
+        var fillColor = baseColor;
+        var strokeColor = baseColor;
+        if (collocateColorize && typeof colorScale === 'function') {
+          fillColor = colorScale(collocateCount);
+          strokeColor = '#4a5568';
+        }
+        var visible = collocateCount > 0;
         var baseOpacity = (typeof layer.options.baseOpacity === 'number') ? layer.options.baseOpacity : (typeof layer.options.opacity === 'number' ? layer.options.opacity : 0.5);
         var baseFill = (typeof layer.options.baseFillOpacity === 'number') ? layer.options.baseFillOpacity : (typeof layer.options.fillOpacity === 'number' ? layer.options.fillOpacity : 0.85);
         if (typeof layer.setStyle === 'function') {
           layer.setStyle({
+            color: strokeColor,
+            fillColor: fillColor,
+            weight: collocateColorize ? 1.0 : (typeof layer.options.weight === 'number' ? layer.options.weight : 1),
             opacity: visible ? baseOpacity : 0,
             fillOpacity: visible ? baseFill : 0,
           });
+        }
+        if (layer.options) {
+          layer.options.color = strokeColor;
+          layer.options.fillColor = fillColor;
+          layer.options.weight = collocateColorize ? 1.0 : (typeof layer.options.weight === 'number' ? layer.options.weight : 1);
+          layer.options.opacity = visible ? baseOpacity : 0;
+          layer.options.fillOpacity = visible ? baseFill : 0;
         }
         var isGhost = !!layer.options.ghostMarker;
         layer.options.interactive = isGhost ? false : !!visible;
@@ -2590,6 +2710,7 @@ def create_map(
         }
       });
       refreshPopupAfterFilter(mapObj);
+      updateCollocateSummaryLineFromDataset(dataset);
       updateHighlightFromDataset(dataset);
     });
   }
@@ -2618,6 +2739,7 @@ def create_map(
         setBaseEntries(data, baseSource, baseCount);
       });
       applyCollocateFilterToDataset(popupCache);
+      updateCollocateSummaryLineFromDataset(popupCache);
     }
     callback(popupCache);
   }
@@ -2677,6 +2799,115 @@ def create_map(
       }
     }
     return keys;
+  }
+
+  function formatInteger(value) {
+    var num = Number(value);
+    if (!Number.isFinite(num)) {
+      return '0';
+    }
+    return Math.round(num).toLocaleString();
+  }
+
+  function collectCollocateStats(dataset) {
+    var articles = 0;
+    var cityCount = 0;
+    var newspaperSet = new Set();
+    if (!dataset) {
+      return { articles: 0, newspapers: 0, cities: 0 };
+    }
+    Object.keys(dataset).forEach(function(key) {
+      var data = dataset[key];
+      if (!data || !Array.isArray(data.entries) || !data.entries.length) {
+        return;
+      }
+      articles += data.entries.length;
+      cityCount += 1;
+      data.entries.forEach(function(entry) {
+        if (entry && entry.newspaper) {
+          newspaperSet.add(entry.newspaper);
+        }
+      });
+    });
+    return {
+      articles: articles,
+      newspapers: newspaperSet.size,
+      cities: cityCount,
+    };
+  }
+
+  function updateCollocateSummaryLineFromDataset(dataset) {
+    var line = document.getElementById('collocateSummaryLine');
+    if (!line) {
+      return;
+    }
+    var term = String(selectedCollocate || '').trim();
+    if (!term) {
+      line.textContent = 'Collocate term: none selected';
+      return;
+    }
+    var stats = collectCollocateStats(dataset);
+    if ((!stats || (!stats.articles && !stats.cities)) && collocateSummary && collocateSummary[term]) {
+      var fallback = collocateSummary[term];
+      stats = {
+        articles: Number(fallback.articles) || 0,
+        newspapers: Number(fallback.newspapers) || 0,
+        cities: Number(fallback.cities) || 0,
+      };
+    }
+    stats = stats || { articles: 0, newspapers: 0, cities: 0 };
+    line.textContent = 'Collocate term "' + term + '": '
+      + formatInteger(stats.articles) + ' articles | '
+      + formatInteger(stats.newspapers) + ' newspapers | '
+      + formatInteger(stats.cities) + ' cities';
+  }
+
+  function interpolateColor(startHex, endHex, t) {
+    var clampT = Math.min(1, Math.max(0, t));
+    var parseHex = function(hex) {
+      var cleaned = String(hex || '').replace('#', '');
+      if (cleaned.length === 3) {
+        cleaned = cleaned[0] + cleaned[0] + cleaned[1] + cleaned[1] + cleaned[2] + cleaned[2];
+      }
+      while (cleaned.length < 6) {
+        cleaned += '0';
+      }
+      var r = parseInt(cleaned.slice(0, 2), 16);
+      var g = parseInt(cleaned.slice(2, 4), 16);
+      var b = parseInt(cleaned.slice(4, 6), 16);
+      return { r: r, g: g, b: b };
+    };
+    var start = parseHex(startHex);
+    var end = parseHex(endHex);
+    var mix = function(a, b) {
+      return Math.round(a + (b - a) * clampT);
+    };
+    var r = mix(start.r, end.r);
+    var g = mix(start.g, end.g);
+    var b = mix(start.b, end.b);
+    var toHex = function(value) {
+      var str = value.toString(16);
+      return str.length === 1 ? '0' + str : str;
+    };
+    return '#' + toHex(r) + toHex(g) + toHex(b);
+  }
+
+  function createColorScale(dataset) {
+    var emptyColor = '#cbd5e0';
+    var thresholds = [1, 5, 10, 20, 40];
+    var colors = ['#fed7d7', '#feb2b2', '#fc8181', '#e53e3e', '#9b2c2c'];
+    return function(count) {
+      var numeric = Number(count);
+      if (!Number.isFinite(numeric) || numeric <= 0) {
+        return emptyColor;
+      }
+      for (var i = thresholds.length - 1; i >= 0; i--) {
+        if (numeric >= thresholds[i]) {
+          return colors[i];
+        }
+      }
+      return colors[0];
+    };
   }
 
   function setBaseEntries(data, entries, articleCount) {
@@ -4132,12 +4363,29 @@ function attach(root) {
         if (!collocateRanks || !collocateTerms || !collocateTerms.length) return;
         var sel = document.getElementById('collocateTermSelect');
         if (!sel) return;
-        if (!selectedCollocate) { selectedCollocate = String(sel.value || collocateTerms[0] || '').trim(); }
+        if (selectedCollocate) {
+          var matchedIndex = -1;
+          for (var i = 0; i < sel.options.length; i++) {
+            if (String(sel.options[i].value).trim() === selectedCollocate) {
+              matchedIndex = i;
+              break;
+            }
+          }
+          if (matchedIndex >= 0) {
+            sel.selectedIndex = matchedIndex;
+          } else {
+            selectedCollocate = String(sel.value || collocateTerms[0] || '').trim();
+          }
+        } else {
+          selectedCollocate = String(sel.value || collocateTerms[0] || '').trim();
+        }
         sel.addEventListener('change', function(){
           selectedCollocate = String(this.value||'').trim();
           refreshCollocateSizes(activeMap);
+          updateCollocateSummaryLineFromDataset(popupCache);
         });
         refreshCollocateSizes(activeMap);
+        updateCollocateSummaryLineFromDataset(popupCache);
       })();
       if (mapObj.timeDimension && typeof mapObj.timeDimension.on === 'function') {
         mapObj.timeDimension.on('timeload', function() { applyTimeFilter(mapObj); });

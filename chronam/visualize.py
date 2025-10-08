@@ -9,6 +9,7 @@ These functions are GUI-agnostic and can be called from PyQt handlers.
 """
 
 from typing import Optional, Union, List, Dict
+import textwrap
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -77,7 +78,8 @@ def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
                      home_bin_index: Optional[int] = None,
                      legend_order: Optional[List[str]] = None,
                      show_term_labels: bool = False,
-                     enable_hover: bool = True):
+                     enable_hover: bool = True,
+                     settings_text: Optional[str] = None):
     """
     Build a bump chart of rank (1=top) vs time_bin for a subset of terms.
 
@@ -118,12 +120,13 @@ def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
     positions = np.arange(len(bins_ordered))
     lines = []
     scatter_points = []
-    for term in ordered_terms:
+    for idx, term in enumerate(ordered_terms, start=1):
         series = pivot[term].to_numpy(dtype=float)
         mask = ~np.isnan(series)
         xs = positions[mask]
         ys = series[mask]
-        line, = ax.plot(positions, series, marker='o', label=term)
+        label_text = f"({idx}) {term}"
+        line, = ax.plot(positions, series, marker='o', label=label_text)
         lines.append(line)
         scatter_points.append((term, xs, ys))
         if show_term_labels:
@@ -137,7 +140,12 @@ def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
     ax.set_ylabel("Ordinal Rank (1 = top)")
     ax.set_title("Collocate Rank Changes Over Time")
     ax.legend(lines, ordered_terms, title="Term", bbox_to_anchor=(1.02, 1), loc="upper left")
-    plt.tight_layout()
+    if settings_text:
+        wrapped = '\n'.join(textwrap.fill(part, 110) for part in str(settings_text).splitlines())
+        fig.text(0.5, 0.98, wrapped, ha='center', va='top', fontsize=10)
+        plt.tight_layout(rect=[0, 0, 1, 0.9])
+    else:
+        plt.tight_layout()
 
     if enable_hover and scatter_points:
         annot = ax.annotate("", xy=(0, 0), xytext=(12, 12), textcoords="offset points",
@@ -146,7 +154,12 @@ def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
 
         def update_annot(term: str, x_val: float, y_val: float):
             annot.xy = (x_val, y_val)
-            annot.set_text(f"{term}\nRank: {int(y_val)}")
+            year_idx = int(round(x_val))
+            if 0 <= year_idx < len(bins_ordered):
+                year_label = bins_ordered[year_idx]
+            else:
+                year_label = ''
+            annot.set_text(f"{term}\nYear: {year_label}\nRank: {int(y_val)}")
             annot.get_bbox_patch().set_alpha(0.8)
 
         def hover(event):
