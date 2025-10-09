@@ -43,7 +43,7 @@ import os, json, re, threading
 import pandas as pd
 import duckdb
 from .config import init_project
-from .utils import term_directory_name
+from .utils import term_directory_name, write_metadata_file
 
 DEFAULT_PARQUET_PREFIX = "AmericanStories"
 SEARCH_LOCATIONS_REL = ["data/parquet", "parquet"]
@@ -64,6 +64,7 @@ def download_data(
     progress_callback=None,
     cancel_event: Optional[threading.Event] = None,
     cleaning_options: Optional[Dict[str, bool]] = None,
+    metadata_enabled: bool = True,
 ) -> List[str]:
     """
     Query local Parquet with DuckDB and write *one* JSON payload for the full date range
@@ -219,5 +220,19 @@ def download_data(
     }
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    metadata_payload = {
+        'tool': 'search_dataset',
+        'parameters': {
+            'search_term': search_term,
+            'start_date': start_date_str,
+            'end_date': end_date_str,
+            'parquet_prefix': parquet_prefix,
+            'parquet_dir': parquet_root,
+        },
+        'cleaning_options': cleaning_options or {},
+        'records': len(all_records),
+    }
+    write_metadata_file(project_dir, out_file, metadata_payload, enabled=metadata_enabled)
 
     return [out_file]

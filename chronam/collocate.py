@@ -17,7 +17,8 @@ import os
 import json
 import hashlib
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Any
 
 import pandas as pd
 import numpy as np
@@ -25,7 +26,7 @@ import re
 from collections import Counter, defaultdict
 
 from .config import init_project  # type: ignore
-from .utils import term_directory_name
+from .utils import term_directory_name, write_metadata_file
 
 
 # A robust built-in English stopword list (no external deps)
@@ -59,7 +60,12 @@ class CollocationOptions:
     include_cooccurrence_rate: bool = False
     include_relative_position: bool = False
     drop_stopwords: bool = False
-    window: int = 5  # window on each side
+    window_left: int = 5
+    window_right: int = 5
+
+    @property
+    def window(self) -> int:
+        return max(self.window_left, self.window_right)
 
 
 def _tokenize(text: str) -> List[str]:
@@ -225,10 +231,12 @@ def _collocate_from_df(df: pd.DataFrame, term: str, opts: CollocationOptions
         )
 
         for st in starts:
-            left = max(0, st - opts.window)
-            right = min(len(tokens), st + len(term_tokens) + opts.window)
-            # collocates exclude the term tokens themselves
-            neighbors = tokens[left:st] + tokens[st+len(term_tokens):right]
+            left_idx = max(0, st - max(0, int(opts.window_left)))
+            right_idx = min(len(tokens), st + len(term_tokens) + max(0, int(opts.window_right)))
+            left_segment = tokens[left_idx:st]
+            right_segment = tokens[st+len(term_tokens):right_idx]
+            neighbors = left_segment + right_segment
+            left_len = len(left_segment)
             for j, tok in enumerate(neighbors):
                 if not tok or tok == "" or tok.isdigit():
                     continue
@@ -250,7 +258,7 @@ def _collocate_from_df(df: pd.DataFrame, term: str, opts: CollocationOptions
                     per_collocate_dates[tok].append(pd_dt)
                 if opts.include_relative_position:
                     # relative position from the first token of the phrase; negative => before
-                    rel = j - len(tokens[left:st])
+                    rel = j - left_len
                     per_collocate_rel_positions[tok].append(rel)
 
             # by-time counting will be assigned after this loop when we know bins
@@ -333,9 +341,11 @@ def _build_by_time(df: pd.DataFrame, term: str, opts: CollocationOptions,
                 continue
             for st in starts:
                 L = len(term_tokens)
-                left = max(0, st - opts.window)
-                right = min(len(toks), st + L + opts.window)
-                neighbors = toks[left:st] + toks[st+L:right]
+                left_idx = max(0, st - max(0, int(opts.window_left)))
+                right_idx = min(len(toks), st + L + max(0, int(opts.window_right)))
+                left_segment = toks[left_idx:st]
+                right_segment = toks[st+L:right_idx]
+                neighbors = left_segment + right_segment
                 for tok in neighbors:
                     if not tok or tok == "" or tok.isdigit():
                         continue
@@ -413,7 +423,7 @@ def _build_output_paths(
     state: Optional[str],
     time_bin_unit: Optional[str],
     ignore_bin: bool,
-    options: Dict[str, bool],
+    options: Dict[str, Any],
     filename_suffix: str,
 ) -> Dict[str, Optional[str]]:
     stem = _build_output_stem(term, start_date, end_date, city, state, time_bin_unit, ignore_bin, options)
@@ -440,8 +450,9 @@ def build_collocation_output_paths(
     state: Optional[str],
     time_bin_unit: Optional[str],
     ignore_bin: bool,
-    options: Dict[str, bool],
+    options: Dict[str, Any],
     drop_terms: Optional[List[str]] = None,
+    metadata_enabled: bool = True,
 ) -> Dict[str, Optional[str]]:
     processed = init_project(project_dir)["processed"]
     suffix = _drop_suffix(drop_terms)
@@ -463,10 +474,13 @@ def run_collocation(
     include_cooccurrence_rate: bool = False,
     include_relative_position: bool = False,
     drop_stopwords: bool = False,
+    window_left: int = 5,
+    window_right: int = 5,
     write_occurrences_geojson: bool = False,
     ignore_bin: bool = False,
     write_by_time: bool = True,
     drop_terms: Optional[List[str]] = None,
+    metadata_enabled: bool = True,
 ) -> Dict[str, Optional[str]]:
     """
     Execute collocation analysis. Writes outputs into data/processed/<term>/.
@@ -476,12 +490,17 @@ def run_collocation(
     if not json_path and not geojson_path:
         raise ValueError("Provide either json_path or geojson_path")
 
+    window_left = int(max(0, min(99, window_left)))
+    window_right = int(max(0, min(99, window_right)))
+
     opts = CollocationOptions(
         include_page_count=include_page_count,
         include_first_last_date=include_first_last_date,
         include_cooccurrence_rate=include_cooccurrence_rate,
         include_relative_position=include_relative_position,
         drop_stopwords=drop_stopwords,
+        window_left=window_left,
+        window_right=window_right,
     )
     opt_dict = {
         "include_page_count": include_page_count,
@@ -489,6 +508,8 @@ def run_collocation(
         "include_cooccurrence_rate": include_cooccurrence_rate,
         "include_relative_position": include_relative_position,
         "drop_stopwords": drop_stopwords,
+        "window_left": window_left,
+        "window_right": window_right,
     }
 
     paths = init_project(project_dir)
@@ -521,6 +542,26 @@ def run_collocation(
     drop_set = {str(t).strip() for t in drop_terms if str(t).strip()}
     suffix = _drop_suffix(list(drop_set))
 
+    metadata_paths: Dict[str, str] = {}
+    metadata_common = {
+        'tool': 'collocation_analysis',
+        'parameters': {
+            'city': city,
+            'state': state,
+            'start_date': start_date,
+            'end_date': end_date,
+            'term': term,
+            'time_bin_unit': None if ignore_bin else time_bin_unit,
+            'ignore_bin': bool(ignore_bin),
+            'options': opt_dict,
+            'drop_terms': sorted(drop_set),
+        },
+        'inputs': {
+            'json_path': json_path,
+            'geojson_path': geojson_path,
+        },
+    }
+
     if df.empty:
         # Still write empty CSVs to keep UI predictable
         empty_paths = _build_output_paths(proc, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, opt_dict, suffix)
@@ -528,12 +569,29 @@ def run_collocation(
         if metrics_dir:
             os.makedirs(metrics_dir, exist_ok=True)
         pd.DataFrame(columns=["collocate_term","frequency"]).to_csv(empty_paths["metrics"], index=False)
+        metrics_meta = dict(metadata_common)
+        metrics_meta.update({
+            'output_type': 'metrics_csv',
+            'row_count': 0,
+        })
+        meta_path = write_metadata_file(project_dir, empty_paths["metrics"], metrics_meta, enabled=metadata_enabled)
+        if meta_path:
+            metadata_paths['metrics'] = meta_path
         if write_by_time and empty_paths["by_time"]:
             pd.DataFrame(columns=["time_bin","collocate_term","frequency","ordinal_rank"]).to_csv(empty_paths["by_time"], index=False)
+            by_time_meta = dict(metadata_common)
+            by_time_meta.update({
+                'output_type': 'by_time_csv',
+                'row_count': 0,
+            })
+            meta_path = write_metadata_file(project_dir, empty_paths["by_time"], by_time_meta, enabled=metadata_enabled)
+            if meta_path:
+                metadata_paths['by_time'] = meta_path
         return {
             "metrics": empty_paths["metrics"],
             "by_time": empty_paths["by_time"] if write_by_time else None,
             "occurrences": None,
+            "metadata": metadata_paths,
         }
 
     # Build metrics (without time dimension)
@@ -548,6 +606,14 @@ def run_collocation(
     if metrics_dir:
         os.makedirs(metrics_dir, exist_ok=True)
     metrics.to_csv(output_paths["metrics"], index=False)
+    metrics_meta = dict(metadata_common)
+    metrics_meta.update({
+        'output_type': 'metrics_csv',
+        'row_count': int(len(metrics)),
+    })
+    meta_path = write_metadata_file(project_dir, output_paths["metrics"], metrics_meta, enabled=metadata_enabled)
+    if meta_path:
+        metadata_paths['metrics'] = meta_path
 
     # Build by-time CSV if requested
     if write_by_time and output_paths["by_time"] and time_bin_unit and isinstance(time_bin_unit, str):
@@ -562,6 +628,14 @@ def run_collocation(
         if drop_set:
             by_time = by_time[~by_time['collocate_term'].isin(drop_set)].reset_index(drop=True)
         by_time.to_csv(output_paths["by_time"], index=False)
+        by_time_meta = dict(metadata_common)
+        by_time_meta.update({
+            'output_type': 'by_time_csv',
+            'row_count': int(len(by_time)),
+        })
+        meta_path = write_metadata_file(project_dir, output_paths["by_time"], by_time_meta, enabled=metadata_enabled)
+        if meta_path:
+            metadata_paths['by_time'] = meta_path
 
     # Optionally write occurrences geojson (filtered subset)
     occurrence_path = None
@@ -599,6 +673,14 @@ def run_collocation(
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(out, f)
             occurrence_path = out_path
+            occur_meta = dict(metadata_common)
+            occur_meta.update({
+                'output_type': 'occurrences_geojson',
+                'feature_count': len(sel),
+            })
+            meta_path = write_metadata_file(project_dir, occurrence_path, occur_meta, enabled=metadata_enabled)
+            if meta_path:
+                metadata_paths['occurrences'] = meta_path
         except Exception:
             occurrence_path = None
 
@@ -606,5 +688,6 @@ def run_collocation(
         "metrics": output_paths["metrics"],
         "by_time": output_paths["by_time"] if write_by_time else None,
         "occurrences": occurrence_path,
+        "metadata": metadata_paths,
     }
     return result

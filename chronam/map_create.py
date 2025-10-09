@@ -16,6 +16,7 @@ from folium import Html, Popup
 from folium.plugins import HeatMap, HeatMapWithTime, MarkerCluster
 
 from .collocate import STOPWORDS as _STOPWORDS, WORD_RE as _WORD_RE
+from .utils import write_metadata_file
 
 
 def _tok(text: Any, drop_stop: bool = False) -> List[str]:
@@ -66,7 +67,14 @@ def _build_collocate_rank_index(
     focus_state: Optional[str] = None,
     rank_limit: int = COLLOCATE_RANK_LIMIT,
     selector_limit: int = COLLOCATE_SELECTOR_LIMIT,
-) -> Tuple[List[str], Dict[str, Dict[str, Dict[str, int]]], int, Dict[str, Dict[str, Set[int]]]]:
+    ) -> Tuple[
+        List[str],
+        Dict[str, Dict[str, Dict[str, int]]],
+        int,
+        Dict[str, Dict[str, Set[int]]],
+        Dict[str, Counter],
+        Dict[str, str],
+    ]:
     term_tokens = [tok for tok in _tok(search_term or '', drop_stop=False) if tok]
     if drop_stopwords:
         term_tokens = [tok for tok in term_tokens if tok not in _STOPWORDS]
@@ -99,6 +107,7 @@ def _build_collocate_rank_index(
     rank_index: Dict[str, Dict[str, Dict[str, int]]] = {}
     global_counts: Counter = Counter()
     aggregate_time_global: Dict[str, Counter] = defaultdict(Counter)
+    time_key_labels: Dict[str, str] = {}
     focus_city_counter: Counter = Counter()
     focus_city_time: Dict[str, Counter] = defaultdict(Counter)
     focus_state_counter: Counter = Counter()
@@ -128,6 +137,8 @@ def _build_collocate_rank_index(
                     alt_keys.append(str(bin_key))
                 if label:
                     alt_keys.append(str(label))
+                    if bin_key is not None:
+                        time_key_labels.setdefault(str(bin_key), str(label))
                 for idx in indexes:
                     try:
                         idx_int = int(idx)
@@ -214,11 +225,29 @@ def _build_collocate_rank_index(
 
     selected_terms_ordered = [term for term, _freq in _sorted_counter_terms(base_counter) if term][:top_limit]
     if term_scope_norm.startswith('time') and time_key:
-        selected_counter = base_time.get(str(time_key)) or base_time.get(str(time_key).strip())
-        if not selected_counter:
-            selected_counter = aggregate_time_global.get(str(time_key))
-        if selected_counter:
-            scoped_terms = [term for term, _freq in _sorted_counter_terms(selected_counter) if term][:top_limit]
+        raw_key = str(time_key).strip()
+        key_variants: List[str] = [raw_key] if raw_key else []
+        label_variant = time_key_labels.get(raw_key)
+        if label_variant:
+            key_variants.append(label_variant)
+        combined_counter: Counter = Counter()
+        for data in group_rank_data.values():
+            time_counters = data.get('time') or {}
+            for candidate in key_variants:
+                if not candidate:
+                    continue
+                counter = time_counters.get(candidate)
+                if counter:
+                    combined_counter.update(counter)
+        if not combined_counter:
+            for candidate in key_variants:
+                if not candidate:
+                    continue
+                counter = aggregate_time_global.get(candidate)
+                if counter:
+                    combined_counter.update(counter)
+        if combined_counter:
+            scoped_terms = [term for term, _freq in _sorted_counter_terms(combined_counter) if term][:top_limit]
             if scoped_terms:
                 selected_terms_ordered = scoped_terms
     if not selected_terms_ordered:
@@ -269,10 +298,10 @@ def _build_collocate_rank_index(
                 rank_max = max(rank_max, len(rank_map_time))
 
     if not selected_terms_ordered:
-        return [], rank_index, rank_max, hits_result
+        return [], rank_index, rank_max, hits_result, aggregate_time_global, time_key_labels
 
     collocate_terms_list = selected_terms_ordered[:selector_cap]
-    return collocate_terms_list, rank_index, rank_max, hits_result
+    return collocate_terms_list, rank_index, rank_max, hits_result, aggregate_time_global, time_key_labels
 
 
 # ----------------------------
@@ -941,11 +970,10 @@ def _heat_slices(
         # map dt to a slice index (first index with time >= dt)
         insert_i = 0
         for i, t in enumerate(time_index):
-            if dt <= t:
+            if dt >= t:
                 insert_i = i
+            else:
                 break
-        else:
-            insert_i = len(time_index) - 1
 
         # compute linger end as dt + linger duration (approx)
         linger_end = dt
@@ -985,11 +1013,10 @@ def _assign_time_bins(
 
     insert_i = 0
     for i, t in enumerate(time_index):
-        if dt <= t:
+        if dt >= t:
             insert_i = i
+        else:
             break
-    else:
-        insert_i = len(time_index) - 1
 
     indices: List[int] = []
     linger_duration = max(0, int(linger_step or 0))
@@ -1236,6 +1263,9 @@ def create_map(
     collocate_rank_time_label: Optional[str] = None,
     collocate_rank_focus_label: Optional[str] = None,
     collocate_rank_colorize: bool = False,
+    collocate_time_slider: bool = False,
+    metadata_enabled: bool = False,
+    project_dir: Optional[str] = None,
 ) -> Dict[str, Optional[str]]:
     """
     Create a leaflet map next to the GeoJSON.
@@ -1271,6 +1301,7 @@ def create_map(
       - collocate_rank_focus: 'all' (default), 'city', or 'state' to control which locations determine the top terms.
       - collocate_rank_focus_city / collocate_rank_focus_state: labels used when collocate_rank_focus filters by city or state.
       - collocate_rank_colorize: when True, apply a graduated color ramp based on collocate article counts.
+      - collocate_time_slider: when True, expose an interactive time slider for collocate views (points mode only).
 
     Returns:
         dict with 'map_path' and optional 'attribute_table'.
@@ -1366,12 +1397,41 @@ def create_map(
         min_dt = max_dt = None
 
     dated_pts = [p for p in pts if p.get("date") is not None]
+    rank_time_bins = collocate_rank_mode and bool(dated_pts)
     use_time_slider = bool(dated_pts) and time_enabled
     time_index: List[datetime] = []
     time_labels: List[str] = []
-    if use_time_slider and min_dt and max_dt:
+    if (use_time_slider or rank_time_bins) and min_dt and max_dt:
         time_index = _build_time_index(min_dt, max_dt, time_unit, max(1, int(time_step or 1)))
         time_labels = [dt.strftime('%Y-%m-%dT%H:%M:%SZ') for dt in time_index]
+
+    collocate_time_slider_enabled = bool(
+        collocate_time_slider
+        and collocate_rank_mode
+        and time_index
+        and len(time_index) > 1
+    )
+    collocate_time_bins_payload: List[Dict[str, str]] = []
+    collocate_time_default_key: Optional[str] = None
+    if collocate_time_slider_enabled:
+        for idx, dt in enumerate(time_index):
+            label_iso = time_labels[idx] if idx < len(time_labels) else dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+            try:
+                display_label = dt.strftime('%Y-%m-%d')
+            except Exception:
+                display_label = label_iso
+            collocate_time_bins_payload.append({'key': str(idx + 1), 'label': display_label, 'iso': label_iso})
+        if len(collocate_time_bins_payload) <= 1:
+            collocate_time_slider_enabled = False
+            collocate_time_bins_payload = []
+        else:
+            if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time'):
+                if collocate_rank_time_key:
+                    candidate_key = str(collocate_rank_time_key).strip()
+                    if any(bin_info['key'] == candidate_key for bin_info in collocate_time_bins_payload):
+                        collocate_time_default_key = candidate_key
+            if collocate_time_default_key is None and collocate_time_bins_payload:
+                collocate_time_default_key = collocate_time_bins_payload[0]['key']
 
     start_str = start_meta or (min_dt.strftime('%Y-%m-%d') if min_dt else '')
     end_str = end_meta or (max_dt.strftime('%Y-%m-%d') if max_dt else '')
@@ -1458,7 +1518,7 @@ def create_map(
             'place_label': place_label,
         }
 
-        if time_enabled and use_time_slider and time_index:
+        if (use_time_slider or rank_time_bins) and time_index:
             time_bins: Dict[str, Dict[str, Any]] = {}
             for idx_entry, entry in enumerate(entries):
                 dt = entry.get('date')
@@ -1506,7 +1566,14 @@ def create_map(
     initial_collocate_term: str = ''
     initial_collocate_summary_text: str = ''
     if collocate_rank_mode:
-        collocate_terms_list, rank_index, rank_max_value, collocate_hits_by_city = _build_collocate_rank_index(
+        (
+            collocate_terms_list,
+            rank_index,
+            rank_max_value,
+            collocate_hits_by_city,
+            collocate_time_totals,
+            collocate_time_labels,
+        ) = _build_collocate_rank_index(
             groups,
             popup_dataset,
             search_term,
@@ -1604,6 +1671,29 @@ def create_map(
 
         initial_collocate_summary_text = _format_collocate_summary(initial_collocate_term)
 
+        scope_norm = str(collocate_rank_term_scope or '').strip().lower()
+        if scope_norm.startswith('time') and collocate_rank_time_key:
+            raw_key = str(collocate_rank_time_key).strip()
+            key_variants = [raw_key] if raw_key else []
+            label_variant = collocate_time_labels.get(raw_key)
+            if label_variant:
+                key_variants.append(label_variant)
+            combined_counter = Counter()
+            for candidate in key_variants:
+                if not candidate:
+                    continue
+                counter = collocate_time_totals.get(candidate)
+                if counter:
+                    combined_counter.update(counter)
+            if combined_counter:
+                scoped_terms = [
+                    term for term, _freq in _sorted_counter_terms(combined_counter) if term
+                ][:collocate_rank_top_n]
+                if scoped_terms:
+                    collocate_terms_list = scoped_terms
+                    initial_collocate_term = collocate_terms_list[0]
+                    initial_collocate_summary_text = _format_collocate_summary(initial_collocate_term)
+
     if groups and not any(v > 0 for v in values):
         for group in groups:
             group["value"] = 1.0
@@ -1644,10 +1734,11 @@ def create_map(
         min_dt = max_dt = None
 
     dated_pts = [p for p in pts if p.get("date") is not None]
+    rank_time_bins = collocate_rank_mode and bool(dated_pts)
     use_time_slider = bool(dated_pts) and time_enabled
     time_index: List[datetime] = []
     time_labels: List[str] = []
-    if use_time_slider and min_dt and max_dt:
+    if (use_time_slider or rank_time_bins) and min_dt and max_dt:
         time_index = _build_time_index(min_dt, max_dt, time_unit, max(1, int(time_step or 1)))
         time_labels = [dt.strftime('%Y-%m-%dT%H:%M:%SZ') for dt in time_index]
 
@@ -1955,16 +2046,37 @@ def create_map(
             _strip_inline_articles(dataset_entry.get('entries'))
             _strip_inline_articles(dataset_entry.get('full_entries'))
 
-    header_lines = [f'<div><strong>File:</strong> {_esc(summary["geojson_name"])}</div>']
-    if summary.get('term'):
-        header_lines.append(f'<div><strong>Term:</strong> {_esc(summary["term"])}</div>')
+    if collocate_rank_mode:
+        metric_display_summary = 'Ranked Collocates'
+
+    search_results_text = f"{articles_count:,} articles | {len(newspaper_ids):,} newspapers | {len(city_set):,} cities"
+    search_results_line = f'<div id="collocateSearchResults" style="margin-top:4px;"><strong>Search Results:</strong> {_esc(search_results_text)}</div>'
+
+    header_lines: List[str] = []
+    if lightweight:
+        header_lines.append('<div><strong>Lightweight mode:</strong> popups and table trimmed for size.</div>')
+
+    header_lines.append(f'<div><strong>Data Source:</strong> {_esc(summary["geojson_name"])}</div>')
+
     if summary.get('date_range'):
         start, end = summary['date_range']
         date_text = start if start == end else ' – '.join([s for s in (start, end) if s])
         if date_text:
             header_lines.append(f'<div><strong>Date range:</strong> {_esc(date_text)}</div>')
-    counts_line = f"{articles_count:,} articles | {len(newspaper_ids):,} newspapers | {len(city_set):,} cities"
-    header_lines.append(f'<div><strong>Counts:</strong> {_esc(counts_line)}</div>')
+
+    if summary.get('term'):
+        header_lines.append(f'<div><strong>Term:</strong> {_esc(summary["term"])}</div>')
+
+    header_lines.append(search_results_line)
+
+    if attr_file:
+        link_name = os.path.basename(attr_file)
+        header_lines.append(
+            f'<div><a href="{html.escape(link_name)}" target="_blank" rel="noopener">Open attribute table</a></div>'
+        )
+
+    header_lines.append('<div style="height:6px;"></div>')
+
     header_lines.append(f'<div><strong>Mapped metric:</strong> {_esc(metric_display_summary)}</div>')
     if summary.get('normalized') and denom_label:
         header_lines.append(
@@ -1976,32 +2088,20 @@ def create_map(
         header_lines.append(
             f'<div><strong>Time bin:</strong> {_esc(time_text)} | <strong>Linger:</strong> {_esc(linger_text)}</div>'
         )
-    if attr_file:
-        link_name = os.path.basename(attr_file)
-        header_lines.append(
-            f'<div><a href="{html.escape(link_name)}" target="_blank" rel="noopener">Open attribute table</a></div>'
-        )
-    if lightweight:
-        header_lines.append(
-            '<div style="font-size:12px; color:#555;">Lightweight mode: popups and table trimmed for size.</div>'
-        )
 
     if collocate_rank_mode:
         summary_line_text = initial_collocate_summary_text or 'Collocate term: none selected'
-        header_lines.append(
-            f'<div id="collocateSummaryLine" style="color:#c53030; margin-top:4px;">{_esc(summary_line_text)}</div>'
-        )
-        scope_desc = 'Entire period'
+        ranking_scope_text = 'Entire period'
         if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time'):
             key_text = collocate_rank_time_key or ''
             if collocate_rank_time_label:
-                scope_desc = f'Time bin {key_text}: {collocate_rank_time_label}'
+                ranking_scope_text = collocate_rank_time_label
             elif key_text:
-                scope_desc = f'Time bin {key_text}'
+                ranking_scope_text = f'Time bin {key_text}'
             else:
-                scope_desc = 'Selected time bin'
+                ranking_scope_text = 'First time bin'
         header_lines.append(
-            f'<div><strong>Selected time bin:</strong> {_esc(scope_desc)}</div>'
+            f'<div><strong>Home time Bin:</strong> {_esc(ranking_scope_text)}</div>'
         )
 
         focus_mode_norm = (collocate_rank_focus or '').strip().lower()
@@ -2017,38 +2117,48 @@ def create_map(
         else:
             focus_desc = 'All cities'
         header_lines.append(
-            f'<div><strong>Geography filter:</strong> {_esc(focus_desc)}</div>'
+            f'<div><strong>Ranking Location:</strong> {_esc(focus_desc)}</div>'
         )
 
-    # Add collocate term selector when rank index is available
-    if collocate_terms_list:
-        select_opts_parts = []
-        for idx, term in enumerate(collocate_terms_list[:200], start=1):
-            select_opts_parts.append(
-                f'<option value="{_esc(term)}">({_esc(str(idx))}) {_esc(term)}</option>'
+        slider_placeholder = '<div id="collocateTimeSliderContainer" style="margin-top:6px;"></div>' if collocate_time_slider_enabled and collocate_time_bins_payload else ''
+
+        if collocate_terms_list:
+            select_opts_parts = []
+            for idx, term in enumerate(collocate_terms_list[:200], start=1):
+                select_opts_parts.append(
+                    f'<option value="{_esc(term)}">({_esc(str(idx))}) {_esc(term)}</option>'
+                )
+            select_opts = ''.join(select_opts_parts)
+            scope_desc = ranking_scope_text
+            if scope_desc.lower() == 'entire period':
+                scope_desc = 'entire period'
+            focus_desc = ''
+            focus_mode_norm = (collocate_rank_focus or '').strip().lower()
+            if focus_mode_norm == 'city' and collocate_rank_focus_city:
+                focus_desc = f' for {collocate_rank_focus_city}'
+                if collocate_rank_focus_state:
+                    focus_desc += f', {collocate_rank_focus_state}'
+            elif focus_mode_norm == 'state' and collocate_rank_focus_state:
+                focus_desc = f' for {collocate_rank_focus_state}'
+            scope_text = _esc(scope_desc)
+            focus_text = _esc(focus_desc)
+            header_lines.append(
+                f'<div>Top {len(collocate_terms_list)} collocates based on {scope_text}{focus_text}</div>'
             )
-        select_opts = ''.join(select_opts_parts)
-        scope_desc = 'entire period'
-        if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time') and collocate_rank_time_key:
-            scope_desc = f'time bin {collocate_rank_time_key}'
-        focus_desc = ''
-        focus_mode_norm = (collocate_rank_focus or '').strip().lower()
-        if focus_mode_norm == 'city' and collocate_rank_focus_city:
-            focus_desc = f' for {collocate_rank_focus_city}'
-            if collocate_rank_focus_state:
-                focus_desc += f', {collocate_rank_focus_state}'
-        elif focus_mode_norm == 'state' and collocate_rank_focus_state:
-            focus_desc = f' for {collocate_rank_focus_state}'
-        scope_text = _esc(scope_desc)
-        focus_text = _esc(focus_desc)
+            header_lines.append(
+                '<div style="margin-top:6px;">'
+                '<label style="font-weight:600; margin-right:6px;">Collocate term:</label>'
+                f'<select id="collocateTermSelect" style="min-width:220px;">{select_opts}</select>'
+                '</div>'
+            )
+            if slider_placeholder:
+                header_lines.append(slider_placeholder)
+        else:
+            if slider_placeholder:
+                header_lines.append(slider_placeholder)
+
         header_lines.append(
-            f'<div>Top {len(collocate_terms_list)} collocates based on {scope_text}{focus_text}</div>'
-        )
-        header_lines.append(
-            '<div style="margin-top:6px;">'
-            '<label style="font-weight:600; margin-right:6px;">Collocate term:</label>'
-            f'<select id="collocateTermSelect" style="min-width:220px;">{select_opts}</select>'
-            '</div>'
+            f'<div id="collocateSummaryLine" style="color:#c53030; margin-top:6px;">{_esc(summary_line_text)}</div>'
         )
 
     header_html = (
@@ -2081,6 +2191,20 @@ def create_map(
             'padding: 0 !important; '
             'line-height: 1; '
             '}'
+            '.collocate-time-button { '
+            'border: 1px solid #cbd5e0; '
+            'background: #f7fafc; '
+            'color: #2d3748; '
+            'border-radius: 999px; '
+            'padding: 2px 10px; '
+            'font-size: 14px; '
+            'line-height: 1; '
+            'cursor: pointer; '
+            'transition: background 0.2s ease, color 0.2s ease; '
+            '}'
+            '.collocate-time-button:hover { background: #edf2f7; color: #1a202c; }'
+            '.collocate-time-button:disabled { opacity: 0.4; cursor: default; }'
+            '#collocateTimeRange { accent-color: #2b6cb0; }'
             '</style>'
         )
         m.get_root().html.add_child(folium.Element(label_style))
@@ -2089,7 +2213,7 @@ def create_map(
         'attribute_table': os.path.basename(attr_file) if attr_file else '',
         'search_term': search_term or '',
         'inline_articles': bool(embed_articles),
-        'time_labels': time_labels if use_time_slider and time_labels else [],
+        'time_labels': time_labels if (use_time_slider or collocate_time_slider_enabled) and time_labels else [],
         'map_mode': mode,
         'click_radius_px': heat_radius_val,
         'collocate_summary': collocate_term_stats if collocate_term_stats else {},
@@ -2114,6 +2238,11 @@ def create_map(
             'focus_label': collocate_rank_focus_label or '',
             'colorize': bool(collocate_rank_colorize),
         }
+        if collocate_time_slider_enabled and collocate_time_bins_payload:
+            config_payload['collocate_time_slider'] = True
+            config_payload['collocate_time_bins'] = collocate_time_bins_payload
+            if collocate_time_default_key is not None:
+                config_payload['collocate_time_default'] = collocate_time_default_key
     config_json = json.dumps(config_payload, ensure_ascii=False).replace('</', '<\\/')
     config_script = (
         '<script id="map-config" type="application/json">'
@@ -2319,6 +2448,11 @@ def create_map(
   var collocateColorize = false;
   var initialCollocateTerm = '';
   var selectedCollocate = '';
+  var collocateTimeEnabled = false;
+  var collocateTimeBins = [];
+  var selectedTimeBinKey = null;
+  var collocateTimeManuallyDisabled = false;
+  var collocateTimeLastActiveIndex = 1;
   var activeMap = null;
   var highlightLayer = null;
   var currentHighlightId = null;
@@ -2385,6 +2519,51 @@ def create_map(
     }
     if (typeof config.initial_collocate_term === 'string') {
       initialCollocateTerm = String(config.initial_collocate_term).trim();
+    }
+    if (config.collocate_time_slider) {
+      collocateTimeEnabled = true;
+    }
+    if (Array.isArray(config.collocate_time_bins)) {
+      collocateTimeBins = config.collocate_time_bins
+        .map(function(item) {
+          if (!item) {
+            return null;
+          }
+          var key = '';
+          if (Object.prototype.hasOwnProperty.call(item, 'key')) {
+            key = String(item.key || '').trim();
+          }
+          if (!key) {
+            return null;
+          }
+          var label = '';
+          if (Object.prototype.hasOwnProperty.call(item, 'label')) {
+            label = String(item.label || '').trim();
+          }
+          var iso = '';
+          if (Object.prototype.hasOwnProperty.call(item, 'iso')) {
+            iso = String(item.iso || '').trim();
+          }
+          if (!label) {
+            label = iso || key;
+          }
+          return { key: key, label: label, iso: iso };
+        })
+        .filter(function(entry) { return entry !== null; });
+    }
+    if (collocateTimeEnabled && !collocateTimeBins.length) {
+      collocateTimeEnabled = false;
+    }
+    if (collocateTimeEnabled) {
+      var defaultTimeKey = '';
+      if (typeof config.collocate_time_default === 'string') {
+        defaultTimeKey = config.collocate_time_default.trim();
+      }
+      if (defaultTimeKey && collocateTimeBins.some(function(entry) { return entry.key === defaultTimeKey; })) {
+        selectedTimeBinKey = defaultTimeKey;
+      } else {
+        selectedTimeBinKey = null;
+      }
     }
   })();
 
@@ -2566,6 +2745,12 @@ def create_map(
   })();
 
   function currentTimeKey(mapObj) {
+    if (collocateTimeEnabled) {
+      if (!selectedTimeBinKey) {
+        return '';
+      }
+      return String(selectedTimeBinKey);
+    }
     if (!mapObj || !mapObj.timeDimension || typeof mapObj.timeDimension.getCurrentTime !== 'function') {
       return '';
     }
@@ -2615,7 +2800,7 @@ def create_map(
           if (byCity) {
             if (timeKey && byCity[timeKey] && Object.prototype.hasOwnProperty.call(byCity[timeKey], selectedCollocate)) {
               rank = byCity[timeKey][selectedCollocate];
-            } else if (byCity[''] && Object.prototype.hasOwnProperty.call(byCity[''], selectedCollocate)) {
+            } else if ((!collocateTimeEnabled || !timeKey) && byCity[''] && Object.prototype.hasOwnProperty.call(byCity[''], selectedCollocate)) {
               rank = byCity[''][selectedCollocate];
             }
           }
@@ -2789,6 +2974,21 @@ def create_map(
         }
       }
     }
+    if (collocateTimeEnabled && Array.isArray(collocateTimeBins) && collocateTimeBins.length) {
+      collocateTimeBins.forEach(function(entry) {
+        if (!entry) {
+          return;
+        }
+        if (entry.key === primary || entry.label === primary || entry.iso === primary) {
+          if (entry.key && keys.indexOf(entry.key) === -1) {
+            keys.push(entry.key);
+          }
+          if (entry.iso && keys.indexOf(entry.iso) === -1) {
+            keys.push(entry.iso);
+          }
+        }
+      });
+    }
     if (typeof timeValue === 'string' && Array.isArray(timeLabels) && timeLabels.length) {
       var parsed = Number(timeValue);
       if (Number.isFinite(parsed) && parsed >= 1 && parsed <= timeLabels.length) {
@@ -2800,6 +3000,249 @@ def create_map(
     }
     return keys;
   }
+
+  function labelForTimeKey(key) {
+    if (!collocateTimeEnabled || !collocateTimeBins.length) {
+      return '';
+    }
+    if (!key) {
+      return 'All bins';
+    }
+    for (var i = 0; i < collocateTimeBins.length; i++) {
+      var entry = collocateTimeBins[i];
+      if (entry && entry.key === key) {
+        return entry.label || entry.key;
+      }
+    }
+    return key;
+  }
+
+  function initCollocateTimeControls() {
+    if (!collocateTimeEnabled || !collocateTimeBins.length) {
+      collocateTimeManuallyDisabled = false;
+      collocateTimeLastActiveIndex = 1;
+      return;
+    }
+    var host = document.getElementById('collocateTimeSliderContainer');
+    if (!host) {
+      return;
+    }
+    host.innerHTML = '';
+
+    var title = document.createElement('div');
+    title.style.fontWeight = '600';
+    title.textContent = 'Time bin:';
+    host.appendChild(title);
+
+    var row = document.createElement('div');
+    row.style.marginTop = '4px';
+    row.style.display = 'flex';
+    row.style.alignItems = 'center';
+    row.style.gap = '6px';
+    row.style.flexWrap = 'nowrap';
+
+    var prevBtn = document.createElement('button');
+    prevBtn.type = 'button';
+    prevBtn.textContent = '‹';
+    prevBtn.title = 'Previous time bin';
+    prevBtn.className = 'collocate-time-button';
+
+    var slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = String(collocateTimeBins.length);
+    slider.step = '1';
+    slider.id = 'collocateTimeRange';
+    slider.style.width = '200px';
+    slider.style.flex = '1 1 160px';
+    slider.style.minWidth = '140px';
+    slider.setAttribute('aria-label', 'Collocate time bin');
+
+    var nextBtn = document.createElement('button');
+    nextBtn.type = 'button';
+    nextBtn.textContent = '›';
+    nextBtn.title = 'Next time bin';
+    nextBtn.className = 'collocate-time-button';
+
+    var toggleBtn = document.createElement('button');
+    toggleBtn.type = 'button';
+    toggleBtn.className = 'collocate-time-button';
+    toggleBtn.style.border = 'none';
+    toggleBtn.style.background = 'none';
+    toggleBtn.style.cursor = 'pointer';
+    toggleBtn.style.fontSize = '16px';
+    toggleBtn.style.lineHeight = '1';
+    toggleBtn.style.padding = '2px 6px';
+    toggleBtn.style.flex = '0 0 auto';
+    toggleBtn.style.minWidth = '32px';
+    toggleBtn.style.textAlign = 'center';
+
+    var sliderLabel = document.createElement('span');
+    sliderLabel.id = 'collocateTimeRangeLabel';
+    sliderLabel.style.fontWeight = '600';
+    sliderLabel.style.flex = '0 0 auto';
+    sliderLabel.style.whiteSpace = 'nowrap';
+
+    row.appendChild(prevBtn);
+    row.appendChild(slider);
+    row.appendChild(nextBtn);
+    row.appendChild(toggleBtn);
+    row.appendChild(sliderLabel);
+    host.appendChild(row);
+
+    var totalBins = collocateTimeBins.length;
+    var defaultIndex = 0;
+    if (!collocateTimeManuallyDisabled && selectedTimeBinKey) {
+      for (var i = 0; i < totalBins; i++) {
+        if (collocateTimeBins[i] && collocateTimeBins[i].key === selectedTimeBinKey) {
+          defaultIndex = i + 1;
+          collocateTimeLastActiveIndex = defaultIndex;
+          break;
+        }
+      }
+      if (!defaultIndex) {
+        selectedTimeBinKey = null;
+      }
+    }
+    if (!collocateTimeManuallyDisabled && !defaultIndex && totalBins) {
+      var candidate = Number(collocateTimeLastActiveIndex);
+      if (Number.isFinite(candidate) && candidate >= 1 && candidate <= totalBins) {
+        defaultIndex = candidate;
+        selectedTimeBinKey = collocateTimeBins[candidate - 1].key;
+      }
+    }
+    if (!collocateTimeManuallyDisabled && !defaultIndex && totalBins) {
+      defaultIndex = 1;
+      selectedTimeBinKey = collocateTimeBins[0].key;
+    }
+    if (!collocateTimeManuallyDisabled && defaultIndex > 0) {
+      collocateTimeLastActiveIndex = defaultIndex;
+    }
+
+    if (collocateTimeManuallyDisabled) {
+      slider.value = '0';
+      selectedTimeBinKey = null;
+    } else {
+      slider.value = String(defaultIndex);
+    }
+
+    function updateLabel(emit) {
+      var idx = parseInt(slider.value || '0', 10);
+      if (!Number.isFinite(idx) || idx <= 0 || collocateTimeManuallyDisabled) {
+        selectedTimeBinKey = null;
+        sliderLabel.textContent = 'All bins';
+      } else {
+        var entry = collocateTimeBins[Math.min(collocateTimeBins.length, Math.max(1, idx)) - 1];
+        if (entry) {
+          selectedTimeBinKey = entry.key;
+          sliderLabel.textContent = entry.label || entry.key;
+          collocateTimeLastActiveIndex = idx;
+        } else {
+          selectedTimeBinKey = null;
+          sliderLabel.textContent = 'All bins';
+        }
+      }
+      if (emit && activeMap) {
+        applyTimeFilter(activeMap);
+        refreshCollocateSizes(activeMap);
+        updateCollocateSummaryLineFromDataset(popupCache);
+      }
+    }
+
+    function updateToggleState() {
+      if (collocateTimeManuallyDisabled) {
+        toggleBtn.textContent = '🕒✕';
+        toggleBtn.title = 'Time disabled (all bins showing)';
+        toggleBtn.setAttribute('aria-pressed', 'true');
+        toggleBtn.style.color = '#c53030';
+        slider.disabled = true;
+        prevBtn.disabled = true;
+        nextBtn.disabled = true;
+      } else {
+        toggleBtn.textContent = '🕒';
+        toggleBtn.title = 'Disable Time';
+        toggleBtn.setAttribute('aria-pressed', 'false');
+        toggleBtn.style.color = '#2b6cb0';
+        slider.disabled = false;
+        prevBtn.disabled = false;
+        nextBtn.disabled = false;
+      }
+      toggleBtn.setAttribute('aria-label', toggleBtn.title);
+    }
+
+    slider.addEventListener('input', function() {
+      if (collocateTimeManuallyDisabled) {
+        return;
+      }
+      updateLabel(true);
+    });
+
+    function stepSlider(delta) {
+      if (collocateTimeManuallyDisabled) {
+        return;
+      }
+      var current = parseInt(slider.value || '0', 10);
+      if (!Number.isFinite(current)) {
+        current = 0;
+      }
+      var nextVal = current + delta;
+      var maxVal = parseInt(slider.max || '0', 10);
+      if (!Number.isFinite(maxVal) || maxVal < 0) {
+        maxVal = collocateTimeBins.length;
+      }
+      if (nextVal < 0) {
+        nextVal = 0;
+      }
+      if (nextVal > maxVal) {
+        nextVal = maxVal;
+      }
+      if (String(nextVal) === slider.value) {
+        return;
+      }
+      slider.value = String(nextVal);
+      updateLabel(true);
+    }
+
+    prevBtn.addEventListener('click', function() {
+      stepSlider(-1);
+    });
+    nextBtn.addEventListener('click', function() {
+      stepSlider(1);
+    });
+
+    toggleBtn.addEventListener('click', function() {
+      if (!collocateTimeManuallyDisabled) {
+        var currentVal = parseInt(slider.value || '0', 10);
+        if (Number.isFinite(currentVal) && currentVal > 0) {
+          collocateTimeLastActiveIndex = currentVal;
+        }
+        collocateTimeManuallyDisabled = true;
+        slider.value = '0';
+        updateToggleState();
+        updateLabel(true);
+        return;
+      }
+      collocateTimeManuallyDisabled = false;
+      var maxVal = parseInt(slider.max || '0', 10);
+      if (!Number.isFinite(maxVal) || maxVal < 1) {
+        maxVal = collocateTimeBins.length;
+      }
+      var restore = parseInt(collocateTimeLastActiveIndex || '0', 10);
+      if (!Number.isFinite(restore) || restore < 1) {
+        restore = 1;
+      }
+      if (restore > maxVal) {
+        restore = maxVal;
+      }
+      slider.value = String(restore);
+      updateToggleState();
+      updateLabel(true);
+    });
+
+    updateToggleState();
+    updateLabel(false);
+  }
+
 
   function formatInteger(value) {
     var num = Number(value);
@@ -2860,6 +3303,12 @@ def create_map(
       + formatInteger(stats.articles) + ' articles | '
       + formatInteger(stats.newspapers) + ' newspapers | '
       + formatInteger(stats.cities) + ' cities';
+    if (collocateTimeEnabled) {
+      var timeLabel = labelForTimeKey(selectedTimeBinKey);
+      if (timeLabel) {
+        line.textContent += ' | Time: ' + timeLabel;
+      }
+    }
   }
 
   function interpolateColor(startHex, endHex, t) {
@@ -3413,13 +3862,23 @@ def create_map(
   }
 
   function applyTimeFilter(mapObj) {
-    if (!mapObj || !mapObj.timeDimension || typeof mapObj.timeDimension.getCurrentTime !== 'function') {
-      return;
-    }
-    var rawTime = mapObj.timeDimension.getCurrentTime();
-    var currentKeys = resolveTimeKeys(rawTime);
-    if (!currentKeys.length) {
-      return;
+    var currentKeys = [];
+    var useAllBins = false;
+    if (collocateTimeEnabled) {
+      if (!collocateTimeBins.length || !selectedTimeBinKey) {
+        useAllBins = true;
+      } else {
+        currentKeys = resolveTimeKeys(selectedTimeBinKey);
+      }
+    } else {
+      if (!mapObj || !mapObj.timeDimension || typeof mapObj.timeDimension.getCurrentTime !== 'function') {
+        return;
+      }
+      var rawTime = mapObj.timeDimension.getCurrentTime();
+      currentKeys = resolveTimeKeys(rawTime);
+      if (!currentKeys.length) {
+        return;
+      }
     }
     loadData(function(dataset) {
       var keys = Object.keys(dataset || {});
@@ -3446,29 +3905,48 @@ def create_map(
         var titleResult = data.full_title;
         var timeLabelResult = '';
         var hasTimeFilter = false;
-        if (data.time_bins) {
+        if (data.time_bins && !useAllBins) {
           hasTimeFilter = true;
           var bin = null;
-          for (var ck = 0; ck < currentKeys.length; ck++) {
-            var attempt = currentKeys[ck];
-            if (!attempt) {
-              continue;
-            }
-            if (data.time_bins && Object.prototype.hasOwnProperty.call(data.time_bins, attempt)) {
-              bin = data.time_bins[attempt];
-              if (bin) {
-                break;
+          if (currentKeys && currentKeys.length) {
+            for (var ck = 0; ck < currentKeys.length; ck++) {
+              var attempt = currentKeys[ck];
+              if (!attempt) {
+                continue;
               }
-            }
-            if (Array.isArray(timeLabels) && timeLabels.length) {
-              var idxCandidate = Number(attempt);
-              if (Number.isFinite(idxCandidate) && idxCandidate >= 1 && idxCandidate <= timeLabels.length) {
-                var altKey = timeLabels[idxCandidate - 1];
-                if (altKey && data.time_bins && Object.prototype.hasOwnProperty.call(data.time_bins, altKey)) {
-                  bin = data.time_bins[altKey];
-                  if (bin) {
-                    break;
+              if (Object.prototype.hasOwnProperty.call(data.time_bins, attempt)) {
+                bin = data.time_bins[attempt];
+                if (bin) {
+                  break;
+                }
+              }
+              if (Array.isArray(timeLabels) && timeLabels.length) {
+                var idxCandidate = Number(attempt);
+                if (Number.isFinite(idxCandidate) && idxCandidate >= 1 && idxCandidate <= timeLabels.length) {
+                  var altKey = timeLabels[idxCandidate - 1];
+                  if (altKey && Object.prototype.hasOwnProperty.call(data.time_bins, altKey)) {
+                    bin = data.time_bins[altKey];
+                    if (bin) {
+                      break;
+                    }
                   }
+                }
+              }
+              if (collocateTimeEnabled && collocateTimeBins.length) {
+                for (var tb = 0; tb < collocateTimeBins.length; tb++) {
+                  var entry = collocateTimeBins[tb];
+                  if (!entry) {
+                    continue;
+                  }
+                  if (entry.key === attempt && entry.iso && Object.prototype.hasOwnProperty.call(data.time_bins, entry.iso)) {
+                    bin = data.time_bins[entry.iso];
+                    if (bin) {
+                      break;
+                    }
+                  }
+                }
+                if (bin) {
+                  break;
                 }
               }
             }
@@ -3672,6 +4150,31 @@ def create_map(
       el.setAttribute('data-scroll-guard', '1');
     }
   }
+
+  function enableHoverScroll(container, scrollTarget) {
+    if (!container || !scrollTarget) {
+      return;
+    }
+    if (container.__hoverScrollAttached) {
+      return;
+    }
+    container.addEventListener('wheel', function(ev) {
+      if (!scrollTarget || ev.defaultPrevented) {
+        return;
+      }
+      if (scrollTarget.contains(ev.target)) {
+        return;
+      }
+      if (scrollTarget.scrollHeight <= scrollTarget.clientHeight) {
+        return;
+      }
+      scrollTarget.scrollTop += ev.deltaY;
+      if (typeof ev.preventDefault === 'function') {
+        ev.preventDefault();
+      }
+    }, { passive: false });
+    container.__hoverScrollAttached = true;
+  }
   function getPinKey(root) {
     if (!root) {
       return '';
@@ -3700,17 +4203,22 @@ function getDockPanel() {
       var existingBody = panel.querySelector('[data-dock-body]');
       if (existingBody) {
         addScrollGuards(existingBody);
+        enableHoverScroll(panel, existingBody);
       }
+      positionDockPanel(panel);
       return panel;
     }
     panel = document.createElement('div');
     panel.setAttribute('data-dock-panel', '1');
     panel.style.position = 'absolute';
-    panel.style.top = '140px';
+    panel.style.top = 'auto';
     panel.style.left = '16px';
-    panel.style.width = '340px';
-    panel.style.maxHeight = 'calc(100vh - 170px)';
-    panel.style.overflow = 'auto';
+    panel.style.right = 'auto';
+    panel.style.width = '360px';
+    panel.style.minWidth = '260px';
+    panel.style.minHeight = '180px';
+    panel.style.resize = 'both';
+    panel.style.overflow = 'hidden';
     panel.style.zIndex = '410';
     panel.style.background = 'rgba(255,255,255,0.96)';
     panel.style.borderRadius = '6px';
@@ -3758,7 +4266,32 @@ function getDockPanel() {
     parent.appendChild(panel);
     addScrollGuards(panel);
     addScrollGuards(body);
+    enableHoverScroll(panel, body);
+    positionDockPanel(panel);
     return panel;
+  }
+
+  function positionDockPanel(panel) {
+    if (!panel) {
+      return;
+    }
+    var isHeatmap = mapMode === 'heatmap';
+    var topBuffer = isHeatmap ? 200 : 140;
+    var bottomBuffer = isHeatmap ? 32 : 16;
+    panel.style.top = 'auto';
+    panel.style.right = 'auto';
+    panel.style.left = '16px';
+    panel.style.bottom = bottomBuffer + 'px';
+    var combinedBuffer = topBuffer + bottomBuffer;
+    panel.style.maxHeight = 'min(65vh, calc(100vh - ' + combinedBuffer + 'px))';
+  }
+
+  function refreshDockPanelLayout() {
+    var panel = document.querySelector('[data-dock-panel]');
+    if (!panel) {
+      return;
+    }
+    positionDockPanel(panel);
   }
 
   function getDockBody() {
@@ -3767,6 +4300,7 @@ function getDockPanel() {
 
   function showDockPanel() {
     var panel = getDockPanel();
+    positionDockPanel(panel);
     panel.style.display = 'block';
   }
 
@@ -3782,6 +4316,7 @@ function getPinPanel() {
       var existingBody = panel.querySelector('[data-pin-body]');
       if (existingBody) {
         addScrollGuards(existingBody);
+        enableHoverScroll(panel, existingBody);
       }
       return panel;
     }
@@ -3798,6 +4333,8 @@ function getPinPanel() {
     panel.style.borderRadius = '6px';
     panel.style.boxShadow = '0 1px 6px rgba(0,0,0,0.25)';
     panel.style.display = 'none';
+    panel.style.flexDirection = 'column';
+    panel.style.alignItems = 'stretch';
     panel.style.padding = '0';
     panel.style.boxSizing = 'border-box';
 
@@ -3834,6 +4371,8 @@ function getPinPanel() {
     body.style.flexDirection = 'column';
     body.style.gap = '10px';
     body.style.overflowY = 'auto';
+    body.style.flex = '1 1 auto';
+    body.style.minHeight = '0';
 
     panel.appendChild(header);
     panel.appendChild(body);
@@ -3842,6 +4381,7 @@ function getPinPanel() {
     parent.appendChild(panel);
     addScrollGuards(panel);
     addScrollGuards(body);
+    enableHoverScroll(panel, body);
     return panel;
   }
 
@@ -3851,11 +4391,12 @@ function getPinPanel() {
 
   function updatePinPanelVisibility() {
     var panel = getPinPanel();
-    panel.style.display = pinState.entries.size ? 'block' : 'none';
+    panel.style.display = pinState.entries.size ? 'flex' : 'none';
     if (panel.style.display !== 'none') {
       var body = getPinBody();
       if (body) {
         addScrollGuards(body);
+        enableHoverScroll(panel, body);
       }
     }
   }
@@ -3947,8 +4488,8 @@ function getPinPanel() {
     wrapper.style.boxShadow = '0 1px 4px rgba(0,0,0,0.1)';
     wrapper.style.padding = '10px';
     wrapper.style.position = 'relative';
-    wrapper.style.maxHeight = '360px';
-    wrapper.style.overflowY = 'auto';
+    wrapper.style.maxHeight = 'none';
+    wrapper.style.overflow = 'visible';
 
     var clone = root.cloneNode(true);
     var clonePinBtn = clone.querySelector('[data-pin-toggle="1"]');
@@ -3964,8 +4505,6 @@ function getPinPanel() {
 
     attach(clone);
     preparePinnedClone(clone, key);
-    addScrollGuards(wrapper);
-    addScrollGuards(clone);
 
     pinState.entries.set(key, {
       wrapper: wrapper,
@@ -3996,7 +4535,7 @@ function getPinPanel() {
     addScrollGuards(body);
     showDockPanel();
     var panel = getDockPanel();
-    panel.style.top = mapMode === 'heatmap' ? '200px' : '140px';
+    positionDockPanel(panel);
     if (mapObj && typeof mapObj.closePopup === 'function') {
       mapObj.closePopup(popupObj);
     }
@@ -4357,6 +4896,7 @@ function attach(root) {
   function init() {
     whenMapReady(function(mapObj) {
       activeMap = mapObj;
+      initCollocateTimeControls();
       applyTimeFilter(mapObj);
       // Initialize collocate selector default and first sizing
       (function initCollocateSelector(){
@@ -4425,6 +4965,9 @@ function attach(root) {
   } else {
     init();
   }
+  if (typeof window !== 'undefined' && window && typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', refreshDockPanelLayout);
+  }
 ${cluster_block}
 })();
 """)
@@ -4432,6 +4975,60 @@ ${cluster_block}
     m.get_root().script.add_child(folium.Element(script_html))
 
     m.save(out_html)
+    metadata_paths: Dict[str, str] = {}
+    metadata_common = {
+        'tool': 'create_map',
+        'parameters': {
+            'mode': mode,
+            'time_unit': time_unit,
+            'time_step': time_step,
+            'linger_unit': linger_unit,
+            'linger_step': linger_step,
+            'disable_time': disable_time,
+            'metric': metric,
+            'normalize': normalize,
+            'normalize_denominator': normalize_denominator,
+            'lightweight': lightweight,
+            'table_mode': table_mode,
+            'table_row_limit': table_row_limit,
+            'heat_radius': heat_radius,
+            'heat_value': heat_value,
+            'grad_min_radius': grad_min_radius,
+            'grad_max_radius': grad_max_radius,
+            'collocate_rank_mode': collocate_rank_mode,
+            'collocate_drop_stopwords': collocate_drop_stopwords,
+            'collocate_window': collocate_window,
+            'collocate_rank_top_n': collocate_rank_top_n,
+            'collocate_rank_term_scope': collocate_rank_term_scope,
+            'collocate_rank_time_key': collocate_rank_time_key,
+            'collocate_rank_focus': collocate_rank_focus,
+            'collocate_rank_focus_city': collocate_rank_focus_city,
+            'collocate_rank_focus_state': collocate_rank_focus_state,
+            'collocate_rank_time_label': collocate_rank_time_label,
+            'collocate_rank_focus_label': collocate_rank_focus_label,
+            'collocate_rank_colorize': collocate_rank_colorize,
+            'collocate_time_slider': collocate_time_slider_enabled,
+        },
+        'inputs': {
+            'geojson_path': geojson_path,
+        },
+        'summary': summary,
+        'config': config_payload,
+        'collocate_term_stats': collocate_term_stats,
+    }
+
+    meta_payload_map = dict(metadata_common)
+    meta_payload_map.update({'output_type': 'map_html'})
+    meta_path = write_metadata_file(project_dir, out_html, meta_payload_map, enabled=metadata_enabled)
+    if meta_path:
+        metadata_paths['map_html'] = meta_path
+    if attr_file:
+        attr_meta = dict(metadata_common)
+        attr_meta.update({'output_type': 'attribute_table_html'})
+        meta_path = write_metadata_file(project_dir, attr_file, attr_meta, enabled=metadata_enabled)
+        if meta_path:
+            metadata_paths['attribute_table'] = meta_path
+
     result: Dict[str, Optional[str]] = {"map_path": out_html, 'summary': summary}
     if attr_file:
         result["attribute_table"] = attr_file
@@ -4443,5 +5040,8 @@ ${cluster_block}
         'lightweight': lightweight,
         'table_mode': table_mode_norm,
         'table_row_limit': row_limit_val or 0,
+        'collocate_time_slider': collocate_time_slider_enabled,
     }
+    if metadata_paths:
+        result['metadata'] = metadata_paths
     return result

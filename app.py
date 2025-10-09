@@ -46,6 +46,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QRadioButton,
     QStyle,
+    QToolButton,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -307,6 +308,7 @@ class MainWindow(QMainWindow):
         self.collocation_state = {'dropped_terms': []}
         self.collocation_drop_terms = []
         self.map_settings = _default_map_settings()
+        self.metadata_enabled = True
         self.init_ui()
         self._close_filter = CloseShortcutFilter()
         QApplication.instance().installEventFilter(self._close_filter)
@@ -371,6 +373,11 @@ class MainWindow(QMainWindow):
         self.btn_map.clicked.connect(self.open_create_map_dialog)
         for btn in (self.btn_download, self.btn_update, self.btn_collocate, self.btn_map):
             main_layout.addWidget(btn)
+
+        self.metadata_checkbox = QCheckBox('Create metadata JSON for all output files')
+        self.metadata_checkbox.setChecked(self.metadata_enabled)
+        self.metadata_checkbox.stateChanged.connect(self._on_metadata_checkbox_toggled)
+        main_layout.addWidget(self.metadata_checkbox)
 
         self._init_project_log()
         self._update_primary_button_styles()
@@ -560,6 +567,9 @@ class MainWindow(QMainWindow):
             else:
                 btn.setStyleSheet('')
 
+    def _on_metadata_checkbox_toggled(self, state: int):
+        self.metadata_enabled = state == Qt.Checked
+
     @staticmethod
     def _search_tool_highlight_style() -> str:
         return (
@@ -602,6 +612,11 @@ class MainWindow(QMainWindow):
         self.collocation_state = {'dropped_terms': []}
         self.collocation_drop_terms = []
         self.map_settings = _default_map_settings()
+        self.metadata_enabled = True
+        if hasattr(self, 'metadata_checkbox'):
+            self.metadata_checkbox.blockSignals(True)
+            self.metadata_checkbox.setChecked(True)
+            self.metadata_checkbox.blockSignals(False)
 
         self.ensure_dataset_folder(prompt=False)
         self._update_loaded_file_labels()
@@ -655,6 +670,12 @@ class MainWindow(QMainWindow):
             self.collocation_drop_terms = []
         if isinstance(self.collocation_state, dict):
             self.collocation_state['dropped_terms'] = list(self.collocation_drop_terms)
+
+        self.metadata_enabled = bool(data.get('metadata_enabled', True))
+        if hasattr(self, 'metadata_checkbox'):
+            self.metadata_checkbox.blockSignals(True)
+            self.metadata_checkbox.setChecked(self.metadata_enabled)
+            self.metadata_checkbox.blockSignals(False)
 
         search_log = data.get('search_log_history')
         if search_log is None:
@@ -714,6 +735,7 @@ class MainWindow(QMainWindow):
             'map_settings': dict(self.map_settings),
             'collocation_state': dict(self.collocation_state),
             'collocation_drop_terms': list(self.collocation_drop_terms),
+            'metadata_enabled': bool(self.metadata_enabled),
         }
 
         try:
@@ -1239,7 +1261,8 @@ class DownloadDialog(QDialog):
                 'lowercase_articles': self.clean_lowercase_cb.isChecked(),
                 'urls_to_pdf': self.clean_urls_cb.isChecked(),
                 'collapse_hyphenated_breaks': self.clean_hyphen_cb.isChecked(),
-            }
+            },
+            metadata_enabled=getattr(self.parent(), 'metadata_enabled', True),
         )
         self.thread.progress.connect(self.update_progress)
         self.thread.finished.connect(self.download_finished)
@@ -1772,12 +1795,32 @@ class CollocateMapSettingsDialog(QDialog):
         self.colorize_check = QCheckBox('Color markers by collocate article count')
         form.addRow(self.colorize_check)
 
+        time_row = QWidget()
+        time_layout = QHBoxLayout(time_row)
+        time_layout.setContentsMargins(0, 0, 0, 0)
+        time_layout.setSpacing(6)
+        self.enable_time_slider = QCheckBox('Enable time slider')
+        self.enable_time_slider.setEnabled(bool(time_bins))
+        if time_bins:
+            self.enable_time_slider.setChecked(True)
+        info_btn = QToolButton()
+        info_btn.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxInformation))
+        info_btn.setAutoRaise(True)
+        info_btn.setStyleSheet('QToolButton { background: transparent; border: none; }')
+        info_btn.setToolTip(
+            'To change the time bin size, re-run the collocation analysis and adjust the Bin Size and Time Unit options.'
+        )
+        time_layout.addWidget(self.enable_time_slider)
+        time_layout.addWidget(info_btn)
+        time_layout.addStretch(1)
+        form.addRow('Time controls:', time_row)
+
         layout.addLayout(form)
 
         scope_box = QGroupBox('Term selection scope')
         scope_layout = QVBoxLayout(scope_box)
         self.global_radio = QRadioButton('Use entire time period')
-        self.time_radio = QRadioButton('Use specific time bin')
+        self.time_radio = QRadioButton('Home time bin')
         self.global_radio.setChecked(True)
         self.time_radio.setEnabled(bool(time_bins))
         scope_layout.addWidget(self.global_radio)
@@ -1791,7 +1834,12 @@ class CollocateMapSettingsDialog(QDialog):
         layout.addWidget(scope_box)
 
         def _update_time_enabled():
-            self.time_combo.setEnabled(self.time_radio.isChecked() and self.time_combo.count() > 0)
+            enabled = self.time_radio.isChecked() and self.time_combo.count() > 0
+            self.time_combo.setEnabled(enabled)
+            has_bins = self.time_combo.count() > 0
+            self.enable_time_slider.setEnabled(has_bins)
+            if not has_bins:
+                self.enable_time_slider.setChecked(False)
 
         self.global_radio.toggled.connect(lambda _checked: _update_time_enabled())
         self.time_radio.toggled.connect(lambda _checked: _update_time_enabled())
@@ -1888,6 +1936,7 @@ class CollocateMapSettingsDialog(QDialog):
             'location_state': str(state_val or ''),
             'colorize': self.colorize_check.isChecked(),
             'location_label': location_label,
+            'enable_time_slider': self.enable_time_slider.isEnabled() and self.enable_time_slider.isChecked(),
         }
 
 
@@ -2260,6 +2309,8 @@ class MapToolDialog(QDialog):
                 lightweight=cfg.get('lightweight'),
                 table_mode=cfg.get('table_mode'),
                 table_row_limit=cfg.get('table_row_limit'),
+                metadata_enabled=getattr(parent, 'metadata_enabled', True) if parent else True,
+                project_dir=parent.project_folder if parent else None,
             )
         except Exception as exc:
             QMessageBox.critical(self, 'Map Error', f'Failed to create map:\n{exc}')
@@ -2623,12 +2674,18 @@ class CollocationDialog(QDialog):
         self.ignore_bin.setChecked(True)
         form.addRow(self.ignore_bin)
 
-        # Additional collocation options (checkboxes)
+        # Additional collocation options (checkboxes) added lower in layout
+        self._checkbox_order = [
+            'include_page_count',
+            'include_first_last_date',
+            'include_cooccurrence_rate',
+            'include_relative_position',
+            'drop_stopwords',
+        ]
         self.checks = {}
-        for opt in ['include_page_count', 'include_first_last_date', 'include_cooccurrence_rate', 'include_relative_position', 'drop_stopwords']:
+        for opt in self._checkbox_order:
             cb = QCheckBox(opt)
             cb.setChecked(True)
-            form.addRow(cb)
             self.checks[opt] = cb
 
         form_widget = QWidget()
@@ -2674,10 +2731,49 @@ class CollocationDialog(QDialog):
         options_row.addLayout(drop_column, 0)
         layout.addLayout(options_row)
 
+        lower_row = QHBoxLayout()
+        lower_row.setContentsMargins(0, 12, 0, 0)
+        lower_row.setSpacing(20)
+
+        options_group = QGroupBox('Collocation Options')
+        options_group.setAlignment(Qt.AlignLeft)
+        options_group_layout = QVBoxLayout(options_group)
+        options_group_layout.setContentsMargins(12, 12, 12, 12)
+        for opt in self._checkbox_order:
+            cb = self.checks[opt]
+            options_group_layout.addWidget(cb)
+        options_group_layout.addStretch(1)
+        lower_row.addWidget(options_group, 1)
+
+        context_group = QGroupBox('Context Window')
+        context_group.setAlignment(Qt.AlignLeft)
+        context_layout = QHBoxLayout(context_group)
+        context_layout.setContentsMargins(12, 12, 12, 12)
+        context_layout.setSpacing(6)
+        context_label = QLabel('Context words:')
+        context_layout.addWidget(context_label)
+        self.context_left_spin = QSpinBox()
+        self.context_left_spin.setRange(0, 99)
+        self.context_left_spin.setValue(5)
+        self.context_left_spin.setFixedWidth(60)
+        context_layout.addWidget(self.context_left_spin)
+        self.keyword_label = QLabel('<keyword>')
+        self.keyword_label.setTextFormat(Qt.PlainText)
+        context_layout.addWidget(self.keyword_label)
+        self.context_right_spin = QSpinBox()
+        self.context_right_spin.setRange(0, 99)
+        self.context_right_spin.setValue(5)
+        self.context_right_spin.setFixedWidth(60)
+        context_layout.addWidget(self.context_right_spin)
+        context_layout.addStretch(1)
+        lower_row.addWidget(context_group, 0)
+        layout.addLayout(lower_row)
+
         self._loading_defaults = True
         self._restore_state_or_defaults()
         self._loading_defaults = False
         self._update_drop_summary()
+        self._update_context_keyword_label()
         self._set_clear_notice('')
 
         self.bin_size.textEdited.connect(self._handle_bin_control_change)
@@ -2685,13 +2781,15 @@ class CollocationDialog(QDialog):
         self.ignore_bin.stateChanged.connect(lambda *_: self._save_state())
         self.city_combo.currentIndexChanged.connect(lambda *_: self._save_state())
         self.state_combo.currentIndexChanged.connect(lambda *_: self._save_state())
-        self.term_input.textEdited.connect(lambda _text: self._save_state())
+        self.term_input.textEdited.connect(self._on_term_edited)
         self.start_input.textEdited.connect(lambda _text: self._save_state())
         self.end_input.textEdited.connect(lambda _text: self._save_state())
         self.mode_geo.toggled.connect(lambda _: self._save_state())
         self.mode_json.toggled.connect(lambda _: self._save_state())
         for cb in self.checks.values():
             cb.stateChanged.connect(lambda *_: self._save_state())
+        self.context_left_spin.valueChanged.connect(lambda *_: self._save_state())
+        self.context_right_spin.valueChanged.connect(lambda *_: self._save_state())
 
         # Action buttons
         btn_run = QPushButton('Run Collocation')
@@ -2749,6 +2847,9 @@ class CollocationDialog(QDialog):
         # Collocation options influence tokenization
         opts = self._collect_options()
         drop_stop = bool(opts.get('drop_stopwords', False))
+        context_left = self.context_left_spin.value()
+        context_right = self.context_right_spin.value()
+        context_window = max(context_left, context_right)
 
         # Gather geo metadata for settings dialog
         try:
@@ -2830,12 +2931,18 @@ class CollocationDialog(QDialog):
                 if index >= 0:
                     settings_dialog.loc_state_radio.setChecked(True)
                     settings_dialog.state_combo.setCurrentIndex(index)
+            if prev.get('enable_time_slider') and settings_dialog.enable_time_slider.isEnabled():
+                settings_dialog.enable_time_slider.setChecked(True)
 
         if settings_dialog.exec_() != QDialog.Accepted:
             return
 
         map_settings = settings_dialog.values()
         self._collocate_map_settings = map_settings
+
+        enable_time_slider = bool(map_settings.get('enable_time_slider')) and bool(time_bin_pairs)
+        if not enable_time_slider:
+            map_settings['enable_time_slider'] = False
 
         top_n = int(map_settings.get('top_n', 25))
         term_scope = map_settings.get('term_scope', 'global')
@@ -2855,14 +2962,13 @@ class CollocationDialog(QDialog):
                 time_step=time_step,
                 linger_unit='week',
                 linger_step=0,
-                disable_time=False,
+                disable_time=not enable_time_slider,
                 lightweight=True,
                 table_mode='minimal',
                 table_row_limit=1000,
                 # Extended kwargs consumed by map_create
                 collocate_rank_mode=True,
                 collocate_drop_stopwords=drop_stop,
-                collocate_window=5,
                 collocate_drop_terms=self._get_parent_drop_terms(),
                 collocate_rank_top_n=top_n,
                 collocate_rank_term_scope=term_scope,
@@ -2870,9 +2976,13 @@ class CollocationDialog(QDialog):
                 collocate_rank_focus=location_scope,
                 collocate_rank_focus_city=location_city or None,
                 collocate_rank_focus_state=location_state or None,
+                collocate_window=context_window,
                 collocate_rank_time_label=time_label or None,
                 collocate_rank_focus_label=location_label or None,
                 collocate_rank_colorize=bool(map_settings.get('colorize')),
+                collocate_time_slider=enable_time_slider,
+                metadata_enabled=getattr(parent, 'metadata_enabled', True),
+                project_dir=parent.project_folder if parent else None,
             )
         except Exception as exc:
             QMessageBox.critical(self, 'Map Error', str(exc))
@@ -2995,6 +3105,7 @@ class CollocationDialog(QDialog):
                 self.state_combo.setCurrentIndex(idx)
 
         self.term_input.setText(state.get('term', self.term_input.text()))
+        self._update_context_keyword_label()
         self.start_input.setText(state.get('start', self.start_input.text()))
         self.end_input.setText(state.get('end', self.end_input.text()))
 
@@ -3013,6 +3124,19 @@ class CollocationDialog(QDialog):
         opts = state.get('options', {})
         for key, cb in self.checks.items():
             cb.setChecked(bool(opts.get(key, True)))
+
+        context_left = state.get('context_left')
+        if context_left is not None:
+            try:
+                self.context_left_spin.setValue(int(context_left))
+            except (TypeError, ValueError):
+                pass
+        context_right = state.get('context_right')
+        if context_right is not None:
+            try:
+                self.context_right_spin.setValue(int(context_right))
+            except (TypeError, ValueError):
+                pass
 
         drop_terms_state = state.get('dropped_terms')
         if parent is not None:
@@ -3045,10 +3169,12 @@ class CollocationDialog(QDialog):
 
         if meta.get('term'):
             self.term_input.setText(meta.get('term'))
+            self._update_context_keyword_label()
         if meta.get('start_date'):
             self.start_input.setText(meta.get('start_date'))
         if meta.get('end_date'):
             self.end_input.setText(meta.get('end_date'))
+        self._update_context_keyword_label()
 
     def _extract_metadata_from_source(self, path: Optional[str], is_geo: bool) -> dict:
         result = {'term': '', 'start_date': '', 'end_date': ''}
@@ -3115,6 +3241,24 @@ class CollocationDialog(QDialog):
 
     def _collect_options(self) -> dict:
         return {opt: cb.isChecked() for opt, cb in self.checks.items()}
+
+    def _options_with_context(self) -> dict:
+        opts = self._collect_options()
+        opts = dict(opts)
+        opts['window_left'] = self.context_left_spin.value()
+        opts['window_right'] = self.context_right_spin.value()
+        return opts
+
+    def _update_context_keyword_label(self):
+        if not hasattr(self, 'keyword_label'):
+            return
+        term_text = self.term_input.text().strip()
+        display = term_text if term_text else '<keyword>'
+        self.keyword_label.setText(display)
+
+    def _on_term_edited(self, _text: str):
+        self._update_context_keyword_label()
+        self._save_state()
 
     def _get_parent_drop_terms(self) -> List[str]:
         parent = self.parent()
@@ -3205,7 +3349,7 @@ class CollocationDialog(QDialog):
             self.end_input.text().strip(),
             city,
             state,
-            self._collect_options(),
+            self._options_with_context(),
         )
         metrics_path = paths.get('metrics')
         if not metrics_path or not os.path.exists(metrics_path):
@@ -3341,6 +3485,8 @@ class CollocationDialog(QDialog):
             'ignore_bin': self.ignore_bin.isChecked(),
             'options': self._collect_options(),
             'dropped_terms': self._get_parent_drop_terms(),
+            'context_left': self.context_left_spin.value(),
+            'context_right': self.context_right_spin.value(),
         }
         parent.collocation_state = state
 
@@ -3431,14 +3577,20 @@ class CollocationDialog(QDialog):
 
         time_bin_unit = self._current_time_bin_unit()
         write_by_time = not ignore_bin
-        opts = self._collect_options()
+        opts_bool = self._collect_options()
+        window_left = self.context_left_spin.value()
+        window_right = self.context_right_spin.value()
+        options_with_context = dict(opts_bool)
+        options_with_context['window_left'] = window_left
+        options_with_context['window_right'] = window_right
 
         parent = self.parent()
         if parent is None:
             QMessageBox.warning(self, 'Unavailable', 'Parent window not available.')
             return
+        metadata_enabled = getattr(parent, 'metadata_enabled', True)
 
-        predicted_paths = self._build_output_paths(term, start or None, end or None, city, state, opts)
+        predicted_paths = self._build_output_paths(term, start or None, end or None, city, state, options_with_context)
         if not self._confirm_overwrite_if_needed(predicted_paths):
             return
 
@@ -3464,7 +3616,10 @@ class CollocationDialog(QDialog):
                     ignore_bin=ignore_bin,
                     write_by_time=write_by_time,
                     drop_terms=parent.collocation_drop_terms,
-                    **opts,
+                    window_left=window_left,
+                    window_right=window_right,
+                    metadata_enabled=metadata_enabled,
+                    **opts_bool,
                 )
             else:
                 geo_path = getattr(parent, 'geojson_file', None)
@@ -3487,7 +3642,10 @@ class CollocationDialog(QDialog):
                     ignore_bin=ignore_bin,
                     write_by_time=write_by_time,
                     drop_terms=parent.collocation_drop_terms,
-                    **opts,
+                    window_left=window_left,
+                    window_right=window_right,
+                    metadata_enabled=metadata_enabled,
+                    **opts_bool,
                 )
         except Exception as e:
             QMessageBox.critical(self, 'Error', str(e))
@@ -3517,7 +3675,7 @@ class CollocationDialog(QDialog):
             state or 'All',
             time_bin_unit,
             ignore_bin,
-            opts,
+            options_with_context,
             result,
         )
         self._set_clear_notice('')
@@ -3531,7 +3689,7 @@ class CollocationDialog(QDialog):
         state_text = self.state_combo.currentText()
         city = None if not city_text or city_text == 'All Cities' else city_text.strip()
         state = None if not state_text or state_text == 'All States' else state_text.strip()
-        paths = self._build_output_paths(term, self.start_input.text().strip(), self.end_input.text().strip(), city, state, self._collect_options())
+        paths = self._build_output_paths(term, self.start_input.text().strip(), self.end_input.text().strip(), city, state, self._options_with_context())
         metrics_path = paths.get('metrics')
         if not metrics_path or not os.path.exists(metrics_path):
             QMessageBox.warning(self, 'File Not Found', 'Metrics file not found. Please run the collocation analysis first.')
@@ -3562,7 +3720,21 @@ class CollocationDialog(QDialog):
             summary_parts.append('Time bin: ignored')
         else:
             summary_parts.append(f"Time bin: {time_bin_unit or 'default'}")
-        enabled_opts = [name for name, enabled in options.items() if enabled]
+
+        context_left = options.get('window_left')
+        context_right = options.get('window_right')
+        if context_left is not None or context_right is not None:
+            try:
+                left_val = int(context_left) if context_left is not None else 0
+            except (TypeError, ValueError):
+                left_val = 0
+            try:
+                right_val = int(context_right) if context_right is not None else 0
+            except (TypeError, ValueError):
+                right_val = 0
+            summary_parts.append(f"Context: {left_val} left / {right_val} right")
+
+        enabled_opts = [name for name, enabled in options.items() if isinstance(enabled, bool) and enabled]
         summary_parts.append(f"Options: {', '.join(enabled_opts) if enabled_opts else 'none'}")
         drop_count = len(getattr(parent, 'collocation_drop_terms', []))
         if drop_count:
@@ -3614,7 +3786,7 @@ class CollocationDialog(QDialog):
         state_text = self.state_combo.currentText()
         city = None if not city_text or city_text == 'All Cities' else city_text.strip()
         state = None if not state_text or state_text == 'All States' else state_text.strip()
-        paths = self._build_output_paths(term, self.start_input.text().strip(), self.end_input.text().strip(), city, state, self._collect_options())
+        paths = self._build_output_paths(term, self.start_input.text().strip(), self.end_input.text().strip(), city, state, self._options_with_context())
         file_path = paths.get('by_time')
         if not file_path or not os.path.exists(file_path):
             QMessageBox.warning(self, 'No Data', 'Collocation by-time data not found. Run collocation with a time bin first.')
@@ -3738,7 +3910,7 @@ class CollocationDialog(QDialog):
         keyword_display = keyword or '(none)'
         line1 = f"Terms plotted: {term_count} | Home bin: {home_label} | Keyword: {keyword_display}"
         line2 = f"City filter: {city_label} | State filter: {state_label}"
-        line3 = f"Dates: {start_label} – {end_label} | Time unit: {time_unit or 'n/a'}"
+        line3 = f"Dates: {start_label} – {end_label} | {time_unit or 'Time Bin: n/a'}"
         return '\n'.join([line1, line2, line3])
 
 if __name__ == '__main__':
