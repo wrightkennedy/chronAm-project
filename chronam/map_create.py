@@ -803,9 +803,11 @@ def _group_popup_html(
                 metric_lines.append(f"{label}: {formatted}")
 
     nav_buttons_html = (
-        '<div data-nav-controls style="display:flex; align-items:center; gap:4px;">'
-        '<button type="button" data-step="-1" style="padding:2px 6px;">&#9664;</button>'
-        '<button type="button" data-step="1" style="padding:2px 6px;">&#9654;</button>'
+        '<div data-nav-controls style="display:flex; align-items:center; gap:6px;">'
+        '<button type="button" data-step="-1" class="collocate-time-button" '
+        'title="Previous article" aria-label="Previous article">‹</button>'
+        '<button type="button" data-step="1" class="collocate-time-button" '
+        'title="Next article" aria-label="Next article">›</button>'
         '</div>'
     )
 
@@ -2158,7 +2160,14 @@ def create_map(
                 header_lines.append(slider_placeholder)
 
         header_lines.append(
-            f'<div id="collocateSummaryLine" style="color:#c53030; margin-top:6px;">{_esc(summary_line_text)}</div>'
+            '<div id="collocateSummaryLine" '
+            'style="color:#c53030; margin-top:6px; position:relative; display:inline-block; min-width:320px;">'
+            f'<span data-summary-content="1">{_esc(summary_line_text)}</span>'
+            '<span aria-hidden="true" data-summary-buffer="1" '
+            'style="visibility:hidden; pointer-events:none; white-space:nowrap; display:inline-block;">'
+            'Collocate term sample: 999,999 articles | 9,999 newspapers | 9,999 cities | Time: 1901-01-01'
+            '</span>'
+            '</div>'
         )
 
     header_html = (
@@ -2201,6 +2210,24 @@ def create_map(
             'line-height: 1; '
             'cursor: pointer; '
             'transition: background 0.2s ease, color 0.2s ease; '
+            '}'
+            '.collocate-time-button[data-clock-role="toggle"] { '
+            'position: relative; '
+            'font-size: 18px; '
+            'padding: 2px 8px; '
+            '}'
+            '.collocate-time-button[data-clock-role="toggle"][data-clock-disabled="1"]::after { '
+            'content: "/"; '
+            'position: absolute; '
+            'inset: 0; '
+            'display: flex; '
+            'align-items: center; '
+            'justify-content: center; '
+            'color: #c53030; '
+            'font-size: 20px; '
+            'font-weight: 700; '
+            'pointer-events: none; '
+            'transform: rotate(-45deg); '
             '}'
             '.collocate-time-button:hover { background: #edf2f7; color: #1a202c; }'
             '.collocate-time-button:disabled { opacity: 0.4; cursor: default; }'
@@ -3030,8 +3057,24 @@ def create_map(
     host.innerHTML = '';
 
     var title = document.createElement('div');
+    title.style.display = 'flex';
+    title.style.alignItems = 'baseline';
+    title.style.gap = '6px';
     title.style.fontWeight = '600';
-    title.textContent = 'Time bin:';
+    title.style.flexWrap = 'wrap';
+
+    var titlePrefix = document.createElement('span');
+    titlePrefix.textContent = 'Time bin:';
+
+    var sliderLabel = document.createElement('span');
+    sliderLabel.id = 'collocateTimeRangeLabel';
+    sliderLabel.style.fontWeight = '600';
+    sliderLabel.style.whiteSpace = 'nowrap';
+    sliderLabel.style.flex = '0 0 auto';
+    sliderLabel.style.color = '#2b6cb0';
+
+    title.appendChild(titlePrefix);
+    title.appendChild(sliderLabel);
     host.appendChild(title);
 
     var row = document.createElement('div');
@@ -3049,7 +3092,7 @@ def create_map(
 
     var slider = document.createElement('input');
     slider.type = 'range';
-    slider.min = '0';
+    slider.min = '1';
     slider.max = String(collocateTimeBins.length);
     slider.step = '1';
     slider.id = 'collocateTimeRange';
@@ -3076,71 +3119,96 @@ def create_map(
     toggleBtn.style.flex = '0 0 auto';
     toggleBtn.style.minWidth = '32px';
     toggleBtn.style.textAlign = 'center';
-
-    var sliderLabel = document.createElement('span');
-    sliderLabel.id = 'collocateTimeRangeLabel';
-    sliderLabel.style.fontWeight = '600';
-    sliderLabel.style.flex = '0 0 auto';
-    sliderLabel.style.whiteSpace = 'nowrap';
+    toggleBtn.dataset.clockRole = 'toggle';
+    toggleBtn.textContent = '🕒';
 
     row.appendChild(prevBtn);
     row.appendChild(slider);
     row.appendChild(nextBtn);
     row.appendChild(toggleBtn);
-    row.appendChild(sliderLabel);
     host.appendChild(row);
+    consumeDragEvents(host);
+    consumeDragEvents(title);
+    consumeDragEvents(row);
+    consumeDragEvents(prevBtn);
+    consumeDragEvents(nextBtn);
+    consumeDragEvents(slider);
+    consumeDragEvents(toggleBtn);
 
     var totalBins = collocateTimeBins.length;
-    var defaultIndex = 0;
+    if (!Number.isFinite(collocateTimeLastActiveIndex) || collocateTimeLastActiveIndex < 1) {
+      collocateTimeLastActiveIndex = 1;
+    }
+    if (collocateTimeLastActiveIndex > totalBins) {
+      collocateTimeLastActiveIndex = totalBins || 1;
+    }
+
+    var defaultIndex = collocateTimeLastActiveIndex;
     if (!collocateTimeManuallyDisabled && selectedTimeBinKey) {
+      var matched = false;
       for (var i = 0; i < totalBins; i++) {
         if (collocateTimeBins[i] && collocateTimeBins[i].key === selectedTimeBinKey) {
           defaultIndex = i + 1;
           collocateTimeLastActiveIndex = defaultIndex;
+          matched = true;
           break;
         }
       }
-      if (!defaultIndex) {
+      if (!matched) {
         selectedTimeBinKey = null;
+        defaultIndex = collocateTimeLastActiveIndex;
       }
-    }
-    if (!collocateTimeManuallyDisabled && !defaultIndex && totalBins) {
-      var candidate = Number(collocateTimeLastActiveIndex);
-      if (Number.isFinite(candidate) && candidate >= 1 && candidate <= totalBins) {
-        defaultIndex = candidate;
-        selectedTimeBinKey = collocateTimeBins[candidate - 1].key;
-      }
-    }
-    if (!collocateTimeManuallyDisabled && !defaultIndex && totalBins) {
-      defaultIndex = 1;
-      selectedTimeBinKey = collocateTimeBins[0].key;
-    }
-    if (!collocateTimeManuallyDisabled && defaultIndex > 0) {
-      collocateTimeLastActiveIndex = defaultIndex;
     }
 
-    if (collocateTimeManuallyDisabled) {
-      slider.value = '0';
-      selectedTimeBinKey = null;
-    } else {
-      slider.value = String(defaultIndex);
+    if (!Number.isFinite(defaultIndex) || defaultIndex < 1) {
+      defaultIndex = totalBins ? 1 : 1;
     }
+    if (defaultIndex > totalBins) {
+      defaultIndex = totalBins;
+    }
+
+    slider.value = String(Math.max(1, defaultIndex));
 
     function updateLabel(emit) {
-      var idx = parseInt(slider.value || '0', 10);
-      if (!Number.isFinite(idx) || idx <= 0 || collocateTimeManuallyDisabled) {
-        selectedTimeBinKey = null;
+      if (collocateTimeManuallyDisabled) {
         sliderLabel.textContent = 'All bins';
-      } else {
-        var entry = collocateTimeBins[Math.min(collocateTimeBins.length, Math.max(1, idx)) - 1];
-        if (entry) {
-          selectedTimeBinKey = entry.key;
-          sliderLabel.textContent = entry.label || entry.key;
-          collocateTimeLastActiveIndex = idx;
-        } else {
-          selectedTimeBinKey = null;
-          sliderLabel.textContent = 'All bins';
+        selectedTimeBinKey = null;
+        if (emit && activeMap) {
+          applyTimeFilter(activeMap);
+          refreshCollocateSizes(activeMap);
+          updateCollocateSummaryLineFromDataset(popupCache);
         }
+        return;
+      }
+      if (totalBins < 1) {
+        sliderLabel.textContent = '';
+        selectedTimeBinKey = null;
+        if (emit && activeMap) {
+          applyTimeFilter(activeMap);
+          refreshCollocateSizes(activeMap);
+          updateCollocateSummaryLineFromDataset(popupCache);
+        }
+        return;
+      }
+      var idx = parseInt(slider.value || '1', 10);
+      if (!Number.isFinite(idx) || idx < 1) {
+        idx = 1;
+      }
+      if (idx > totalBins) {
+        idx = totalBins;
+      }
+      if (idx < 1) {
+        idx = 1;
+      }
+      slider.value = String(idx);
+      var entry = collocateTimeBins[Math.min(totalBins - 1, Math.max(0, idx - 1))];
+      if (entry) {
+        selectedTimeBinKey = entry.key;
+        sliderLabel.textContent = entry.label || entry.key;
+        collocateTimeLastActiveIndex = idx;
+      } else {
+        selectedTimeBinKey = null;
+        sliderLabel.textContent = '';
       }
       if (emit && activeMap) {
         applyTimeFilter(activeMap);
@@ -3151,13 +3219,16 @@ def create_map(
 
     function updateToggleState() {
       if (collocateTimeManuallyDisabled) {
-        toggleBtn.textContent = '🕒✕';
+        toggleBtn.textContent = '🕒';
         toggleBtn.title = 'Time disabled (all bins showing)';
         toggleBtn.setAttribute('aria-pressed', 'true');
         toggleBtn.style.color = '#c53030';
         slider.disabled = true;
         prevBtn.disabled = true;
         nextBtn.disabled = true;
+        sliderLabel.style.color = '#c53030';
+        toggleBtn.dataset.clockDisabled = '1';
+        sliderLabel.textContent = 'All bins';
       } else {
         toggleBtn.textContent = '🕒';
         toggleBtn.title = 'Disable Time';
@@ -3166,6 +3237,8 @@ def create_map(
         slider.disabled = false;
         prevBtn.disabled = false;
         nextBtn.disabled = false;
+        sliderLabel.style.color = '#2b6cb0';
+        delete toggleBtn.dataset.clockDisabled;
       }
       toggleBtn.setAttribute('aria-label', toggleBtn.title);
     }
@@ -3181,23 +3254,23 @@ def create_map(
       if (collocateTimeManuallyDisabled) {
         return;
       }
-      var current = parseInt(slider.value || '0', 10);
-      if (!Number.isFinite(current)) {
-        current = 0;
+      var current = parseInt(slider.value || '1', 10);
+      if (!Number.isFinite(current) || current < 1) {
+        current = 1;
       }
-      var nextVal = current + delta;
       var maxVal = parseInt(slider.max || '0', 10);
-      if (!Number.isFinite(maxVal) || maxVal < 0) {
+      if (!Number.isFinite(maxVal) || maxVal < 1) {
         maxVal = collocateTimeBins.length;
       }
-      if (nextVal < 0) {
-        nextVal = 0;
+      if (maxVal < 1) {
+        return;
       }
-      if (nextVal > maxVal) {
+      var nextVal = current + delta;
+      if (nextVal < 1) {
         nextVal = maxVal;
       }
-      if (String(nextVal) === slider.value) {
-        return;
+      if (nextVal > maxVal) {
+        nextVal = 1;
       }
       slider.value = String(nextVal);
       updateLabel(true);
@@ -3212,12 +3285,11 @@ def create_map(
 
     toggleBtn.addEventListener('click', function() {
       if (!collocateTimeManuallyDisabled) {
-        var currentVal = parseInt(slider.value || '0', 10);
-        if (Number.isFinite(currentVal) && currentVal > 0) {
+        var currentVal = parseInt(slider.value || '1', 10);
+        if (Number.isFinite(currentVal) && currentVal >= 1 && currentVal <= totalBins) {
           collocateTimeLastActiveIndex = currentVal;
         }
         collocateTimeManuallyDisabled = true;
-        slider.value = '0';
         updateToggleState();
         updateLabel(true);
         return;
@@ -3227,12 +3299,12 @@ def create_map(
       if (!Number.isFinite(maxVal) || maxVal < 1) {
         maxVal = collocateTimeBins.length;
       }
-      var restore = parseInt(collocateTimeLastActiveIndex || '0', 10);
+      var restore = parseInt(collocateTimeLastActiveIndex || '1', 10);
       if (!Number.isFinite(restore) || restore < 1) {
         restore = 1;
       }
       if (restore > maxVal) {
-        restore = maxVal;
+        restore = maxVal || 1;
       }
       slider.value = String(restore);
       updateToggleState();
@@ -3284,9 +3356,19 @@ def create_map(
     if (!line) {
       return;
     }
+    var content = line.querySelector('[data-summary-content]');
+    if (!content) {
+      content = document.createElement('span');
+      content.setAttribute('data-summary-content', '1');
+      if (line.firstChild) {
+        line.insertBefore(content, line.firstChild);
+      } else {
+        line.appendChild(content);
+      }
+    }
     var term = String(selectedCollocate || '').trim();
     if (!term) {
-      line.textContent = 'Collocate term: none selected';
+      content.textContent = 'Collocate term: none selected';
       return;
     }
     var stats = collectCollocateStats(dataset);
@@ -3299,16 +3381,17 @@ def create_map(
       };
     }
     stats = stats || { articles: 0, newspapers: 0, cities: 0 };
-    line.textContent = 'Collocate term "' + term + '": '
+    var summaryText = 'Collocate term "' + term + '": '
       + formatInteger(stats.articles) + ' articles | '
       + formatInteger(stats.newspapers) + ' newspapers | '
       + formatInteger(stats.cities) + ' cities';
     if (collocateTimeEnabled) {
       var timeLabel = labelForTimeKey(selectedTimeBinKey);
       if (timeLabel) {
-        line.textContent += ' | Time: ' + timeLabel;
+        summaryText += ' | Time: ' + timeLabel;
       }
     }
+    content.textContent = summaryText;
   }
 
   function interpolateColor(startHex, endHex, t) {
@@ -4175,6 +4258,298 @@ def create_map(
     }, { passive: false });
     container.__hoverScrollAttached = true;
   }
+
+  function consumeDragEvents(el) {
+    if (!el || el.__dragGuardAttached) {
+      return;
+    }
+    var stop = function(ev) {
+      ev.stopPropagation();
+    };
+    ['pointerdown', 'pointermove', 'pointerup', 'mousedown', 'mousemove', 'mouseup', 'touchstart', 'touchmove', 'touchend', 'contextmenu'].forEach(function(evt) {
+      el.addEventListener(evt, stop, true);
+    });
+    el.__dragGuardAttached = true;
+  }
+
+  function buildPinSignature(baseKey, groupData, entry, entryIndex, timeLabel, selectionValue) {
+    var pieces = [String(baseKey || '')];
+    var fullIndex = null;
+    if (entry && Object.prototype.hasOwnProperty.call(entry, 'full_index')) {
+      fullIndex = entry.full_index;
+    }
+    if (!Number.isFinite(fullIndex) && entry && Object.prototype.hasOwnProperty.call(entry, 'index')) {
+      fullIndex = entry.index;
+    }
+    if (!Number.isFinite(fullIndex)) {
+      fullIndex = Number(entryIndex);
+    }
+    if (Number.isFinite(fullIndex)) {
+      pieces.push('idx:' + fullIndex);
+    }
+    if (entry && entry.date) {
+      pieces.push('date:' + entry.date);
+    }
+    if (timeLabel) {
+      pieces.push('time:' + timeLabel);
+    }
+    if (selectionValue) {
+      pieces.push('sel:' + selectionValue);
+    }
+    return pieces.join('|');
+  }
+
+  function findPinnedBySignature(signature) {
+    if (!signature) {
+      return null;
+    }
+    for (var i = 0; i < pinState.entries.length; i++) {
+      if (pinState.entries[i] && pinState.entries[i].signature === signature) {
+        return pinState.entries[i];
+      }
+    }
+    return null;
+  }
+
+  function determineEntryTimeMeta(groupData, entry, fallbackLabel) {
+    var result = {
+      key: null,
+      label: fallbackLabel || '',
+      iso: '',
+    };
+    if (!groupData || !entry || !groupData.time_bins) {
+      return result;
+    }
+    var fullIndex = null;
+    if (Object.prototype.hasOwnProperty.call(entry, 'full_index')) {
+      fullIndex = entry.full_index;
+    }
+    if (!Number.isFinite(fullIndex) && Object.prototype.hasOwnProperty.call(entry, 'index')) {
+      fullIndex = entry.index;
+    }
+    if (!Number.isFinite(fullIndex)) {
+      fullIndex = null;
+    }
+    if (fullIndex === null) {
+      return result;
+    }
+    var bins = groupData.time_bins;
+    var binKeys = Object.keys(bins || {});
+    for (var i = 0; i < binKeys.length; i++) {
+      var key = binKeys[i];
+      var bin = bins[key];
+      if (!bin || !Array.isArray(bin.indexes)) {
+        continue;
+      }
+      if (bin.indexes.indexOf(fullIndex) !== -1) {
+        result.key = key;
+        result.label = bin.time_label || bin.label || result.label || key;
+        if (bin.iso) {
+          result.iso = bin.iso;
+        }
+        break;
+      }
+    }
+    return result;
+  }
+
+  function incrementPinCount(baseKey) {
+    if (!baseKey) {
+      return;
+    }
+    var current = pinState.counts.get(baseKey) || 0;
+    pinState.counts.set(baseKey, current + 1);
+    updatePinButtonsByKey(baseKey);
+  }
+
+  function decrementPinCount(baseKey) {
+    if (!baseKey) {
+      return;
+    }
+    var current = pinState.counts.get(baseKey) || 0;
+    var next = Math.max(0, current - 1);
+    if (next === 0) {
+      pinState.counts.delete(baseKey);
+    } else {
+      pinState.counts.set(baseKey, next);
+    }
+    updatePinButtonsByKey(baseKey);
+  }
+
+  function updatePinnedOrderIndices() {
+    pinState.orderSequence = pinState.orderSequence.filter(function(id) {
+      return pinState.lookup.has(id);
+    });
+    pinState.orderSequence.forEach(function(id, idx) {
+      var entry = pinState.lookup.get(id);
+      if (entry) {
+        entry.orderIndex = idx + 1;
+      }
+    });
+  }
+
+  function updatePinnedHeaderCounter() {
+    if (!pinState.headerCounter) {
+      return;
+    }
+    var total = pinState.entries.length;
+    if (!total) {
+      pinState.headerCounter.textContent = 'Pinned Article 0 of 0';
+      return;
+    }
+    var topEntry = pinState.entries[0];
+    var displayIndex = topEntry && Number.isFinite(topEntry.orderIndex) ? topEntry.orderIndex : 1;
+    pinState.headerCounter.textContent = 'Pinned Article ' + displayIndex + ' of ' + total;
+  }
+
+  function renderPinnedList() {
+    updatePinnedOrderIndices();
+    var body = getPinBody();
+    if (!body) {
+      return;
+    }
+    var frag = document.createDocumentFragment();
+    pinState.entries.forEach(function(entry, idx) {
+      if (!entry || !entry.wrapper) {
+        return;
+      }
+      var labelIndex = Number.isFinite(entry.orderIndex) ? entry.orderIndex : (idx + 1);
+      entry.orderIndex = labelIndex;
+      entry.wrapper.dataset.pinDisplayIndex = String(labelIndex);
+      var badge = entry.wrapper.querySelector('[data-pin-badge="1"]');
+      if (!badge) {
+        badge = document.createElement('div');
+        badge.setAttribute('data-pin-badge', '1');
+        badge.style.position = 'absolute';
+        badge.style.top = '6px';
+        badge.style.right = '8px';
+        badge.style.background = '#2b6cb0';
+        badge.style.color = '#ffffff';
+        badge.style.fontSize = '12px';
+        badge.style.fontWeight = '600';
+        badge.style.padding = '2px 6px';
+        badge.style.borderRadius = '999px';
+        entry.wrapper.appendChild(badge);
+      }
+      badge.textContent = '#' + labelIndex;
+      frag.appendChild(entry.wrapper);
+    });
+    body.innerHTML = '';
+    body.appendChild(frag);
+    updatePinnedHeaderCounter();
+    var hasEntries = pinState.entries.length > 0;
+    if (pinState.navUpBtn) {
+      pinState.navUpBtn.disabled = pinState.entries.length <= 1;
+    }
+    if (pinState.navDownBtn) {
+      pinState.navDownBtn.disabled = pinState.entries.length <= 1;
+    }
+    if (pinState.focusBtn) {
+      pinState.focusBtn.disabled = !hasEntries;
+    }
+  }
+
+  function rotatePinnedEntries(direction) {
+    if (pinState.entries.length <= 1) {
+      return;
+    }
+    if (direction < 0) {
+      // move first entry to end
+      var first = pinState.entries.shift();
+      pinState.entries.push(first);
+    } else {
+      // move last entry to front
+      var last = pinState.entries.pop();
+      pinState.entries.unshift(last);
+    }
+    renderPinnedList();
+    updatePinPanelVisibility();
+  }
+
+  function indexForTimeKey(key) {
+    if (!key || !Array.isArray(collocateTimeBins)) {
+      return 0;
+    }
+    for (var i = 0; i < collocateTimeBins.length; i++) {
+      if (collocateTimeBins[i] && collocateTimeBins[i].key === key) {
+        return i + 1;
+      }
+    }
+    return 0;
+  }
+
+  function focusPinnedTopEntry() {
+    if (!pinState.entries.length) {
+      return;
+    }
+    var entry = pinState.entries[0];
+    if (entry && Number.isFinite(entry.lat) && Number.isFinite(entry.lon) && activeMap) {
+      var target = L.latLng(entry.lat, entry.lon);
+      var zoom = typeof activeMap.getZoom === 'function' ? activeMap.getZoom() : 8;
+      var desiredZoom = Number.isFinite(zoom) ? Math.max(zoom, 8) : 8;
+      if (typeof activeMap.flyTo === 'function') {
+        activeMap.flyTo(target, desiredZoom);
+      } else if (typeof activeMap.setView === 'function') {
+        activeMap.setView(target, desiredZoom);
+      }
+      var highlightData = entry.dataset || (popupCache && entry.gid ? popupCache[entry.gid] : null);
+      var highlightId = entry.layerId || entry.gid;
+      if (highlightId) {
+        setHighlightForGroup(highlightId, highlightData);
+      }
+      if (typeof openGroupsPopup === 'function' || highlightId) {
+        setTimeout(function() {
+          if (highlightId) {
+            var latestData = entry.dataset || (popupCache && highlightId ? popupCache[highlightId] : null);
+            setHighlightForGroup(highlightId, latestData);
+          }
+          if (typeof openGroupsPopup === 'function') {
+            openGroupsPopup(target, activeMap);
+          }
+        }, 150);
+      }
+    }
+    if (collocateTimeEnabled) {
+      if (entry && entry.timeKey) {
+        collocateTimeManuallyDisabled = false;
+        selectedTimeBinKey = entry.timeKey;
+        var idx = indexForTimeKey(entry.timeKey);
+        collocateTimeLastActiveIndex = idx || collocateTimeLastActiveIndex || 1;
+        initCollocateTimeControls();
+        applyTimeFilter(activeMap);
+        refreshCollocateSizes(activeMap);
+        updateCollocateSummaryLineFromDataset(popupCache);
+      } else {
+        collocateTimeManuallyDisabled = true;
+        selectedTimeBinKey = null;
+        initCollocateTimeControls();
+        applyTimeFilter(activeMap);
+        refreshCollocateSizes(activeMap);
+        updateCollocateSummaryLineFromDataset(popupCache);
+      }
+    } else if (activeMap && activeMap.timeDimension && entry && entry.timeIso) {
+      var timeDate = new Date(entry.timeIso);
+      if (!Number.isNaN(timeDate.getTime())) {
+        activeMap.timeDimension.setCurrentTime(timeDate.getTime());
+      }
+    }
+  }
+
+  function suppressDoubleClick(element) {
+    if (!element) {
+      return;
+    }
+    if (element.__dblBlockAttached) {
+      return;
+    }
+    element.addEventListener('dblclick', function(ev) {
+      if (typeof ev.preventDefault === 'function') {
+        ev.preventDefault();
+      }
+      ev.stopPropagation();
+    });
+    element.__dblBlockAttached = true;
+  }
   function getPinKey(root) {
     if (!root) {
       return '';
@@ -4193,10 +4568,19 @@ def create_map(
   }
 
   var pinState = {
-    entries: new Map(),
+    entries: [],
+    lookup: new Map(),
+    counts: new Map(),
+    orderSequence: [],
+    nextSeq: 1,
+    headerCounter: null,
+    navUpBtn: null,
+    navDownBtn: null,
+    focusBtn: null,
+    body: null,
   };
 
-function getDockPanel() {
+  function getDockPanel() {
     var panel = document.querySelector('[data-dock-panel]');
     if (panel) {
       addScrollGuards(panel);
@@ -4204,7 +4588,10 @@ function getDockPanel() {
       if (existingBody) {
         addScrollGuards(existingBody);
         enableHoverScroll(panel, existingBody);
+        consumeDragEvents(existingBody);
       }
+      suppressDoubleClick(panel);
+      consumeDragEvents(panel);
       positionDockPanel(panel);
       return panel;
     }
@@ -4267,6 +4654,10 @@ function getDockPanel() {
     addScrollGuards(panel);
     addScrollGuards(body);
     enableHoverScroll(panel, body);
+    suppressDoubleClick(panel);
+    suppressDoubleClick(body);
+    consumeDragEvents(panel);
+    consumeDragEvents(body);
     positionDockPanel(panel);
     return panel;
   }
@@ -4317,6 +4708,26 @@ function getPinPanel() {
       if (existingBody) {
         addScrollGuards(existingBody);
         enableHoverScroll(panel, existingBody);
+        consumeDragEvents(existingBody);
+        pinState.body = existingBody;
+      }
+      suppressDoubleClick(panel);
+      consumeDragEvents(panel);
+      var counterEl = panel.querySelector('[data-pin-counter]');
+      if (counterEl) {
+        pinState.headerCounter = counterEl;
+      }
+      var upBtn = panel.querySelector('[data-pin-nav="up"]');
+      if (upBtn) {
+        pinState.navUpBtn = upBtn;
+      }
+      var downBtn = panel.querySelector('[data-pin-nav="down"]');
+      if (downBtn) {
+        pinState.navDownBtn = downBtn;
+      }
+      var focusBtn = panel.querySelector('[data-pin-nav="focus"]');
+      if (focusBtn) {
+        pinState.focusBtn = focusBtn;
       }
       return panel;
     }
@@ -4347,7 +4758,51 @@ function getPinPanel() {
     header.style.borderBottom = '1px solid rgba(0,0,0,0.1)';
     header.style.fontSize = '13px';
     header.style.fontWeight = '600';
-    header.textContent = 'Pinned Locations';
+
+    var headerLeft = document.createElement('div');
+    headerLeft.style.display = 'flex';
+    headerLeft.style.alignItems = 'center';
+
+    var headerCounter = document.createElement('span');
+    headerCounter.setAttribute('data-pin-counter', '1');
+    headerCounter.style.fontSize = '11px';
+    headerCounter.style.color = '#4a5568';
+    headerCounter.textContent = 'Pinned Article 0 of 0';
+
+    headerLeft.appendChild(headerCounter);
+
+    var headerControls = document.createElement('div');
+    headerControls.style.display = 'flex';
+    headerControls.style.alignItems = 'center';
+    headerControls.style.gap = '6px';
+
+    var upBtn = document.createElement('button');
+    upBtn.type = 'button';
+    upBtn.className = 'collocate-time-button';
+    upBtn.textContent = '▲';
+    upBtn.title = 'Show previous pinned article';
+    upBtn.setAttribute('aria-label', 'Show previous pinned article');
+    upBtn.setAttribute('data-pin-nav', 'up');
+
+    var focusBtn = document.createElement('button');
+    focusBtn.type = 'button';
+    focusBtn.className = 'collocate-time-button';
+    focusBtn.textContent = '⌖';
+    focusBtn.title = 'Focus map on top pinned article';
+    focusBtn.setAttribute('aria-label', 'Focus map on top pinned article');
+    focusBtn.setAttribute('data-pin-nav', 'focus');
+
+    var downBtn = document.createElement('button');
+    downBtn.type = 'button';
+    downBtn.className = 'collocate-time-button';
+    downBtn.textContent = '▼';
+    downBtn.title = 'Show next pinned article';
+    downBtn.setAttribute('aria-label', 'Show next pinned article');
+    downBtn.setAttribute('data-pin-nav', 'down');
+
+    headerControls.appendChild(upBtn);
+    headerControls.appendChild(focusBtn);
+    headerControls.appendChild(downBtn);
 
     var clearBtn = document.createElement('button');
     clearBtn.type = 'button';
@@ -4362,7 +4817,25 @@ function getPinPanel() {
     clearBtn.addEventListener('click', function() {
       clearPinnedEntries();
     });
+
+    header.appendChild(headerLeft);
+    header.appendChild(headerControls);
     header.appendChild(clearBtn);
+
+    pinState.headerCounter = headerCounter;
+    pinState.navUpBtn = upBtn;
+    pinState.navDownBtn = downBtn;
+    pinState.focusBtn = focusBtn;
+
+    upBtn.addEventListener('click', function() {
+      rotatePinnedEntries(-1);
+    });
+    downBtn.addEventListener('click', function() {
+      rotatePinnedEntries(1);
+    });
+    focusBtn.addEventListener('click', function() {
+      focusPinnedTopEntry();
+    });
 
     var body = document.createElement('div');
     body.setAttribute('data-pin-body', '1');
@@ -4382,51 +4855,87 @@ function getPinPanel() {
     addScrollGuards(panel);
     addScrollGuards(body);
     enableHoverScroll(panel, body);
+    suppressDoubleClick(panel);
+    suppressDoubleClick(body);
+    consumeDragEvents(panel);
+    consumeDragEvents(body);
+    consumeDragEvents(header);
+    consumeDragEvents(headerControls);
+    consumeDragEvents(upBtn);
+    consumeDragEvents(downBtn);
+    consumeDragEvents(focusBtn);
+    consumeDragEvents(clearBtn);
+    pinState.body = body;
     return panel;
   }
 
   function getPinBody() {
-    return getPinPanel().querySelector('[data-pin-body]');
+    if (pinState.body && document.body.contains(pinState.body)) {
+      return pinState.body;
+    }
+    var panel = getPinPanel();
+    var body = panel.querySelector('[data-pin-body]');
+    pinState.body = body;
+    return body;
   }
 
   function updatePinPanelVisibility() {
     var panel = getPinPanel();
-    panel.style.display = pinState.entries.size ? 'flex' : 'none';
-    if (panel.style.display !== 'none') {
+    if (!panel) {
+      return;
+    }
+    var hasEntries = pinState.entries.length > 0;
+    panel.style.display = hasEntries ? 'flex' : 'none';
+    if (hasEntries) {
       var body = getPinBody();
       if (body) {
         addScrollGuards(body);
         enableHoverScroll(panel, body);
+        consumeDragEvents(body);
       }
+    }
+    updatePinnedHeaderCounter();
+    if (pinState.navUpBtn) {
+      pinState.navUpBtn.disabled = pinState.entries.length <= 1;
+    }
+    if (pinState.navDownBtn) {
+      pinState.navDownBtn.disabled = pinState.entries.length <= 1;
+    }
+    if (pinState.focusBtn) {
+      pinState.focusBtn.disabled = !hasEntries;
     }
   }
 
-  function updatePinButtonsByKey(key) {
-    document.querySelectorAll('[data-pin-toggle="1"][data-pin-key="' + key + '"]').forEach(function(btn) {
-      var active = pinState.entries.has(key);
+  function updatePinButtonsByKey(baseKey) {
+    if (!baseKey) {
+      return;
+    }
+    var active = (pinState.counts.get(baseKey) || 0) > 0;
+    document.querySelectorAll('[data-pin-toggle="1"][data-pin-key="' + baseKey + '"]').forEach(function(btn) {
       btn.textContent = active ? '📍' : '📌';
       btn.title = active ? 'Unpin popup' : 'Pin popup';
       btn.style.color = active ? '#c53030' : '#2b6cb0';
     });
   }
 
-  function preparePinnedClone(clone, key) {
-    if (!clone) {
+  function preparePinnedClone(clone, entry) {
+    if (!clone || !entry) {
       return;
     }
     clone.setAttribute('data-docked', '0');
     var pinBtn = clone.querySelector('[data-pin-toggle="1"]');
     if (pinBtn) {
       pinBtn.removeAttribute('data-pin-toggle');
-      pinBtn.dataset.pinRemove = key;
-      pinBtn.textContent = '✕';
-      pinBtn.title = 'Remove pinned popup';
+      pinBtn.dataset.pinRemove = entry.id;
+      pinBtn.textContent = '📍';
+      pinBtn.title = 'Unpin this article';
+      pinBtn.setAttribute('aria-label', 'Unpin this article');
       pinBtn.style.color = '#c53030';
       pinBtn.style.cursor = 'pointer';
       if (!pinBtn.dataset.pinRemoveAttached) {
         pinBtn.dataset.pinRemoveAttached = '1';
         pinBtn.addEventListener('click', function() {
-          removePinnedEntry(key);
+          removePinnedEntry(entry.id);
         });
       }
     }
@@ -4434,84 +4943,164 @@ function getPinPanel() {
     if (dockBtn) {
       dockBtn.remove();
     }
+    var navControls = clone.querySelector('[data-nav-controls]');
+    if (navControls && navControls.parentNode) {
+      navControls.parentNode.removeChild(navControls);
+    }
+    var select = clone.querySelector('select[data-map-select]');
+    if (select) {
+      select.disabled = true;
+      select.style.opacity = '0.7';
+      select.title = 'Navigation disabled for pinned article';
+      consumeDragEvents(select);
+    }
+    addScrollGuards(clone);
   }
 
-  function removePinnedEntry(key) {
-    var entry = pinState.entries.get(key);
+  function removePinnedEntry(id) {
+    var entry = pinState.lookup.get(id);
     if (!entry) {
       return;
     }
     if (entry.wrapper && entry.wrapper.parentNode) {
       entry.wrapper.parentNode.removeChild(entry.wrapper);
     }
-    pinState.entries.delete(key);
+    pinState.lookup.delete(id);
+    pinState.entries = pinState.entries.filter(function(item) {
+      return item && item.id !== id;
+    });
+    pinState.orderSequence = pinState.orderSequence.filter(function(orderId) {
+      return orderId !== id;
+    });
+    updatePinnedOrderIndices();
+    decrementPinCount(entry.baseKey);
+    renderPinnedList();
     updatePinPanelVisibility();
-    updatePinButtonsByKey(key);
   }
 
   function clearPinnedEntries() {
-    Array.from(pinState.entries.keys()).forEach(function(key) {
-      removePinnedEntry(key);
+    var affectedKeys = Array.from(pinState.counts.keys());
+    pinState.entries.forEach(function(entry) {
+      if (entry && entry.wrapper && entry.wrapper.parentNode) {
+        entry.wrapper.parentNode.removeChild(entry.wrapper);
+      }
     });
+    pinState.entries = [];
+    pinState.lookup.clear();
+    pinState.counts.clear();
+    pinState.orderSequence = [];
+    pinState.nextSeq = 1;
+    updatePinnedOrderIndices();
+    var body = getPinBody();
+    if (body) {
+      body.innerHTML = '';
+    }
+    affectedKeys.forEach(function(key) {
+      updatePinButtonsByKey(key);
+    });
+    renderPinnedList();
+    updatePinPanelVisibility();
   }
 
   function togglePin(root, mapObj, popupObj) {
     if (!root) {
       return;
     }
-    var key = getPinKey(root);
-    if (root.dataset) {
-      var suffix = '';
-      if (root.dataset.locationIndex && root.dataset.locationTotal) {
-        suffix = '|loc:' + root.dataset.locationIndex + '/' + root.dataset.locationTotal;
-      }
-      if (root.dataset.timeLabel) {
-        suffix += '|time:' + root.dataset.timeLabel;
-      }
-      if (suffix) {
-        key = key + suffix;
-      }
-    }
-    if (!key) {
+    var gid = root.getAttribute('data-group-id');
+    if (!gid) {
       return;
     }
-    if (pinState.entries.has(key)) {
-      removePinnedEntry(key);
+    var baseKey = getPinKey(root);
+    if (!baseKey) {
       return;
     }
-    var panel = getPinPanel();
-    var body = getPinBody();
-    var wrapper = document.createElement('div');
-    wrapper.style.background = 'rgba(255,255,255,0.98)';
-    wrapper.style.border = '1px solid rgba(0,0,0,0.1)';
-    wrapper.style.borderRadius = '6px';
-    wrapper.style.boxShadow = '0 1px 4px rgba(0,0,0,0.1)';
-    wrapper.style.padding = '10px';
-    wrapper.style.position = 'relative';
-    wrapper.style.maxHeight = 'none';
-    wrapper.style.overflow = 'visible';
+    loadData(function(dataset) {
+      var groupData = dataset[gid];
+      if (!groupData) {
+        return;
+      }
+      var select = root.querySelector('select[data-map-select]');
+      var currentIndex = 0;
+      if (select && select.options && select.options.length) {
+        currentIndex = select.selectedIndex;
+      } else if (typeof groupData._lastIndex === 'number') {
+        currentIndex = groupData._lastIndex;
+      }
+      if (!Number.isFinite(currentIndex) || currentIndex < 0) {
+        currentIndex = 0;
+      }
+      var entry = (groupData.entries && groupData.entries[currentIndex]) || null;
+      var selectionValue = '';
+      if (select && select.options && select.options[currentIndex]) {
+        selectionValue = select.options[currentIndex].value;
+      }
+      var timeLabel = root.dataset ? root.dataset.timeLabel : '';
+      var signature = buildPinSignature(baseKey, groupData, entry, currentIndex, timeLabel, selectionValue);
+      var existing = findPinnedBySignature(signature);
+      if (existing) {
+        removePinnedEntry(existing.id);
+        return;
+      }
 
-    var clone = root.cloneNode(true);
-    var clonePinBtn = clone.querySelector('[data-pin-toggle="1"]');
-    if (clonePinBtn) {
-      clonePinBtn.removeAttribute('data-pin-toggle');
-    }
-    var cloneDockBtn = clone.querySelector('[data-dock-toggle="1"]');
-    if (cloneDockBtn) {
-      cloneDockBtn.removeAttribute('data-dock-toggle');
-    }
-    wrapper.appendChild(clone);
-    body.appendChild(wrapper);
+      var panel = getPinPanel();
+      var body = getPinBody();
+      if (!panel || !body) {
+        return;
+      }
 
-    attach(clone);
-    preparePinnedClone(clone, key);
+      var wrapper = document.createElement('div');
+      wrapper.style.background = 'rgba(255,255,255,0.98)';
+      wrapper.style.border = '1px solid rgba(0,0,0,0.1)';
+      wrapper.style.borderRadius = '6px';
+      wrapper.style.boxShadow = '0 1px 4px rgba(0,0,0,0.1)';
+      wrapper.style.padding = '10px';
+      wrapper.style.position = 'relative';
+      wrapper.style.maxHeight = 'none';
+      wrapper.style.overflow = 'visible';
+      consumeDragEvents(wrapper);
+      addScrollGuards(wrapper);
 
-    pinState.entries.set(key, {
-      wrapper: wrapper,
-      clone: clone,
+      var clone = root.cloneNode(true);
+      wrapper.appendChild(clone);
+      body.appendChild(wrapper);
+
+      attach(clone);
+
+      var latNum = root.dataset && root.dataset.lat ? Number(root.dataset.lat) : NaN;
+      var lonNum = root.dataset && root.dataset.lon ? Number(root.dataset.lon) : NaN;
+      var timeMeta = determineEntryTimeMeta(groupData, entry, timeLabel);
+
+      var uniqueId = baseKey + '|pin:' + pinState.nextSeq++;
+      var pinEntry = {
+        id: uniqueId,
+        baseKey: baseKey,
+        signature: signature,
+        wrapper: wrapper,
+        clone: clone,
+        gid: gid,
+        layerId: groupData && Object.prototype.hasOwnProperty.call(groupData, 'layer_id') ? groupData.layer_id : gid,
+        entryIndex: currentIndex,
+        selectionValue: selectionValue,
+        lat: Number.isFinite(latNum) ? latNum : null,
+        lon: Number.isFinite(lonNum) ? lonNum : null,
+        timeKey: timeMeta.key,
+        timeLabel: timeMeta.label,
+        timeIso: timeMeta.iso,
+        dataset: groupData,
+        orderIndex: 0,
+      };
+
+      pinState.lookup.set(uniqueId, pinEntry);
+      pinState.orderSequence.push(uniqueId);
+      updatePinnedOrderIndices();
+      pinState.entries.push(pinEntry);
+      incrementPinCount(baseKey);
+      preparePinnedClone(clone, pinEntry);
+      suppressDoubleClick(wrapper);
+      consumeDragEvents(clone);
+      renderPinnedList();
+      updatePinPanelVisibility();
     });
-    updatePinPanelVisibility();
-    updatePinButtonsByKey(key);
   }
 
   function dockPopup(root, mapObj, popupObj) {
@@ -4579,23 +5168,8 @@ function getPinPanel() {
   }
 
   function refreshPinnedEntries() {
-    pinState.entries.forEach(function(entry, key) {
-      if (!entry || !entry.clone) {
-        return;
-      }
-      var clone = entry.clone;
-      var pinBtn = clone.querySelector('[data-pin-toggle="1"]');
-      if (pinBtn) {
-        pinBtn.removeAttribute('data-pin-toggle');
-      }
-      var dockBtn = clone.querySelector('[data-dock-toggle="1"]');
-      if (dockBtn) {
-        dockBtn.removeAttribute('data-dock-toggle');
-      }
-      attach(clone);
-      preparePinnedClone(clone, key);
-      addScrollGuards(clone);
-    });
+    renderPinnedList();
+    updatePinPanelVisibility();
   }
 
   function attachDockToggle(root, mapObj, popupObj) {
@@ -4796,6 +5370,8 @@ function attach(root) {
         }
       }
       addScrollGuards(root);
+      suppressDoubleClick(root);
+      consumeDragEvents(root);
       updateDockButtonState(root, root.querySelector('[data-dock-toggle="1"]'));
       var header = root.querySelector('[data-popup-header]');
       if (header && typeof groupData.title === 'string') {
