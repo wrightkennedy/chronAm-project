@@ -2912,6 +2912,8 @@ class TermGroupDialog(TermSelectionDialog):
         groups_layout.addWidget(self.groups_list)
 
         group_buttons = QHBoxLayout()
+        self.edit_group_btn = QPushButton('Edit')
+        group_buttons.addWidget(self.edit_group_btn)
         self.rename_group_btn = QPushButton('Rename')
         self.remove_group_btn = QPushButton('Remove')
         group_buttons.addWidget(self.rename_group_btn)
@@ -2919,11 +2921,17 @@ class TermGroupDialog(TermSelectionDialog):
         group_buttons.addStretch(1)
         groups_layout.addLayout(group_buttons)
 
+        # Explicit naming option
+        self.explicit_names_box = QCheckBox('Explicit Group Names')
+        self.explicit_names_box.setToolTip('If checked, new group names default to "*<term1> (<term1>; <term2>; …)". You can still rename.')
+        groups_layout.addWidget(self.explicit_names_box)
+
         insert_index = max(0, self._main_layout.count() - 1)
         self._main_layout.insertWidget(insert_index, groups_box)
 
         self.groups_list.itemSelectionChanged.connect(self._update_group_controls)
         self.groups_list.itemDoubleClicked.connect(lambda _item: self._rename_selected_group())
+        self.edit_group_btn.clicked.connect(self._edit_selected_group)
         self.rename_group_btn.clicked.connect(self._rename_selected_group)
         self.remove_group_btn.clicked.connect(self._remove_selected_group)
 
@@ -2983,7 +2991,13 @@ class TermGroupDialog(TermSelectionDialog):
         if not selected_terms:
             QMessageBox.information(self, 'Select Terms', 'Select one or more ungrouped terms to create a new group.')
             return
-        default_name = selected_terms[0]
+        # Default name with leading marker
+        term1 = selected_terms[0]
+        if self.explicit_names_box.isChecked():
+            parts = '; '.join(selected_terms)
+            default_name = f"*{term1} ({parts})"
+        else:
+            default_name = f"*{term1}"
         name, ok = QInputDialog.getText(self, 'Group Name', 'Enter display name for this group:', QLineEdit.Normal, default_name)
         if not ok:
             return
@@ -3010,6 +3024,80 @@ class TermGroupDialog(TermSelectionDialog):
             self._set_item_group_state(term, display_name)
         self._refresh_group_list()
         self._update_group_button_enabled()
+        self._update_action_button_text()
+
+    def _edit_selected_group(self):
+        item = self.groups_list.currentItem()
+        if item is None:
+            return
+        name = item.data(Qt.UserRole) or ''
+        group = next((grp for grp in self.groups if grp.get('name') == name), None)
+        if group is None:
+            return
+        current_terms = list(dict.fromkeys(group.get('terms', []) or []))
+        # Build term info list from existing items; include any missing terms from the group
+        info_rows: List[dict] = []
+        seen: Set[str] = set()
+        for term, _item in self._item_by_term.items():
+            if term in seen:
+                continue
+            seen.add(term)
+            info_rows.append({
+                'term': term,
+                'frequency': self._term_frequency.get(term),
+                'rank': None,
+            })
+        for term in current_terms:
+            if term not in seen:
+                seen.add(term)
+                info_rows.append({'term': term, 'frequency': None, 'rank': None})
+
+        dlg = TermSelectionDialog(
+            self,
+            info_rows,
+            current_terms,
+            window_title='Edit Group Members',
+            info_text='Add or remove terms in this group. Terms already in other groups are disabled.',
+            action_verb='Apply',
+        )
+        # Disable items belonging to other groups
+        for i in range(dlg.list_widget.count()):
+            it = dlg.list_widget.item(i)
+            term_val = it.data(Qt.UserRole) or ''
+            in_other = (term_val.lower() in self._group_term_lookup) and (self._group_term_lookup.get(term_val.lower()) != name)
+            if in_other:
+                it.setFlags(it.flags() & ~Qt.ItemIsEnabled)
+                txt = it.text()
+                if '(in another group)' not in txt:
+                    it.setText(f"{txt} (in another group)")
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        new_terms = list(dict.fromkeys(dlg.selected_terms))
+        # Update mappings for removed terms
+        removed = [t for t in current_terms if t not in new_terms]
+        added = [t for t in new_terms if t not in current_terms]
+        for t in removed:
+            self._group_term_lookup.pop(t.lower(), None)
+            self._set_item_group_state(t, None)
+        for t in added:
+            self._group_term_lookup[t.lower()] = name
+            self._set_item_group_state(t, name)
+        # Update group data
+        freq_values = [self._term_frequency.get(term) for term in new_terms if self._term_frequency.get(term) is not None]
+        total_freq = float(sum(freq_values)) if freq_values else None
+        group['terms'] = new_terms
+        if total_freq is not None:
+            group['total_frequency'] = total_freq
+        else:
+            group.pop('total_frequency', None)
+        # Update missing terms set
+        missing_terms = [t for t in new_terms if t not in self._item_by_term]
+        if missing_terms:
+            group['missing_terms'] = list(missing_terms)
+        else:
+            group.pop('missing_terms', None)
+        self._refresh_group_list()
+        self._update_group_controls()
         self._update_action_button_text()
 
     def _rename_selected_group(self):
@@ -3110,6 +3198,8 @@ class TermGroupDialog(TermSelectionDialog):
 
     def _update_group_controls(self):
         has_selection = self.groups_list.currentRow() >= 0
+        if hasattr(self, 'edit_group_btn'):
+            self.edit_group_btn.setEnabled(has_selection)
         self.rename_group_btn.setEnabled(has_selection)
         self.remove_group_btn.setEnabled(has_selection)
 
@@ -4541,6 +4631,13 @@ class CollocationDialog(QDialog):
         dialog = TermGroupDialog(self, top_terms, existing_groups)
         if dialog.exec_() == QDialog.Accepted:
             self._set_term_groups(dialog.created_groups, log_change=True, show_notice=True)
+            # Return focus to Collocation dialog
+            try:
+                self.raise_()
+                self.activateWindow()
+                self.setFocus()
+            except Exception:
+                pass
 
     def open_select_terms_dialog(self):
         if not self.select_terms_btn.isEnabled():
