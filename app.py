@@ -8,7 +8,7 @@ import threading
 import time
 import urllib.parse
 from datetime import datetime
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 from PyQt5.QtCore import (
@@ -1728,7 +1728,15 @@ class CSVPreviewDialog(QDialog):
 
 
 class CollocationRankSettingsDialog(QDialog):
-    def __init__(self, parent, bins: List[str], max_terms: int, default_top_n: int = 10):
+    def __init__(
+        self,
+        parent,
+        bins: List[str],
+        max_terms: int,
+        default_top_n: int = 10,
+        *,
+        selected_terms: Optional[Iterable[str]] = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle('Rank Chart Settings')
         layout = QVBoxLayout(self)
@@ -1753,6 +1761,20 @@ class CollocationRankSettingsDialog(QDialog):
 
         layout.addLayout(form)
 
+        self._selected_terms: List[str] = list(dict.fromkeys(selected_terms or []))
+        has_selected = bool(self._selected_terms)
+
+        self.use_selected_check = QCheckBox('Use selected terms from Collocation tool (overrides Top N)')
+        self.use_selected_check.setChecked(has_selected)
+        self.use_selected_check.setEnabled(has_selected)
+        layout.addWidget(self.use_selected_check)
+        self.use_selected_check.toggled.connect(self._handle_use_selected_toggle)
+
+        self.selection_label = QLabel()
+        self.selection_label.setWordWrap(True)
+        self.selection_label.setStyleSheet('color: #555555; font-size: 11px;')
+        layout.addWidget(self.selection_label)
+
         self.global_check.toggled.connect(self.home_combo.setDisabled)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1760,13 +1782,47 @@ class CollocationRankSettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        self._update_selection_summary()
+
     def values(self) -> dict:
         return {
             'top_n': self.top_spin.value(),
             'home_bin_index': self.home_combo.currentIndex(),
             'use_global': self.global_check.isChecked(),
             'show_labels': self.labels_check.isChecked(),
+            'use_selected_terms': self.use_selected_check.isChecked(),
+            'selected_terms': list(self._selected_terms),
         }
+
+    def _update_selection_summary(self):
+        count = len(self._selected_terms)
+        if count:
+            preview = ', '.join(self._selected_terms[:3])
+            if count > 3:
+                preview += ', …'
+            self.selection_label.setText(
+                f'Selected {count} term(s): {html.escape(preview)}.'
+            )
+        else:
+            self.selection_label.setText('No specific terms selected. Top N terms will be used.')
+        self._apply_top_spin_enabled()
+
+    def _handle_use_selected_toggle(self, checked: bool):
+        if checked and not self._selected_terms:
+            self.use_selected_check.setChecked(False)
+            return
+        self._apply_top_spin_enabled()
+
+    def _apply_top_spin_enabled(self):
+        use_selected = self.use_selected_check.isChecked() and bool(self._selected_terms)
+        self.top_spin.setEnabled(not use_selected)
+        if self._selected_terms:
+            base_text = self.selection_label.text().split(' (', 1)[0]
+            base_text = base_text.rstrip('.')
+            if use_selected:
+                self.selection_label.setText(f'{base_text} (overrides Top N).')
+            else:
+                self.selection_label.setText(f'{base_text}.')
 
 
 
@@ -1780,6 +1836,8 @@ class CollocateMapSettingsDialog(QDialog):
         states: List[str],
         default_top_n: int = 25,
         max_top_n: int = 150,
+        selected_terms: Optional[Iterable[str]] = None,
+        use_selected_default: bool = False,
     ):
         super().__init__(parent)
         self.setWindowTitle('Collocate Map Settings')
@@ -1790,9 +1848,23 @@ class CollocateMapSettingsDialog(QDialog):
         self.top_spin = QSpinBox()
         self.top_spin.setRange(1, max_top_n)
         self.top_spin.setValue(max(1, min(default_top_n, max_top_n)))
-        form.addRow('Top collocates:', self.top_spin)
+        form.addRow('Top N terms:', self.top_spin)
+
+        self._selected_terms = list(dict.fromkeys(selected_terms or []))
+        self.use_selected_terms_check = QCheckBox('Use selected terms from Collocation tool (overrides Top N)')
+        has_selected = bool(self._selected_terms)
+        default_selected = has_selected and use_selected_default
+        self.use_selected_terms_check.setChecked(default_selected)
+        self.use_selected_terms_check.setEnabled(has_selected)
+        form.addRow(self.use_selected_terms_check)
+
+        self.selected_terms_label = QLabel()
+        self.selected_terms_label.setWordWrap(True)
+        self.selected_terms_label.setStyleSheet('color: #555555; font-size: 11px;')
+        form.addRow(self.selected_terms_label)
 
         self.colorize_check = QCheckBox('Color markers by collocate article count')
+        self.colorize_check.setChecked(True)
         form.addRow(self.colorize_check)
 
         time_row = QWidget()
@@ -1816,6 +1888,10 @@ class CollocateMapSettingsDialog(QDialog):
         form.addRow('Time controls:', time_row)
 
         layout.addLayout(form)
+
+        self.use_selected_terms_check.toggled.connect(self._apply_top_spin_enabled)
+        self._update_selected_terms_summary()
+        self._apply_top_spin_enabled()
 
         scope_box = QGroupBox('Term selection scope')
         scope_layout = QVBoxLayout(scope_box)
@@ -1896,6 +1972,29 @@ class CollocateMapSettingsDialog(QDialog):
         _update_time_enabled()
         _update_location_controls()
 
+    def _update_selected_terms_summary(self):
+        count = len(self._selected_terms)
+        if count:
+            preview = ', '.join(self._selected_terms[:3])
+            if count > 3:
+                preview += ', …'
+            self.selected_terms_label.setText(
+                f'Selected {count} term(s): {html.escape(preview)}.'
+            )
+        else:
+            self.selected_terms_label.setText('No selected terms available; Top N terms will be used.')
+
+    def _apply_top_spin_enabled(self):
+        use_selected = self.use_selected_terms_check.isChecked() and bool(self._selected_terms)
+        self.top_spin.setEnabled(not use_selected)
+        if self._selected_terms:
+            base_text = self.selected_terms_label.text().split(' (', 1)[0]
+            base_text = base_text.rstrip('.')
+            if use_selected:
+                self.selected_terms_label.setText(f'{base_text} (overrides Top N).')
+            else:
+                self.selected_terms_label.setText(f'{base_text}.')
+
     def values(self) -> dict:
         term_scope = 'global'
         time_key = None
@@ -1937,6 +2036,7 @@ class CollocateMapSettingsDialog(QDialog):
             'colorize': self.colorize_check.isChecked(),
             'location_label': location_label,
             'enable_time_slider': self.enable_time_slider.isEnabled() and self.enable_time_slider.isChecked(),
+            'use_selected_terms': self.use_selected_terms_check.isChecked(),
         }
 
 
@@ -2414,16 +2514,26 @@ class MapToolDialog(QDialog):
         self.status_label.setText(html.escape('Map created successfully. ' + '; '.join(parts)))
 
 
-class TermDropDialog(QDialog):
-    def __init__(self, parent: Optional[QWidget], terms: List[dict], selected_terms: set):
+class TermSelectionDialog(QDialog):
+    def __init__(
+        self,
+        parent: Optional[QWidget],
+        terms: List[dict],
+        selected_terms: Iterable[str],
+        *,
+        window_title: str,
+        info_text: str,
+        action_verb: str,
+    ):
         super().__init__(parent)
-        self.setWindowTitle('Select Terms to Drop')
+        self.setWindowTitle(window_title)
         self.setMinimumSize(480, 620)
         self.selected_terms: List[str] = list(selected_terms)
         self._initializing = True
+        self._action_verb = action_verb
 
         layout = QVBoxLayout(self)
-        info = QLabel('Select collocate terms to exclude from the analysis (top 150 shown).')
+        info = QLabel(info_text)
         info.setWordWrap(True)
         layout.addWidget(info)
 
@@ -2476,17 +2586,17 @@ class TermDropDialog(QDialog):
             item = QListWidgetItem(item_text)
             item.setData(Qt.UserRole, term)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if term in selected_terms else Qt.Unchecked)
+            item.setCheckState(Qt.Checked if term in self.selected_terms else Qt.Unchecked)
             self.list_widget.addItem(item)
         self.list_widget.blockSignals(False)
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
-        self.drop_btn = QPushButton('Drop 0 Term(s)')
-        self.drop_btn.setDefault(True)
-        self.drop_btn.setAutoDefault(True)
+        self.action_btn = QPushButton(f'{self._action_verb} 0 Term(s)')
+        self.action_btn.setDefault(True)
+        self.action_btn.setAutoDefault(True)
         self.cancel_btn = QPushButton('Cancel')
-        button_row.addWidget(self.drop_btn)
+        button_row.addWidget(self.action_btn)
         button_row.addWidget(self.cancel_btn)
         layout.addLayout(button_row)
 
@@ -2495,7 +2605,7 @@ class TermDropDialog(QDialog):
         self.clear_btn.clicked.connect(self._clear_checks)
         self.length_spin.valueChanged.connect(self._handle_length_selection)
         self.list_widget.itemChanged.connect(self._handle_item_changed)
-        self.drop_btn.clicked.connect(self._accept_selection)
+        self.action_btn.clicked.connect(self._accept_selection)
         self.cancel_btn.clicked.connect(self.reject)
 
         self._initializing = False
@@ -2506,7 +2616,7 @@ class TermDropDialog(QDialog):
             self._update_show_selected_button_text(self.show_selected_btn.isChecked())
 
         self._apply_filters()
-        self._update_drop_button_text()
+        self._update_action_button_text()
 
     def _gather_selected(self) -> List[str]:
         terms: List[str] = []
@@ -2530,7 +2640,7 @@ class TermDropDialog(QDialog):
             matches_selection = (not show_selected) or item.checkState() == Qt.Checked
             item.setHidden(not (matches_search and matches_selection))
         self._update_show_selected_button_text(show_selected)
-        self._update_drop_button_text()
+        self._update_action_button_text()
 
     def _clear_checks(self):
         self.list_widget.blockSignals(True)
@@ -2564,16 +2674,16 @@ class TermDropDialog(QDialog):
         if self.show_selected_btn.isChecked():
             self._apply_filters()
         else:
-            self._update_drop_button_text()
+            self._update_action_button_text()
 
     def _accept_selection(self):
         self.selected_terms = self._gather_selected()
         self.accept()
 
-    def _update_drop_button_text(self):
+    def _update_action_button_text(self):
         count = len(self._gather_selected())
-        self.drop_btn.setText(f'Drop {count} Term(s)')
-        self.drop_btn.setEnabled(count > 0)
+        self.action_btn.setText(f'{self._action_verb} {count} Term(s)')
+        self.action_btn.setEnabled(count > 0)
 
     def _on_toggle_show_selected(self, checked: bool):
         self._update_show_selected_button_text(checked)
@@ -2581,6 +2691,30 @@ class TermDropDialog(QDialog):
 
     def _update_show_selected_button_text(self, checked: bool):
         self.show_selected_btn.setText('Show All Terms' if checked else 'Show Selected Terms')
+
+
+class TermDropDialog(TermSelectionDialog):
+    def __init__(self, parent: Optional[QWidget], terms: List[dict], selected_terms: Iterable[str]):
+        super().__init__(
+            parent,
+            terms,
+            selected_terms,
+            window_title='Select Terms to Drop',
+            info_text='Select collocate terms to exclude from the analysis (top 150 shown).',
+            action_verb='Drop',
+        )
+
+
+class TermPlotDialog(TermSelectionDialog):
+    def __init__(self, parent: Optional[QWidget], terms: List[dict], selected_terms: Iterable[str]):
+        super().__init__(
+            parent,
+            terms,
+            selected_terms,
+            window_title='Select Terms to Visualize',
+            info_text='Select specific collocate terms to use in charts and maps (top 150 shown).',
+            action_verb='Select',
+        )
 
 class CollocationDialog(QDialog):
     def __init__(self, parent=None):
@@ -2591,6 +2725,7 @@ class CollocationDialog(QDialog):
         self._last_output_paths = None
         self._preview_windows = []
         self._collocate_map_settings: Optional[dict] = None
+        self._rank_selected_terms: List[str] = []
 
         # --- Source selection & status line ---
         mode_row = QHBoxLayout()
@@ -2691,34 +2826,36 @@ class CollocationDialog(QDialog):
         form_widget = QWidget()
         form_widget.setLayout(form)
 
-        options_row = QHBoxLayout()
-        options_row.setContentsMargins(0, 0, 0, 0)
-        options_row.addWidget(form_widget, 1)
+        main_columns = QHBoxLayout()
+        main_columns.setContentsMargins(0, 0, 0, 0)
+
+        left_column = QVBoxLayout()
+        left_column.setContentsMargins(0, 0, 0, 0)
+        left_column.addWidget(form_widget, 1)
 
         drop_column = QVBoxLayout()
         drop_column.setContentsMargins(0, 0, 0, 0)
         drop_column.setSpacing(6)
-        self.select_drop_terms_btn = QPushButton('Select Terms to Drop')
+        self.select_drop_terms_btn = QPushButton('Drop Terms')
         self.select_drop_terms_btn.clicked.connect(self.open_drop_terms_dialog)
         drop_column.addWidget(self.select_drop_terms_btn)
 
-        summary_row = QHBoxLayout()
-        summary_row.setContentsMargins(0, 0, 0, 0)
+        drop_summary_row = QHBoxLayout()
+        drop_summary_row.setContentsMargins(0, 0, 0, 0)
         self.drop_summary_label = QLabel()
         self.drop_summary_label.setWordWrap(True)
         self.drop_summary_label.setStyleSheet('color: #555555; font-size: 11px;')
-        summary_row.addWidget(self.drop_summary_label, 1)
+        drop_summary_row.addWidget(self.drop_summary_label, 1)
         self.clear_drop_btn = QPushButton('Clear')
         self.clear_drop_btn.setFixedHeight(22)
         self.clear_drop_btn.setMaximumWidth(70)
         self.clear_drop_btn.clicked.connect(self.clear_dropped_terms)
-        summary_row.addWidget(self.clear_drop_btn, 0)
-        drop_column.addLayout(summary_row)
+        drop_summary_row.addWidget(self.clear_drop_btn, 0)
+        drop_column.addLayout(drop_summary_row)
 
         self.drop_terms_view = QTextBrowser()
         self.drop_terms_view.setReadOnly(True)
         self.drop_terms_view.setMinimumHeight(120)
-        self.drop_terms_view.setMaximumWidth(260)
         self.drop_terms_view.setStyleSheet('font-size: 11px;')
         drop_column.addWidget(self.drop_terms_view)
 
@@ -2728,12 +2865,47 @@ class CollocationDialog(QDialog):
         drop_column.addWidget(self.clear_notice_label)
         drop_column.addStretch(1)
 
-        options_row.addLayout(drop_column, 0)
-        layout.addLayout(options_row)
+        drop_group = QGroupBox('Drop Terms')
+        drop_group.setLayout(drop_column)
+        drop_group.setMaximumWidth(260)
 
-        lower_row = QHBoxLayout()
-        lower_row.setContentsMargins(0, 12, 0, 0)
-        lower_row.setSpacing(20)
+        select_column = QVBoxLayout()
+        select_column.setContentsMargins(0, 0, 0, 0)
+        select_column.setSpacing(6)
+        self.select_terms_btn = QPushButton('Select Terms')
+        self.select_terms_btn.clicked.connect(self.open_select_terms_dialog)
+        self.select_terms_btn.setEnabled(False)
+        select_column.addWidget(self.select_terms_btn)
+
+        select_summary_row = QHBoxLayout()
+        select_summary_row.setContentsMargins(0, 0, 0, 0)
+        self.selected_summary_label = QLabel()
+        self.selected_summary_label.setWordWrap(True)
+        self.selected_summary_label.setStyleSheet('color: #555555; font-size: 11px;')
+        select_summary_row.addWidget(self.selected_summary_label, 1)
+        self.clear_selected_btn = QPushButton('Clear')
+        self.clear_selected_btn.setFixedHeight(22)
+        self.clear_selected_btn.setMaximumWidth(70)
+        self.clear_selected_btn.clicked.connect(self.clear_selected_terms)
+        select_summary_row.addWidget(self.clear_selected_btn, 0)
+        select_column.addLayout(select_summary_row)
+
+        self.selected_terms_view = QTextBrowser()
+        self.selected_terms_view.setReadOnly(True)
+        self.selected_terms_view.setMinimumHeight(120)
+        self.selected_terms_view.setStyleSheet('font-size: 11px;')
+        select_column.addWidget(self.selected_terms_view)
+        select_column.addStretch(1)
+
+        selected_group = QGroupBox('Selected Terms')
+        selected_group.setLayout(select_column)
+        selected_group.setMaximumWidth(260)
+
+        right_column = QVBoxLayout()
+        right_column.setContentsMargins(0, 0, 0, 0)
+        right_column.setSpacing(12)
+        right_column.addWidget(drop_group)
+        right_column.addWidget(selected_group)
 
         options_group = QGroupBox('Collocation Options')
         options_group.setAlignment(Qt.AlignLeft)
@@ -2743,7 +2915,8 @@ class CollocationDialog(QDialog):
             cb = self.checks[opt]
             options_group_layout.addWidget(cb)
         options_group_layout.addStretch(1)
-        lower_row.addWidget(options_group, 1)
+        left_column.addWidget(options_group)
+        left_column.addStretch(1)
 
         context_group = QGroupBox('Context Window')
         context_group.setAlignment(Qt.AlignLeft)
@@ -2766,15 +2939,24 @@ class CollocationDialog(QDialog):
         self.context_right_spin.setFixedWidth(60)
         context_layout.addWidget(self.context_right_spin)
         context_layout.addStretch(1)
-        lower_row.addWidget(context_group, 0)
-        layout.addLayout(lower_row)
+        context_group.setMaximumWidth(260)
+        right_column.addWidget(context_group)
+        right_column.addStretch(1)
+
+        main_columns.addLayout(left_column, 1)
+        main_columns.addLayout(right_column, 0)
+        layout.addLayout(main_columns)
+
+        self._update_selected_terms_summary()
 
         self._loading_defaults = True
         self._restore_state_or_defaults()
         self._loading_defaults = False
         self._update_drop_summary()
+        self._update_selected_terms_summary()
         self._update_context_keyword_label()
         self._set_clear_notice('')
+        self._update_select_terms_enabled()
 
         self.bin_size.textEdited.connect(self._handle_bin_control_change)
         self.bin_unit.currentIndexChanged.connect(self._handle_bin_control_change)
@@ -2897,6 +3079,10 @@ class CollocationDialog(QDialog):
         sorted_states = sorted(state_set, key=lambda s: s.lower())
 
         default_top = self._collocate_map_settings.get('top_n') if isinstance(self._collocate_map_settings, dict) else 25
+        manual_terms_current = list(dict.fromkeys(self._rank_selected_terms))
+        use_selected_default = bool(manual_terms_current)
+        if isinstance(self._collocate_map_settings, dict) and 'use_selected_terms' in self._collocate_map_settings:
+            use_selected_default = bool(self._collocate_map_settings.get('use_selected_terms')) and bool(manual_terms_current)
         settings_dialog = CollocateMapSettingsDialog(
             self,
             time_bins=time_bin_pairs,
@@ -2904,6 +3090,8 @@ class CollocationDialog(QDialog):
             states=sorted_states,
             default_top_n=max(1, min(int(default_top or 25), 150)),
             max_top_n=150,
+            selected_terms=manual_terms_current,
+            use_selected_default=use_selected_default,
         )
         if self._collocate_map_settings:
             prev = self._collocate_map_settings
@@ -2933,6 +3121,9 @@ class CollocationDialog(QDialog):
                     settings_dialog.state_combo.setCurrentIndex(index)
             if prev.get('enable_time_slider') and settings_dialog.enable_time_slider.isEnabled():
                 settings_dialog.enable_time_slider.setChecked(True)
+            if settings_dialog.use_selected_terms_check.isEnabled():
+                settings_dialog.use_selected_terms_check.setChecked(bool(prev.get('use_selected_terms')))
+                settings_dialog._apply_top_spin_enabled()
 
         if settings_dialog.exec_() != QDialog.Accepted:
             return
@@ -2944,7 +3135,44 @@ class CollocationDialog(QDialog):
         if not enable_time_slider:
             map_settings['enable_time_slider'] = False
 
-        top_n = int(map_settings.get('top_n', 25))
+        manual_terms = list(dict.fromkeys(self._rank_selected_terms))
+        use_selected_terms = bool(map_settings.get('use_selected_terms'))
+        default_top_n = int(map_settings.get('top_n', 25))
+        if use_selected_terms and manual_terms:
+            metrics_path = None
+            if isinstance(self._last_output_paths, dict):
+                metrics_path = self._last_output_paths.get('metrics')
+            if metrics_path and os.path.exists(metrics_path):
+                try:
+                    term_infos = self._fetch_metric_term_infos(metrics_path)
+                except (RuntimeError, ValueError):
+                    term_infos = []
+                if term_infos:
+                    available_terms = {info['term'] for info in term_infos}
+                    missing_manual = [term for term in manual_terms if term not in available_terms]
+                    if missing_manual and len(missing_manual) == len(manual_terms):
+                        QMessageBox.information(
+                            self,
+                            'Terms Not Found',
+                            'None of the selected terms are available in the current metrics. The map will use the Top N terms instead.',
+                        )
+                        manual_terms = []
+                        use_selected_terms = False
+                    elif missing_manual:
+                        preview = ', '.join(missing_manual[:5])
+                        if len(missing_manual) > 5:
+                            preview += ', …'
+                        QMessageBox.information(
+                            self,
+                            'Terms Not Found',
+                            'The following selected terms are not available in the current metrics and will be skipped:\n' + preview,
+                        )
+                        manual_terms = [term for term in manual_terms if term in available_terms]
+        else:
+            use_selected_terms = False
+        top_n = len(manual_terms) if use_selected_terms and manual_terms else default_top_n
+        map_settings['use_selected_terms'] = use_selected_terms
+        self._collocate_map_settings['use_selected_terms'] = use_selected_terms
         term_scope = map_settings.get('term_scope', 'global')
         time_key = map_settings.get('time_key') or None
         time_label = map_settings.get('time_label') or ''
@@ -2976,6 +3204,7 @@ class CollocationDialog(QDialog):
                 collocate_rank_focus=location_scope,
                 collocate_rank_focus_city=location_city or None,
                 collocate_rank_focus_state=location_state or None,
+                collocate_rank_terms=manual_terms if use_selected_terms and manual_terms else None,
                 collocate_window=context_window,
                 collocate_rank_time_label=time_label or None,
                 collocate_rank_focus_label=location_label or None,
@@ -3027,6 +3256,10 @@ class CollocationDialog(QDialog):
         self.source_label.setText(self._source_text())
         if parent is not None:
             parent.collocation_state = {}
+        self._last_output_paths = None
+        self._rank_selected_terms = []
+        self._update_selected_terms_summary()
+        self._update_select_terms_enabled()
         self._loading_defaults = True
         self._prefill_from_current_source(reset_state=True)
         self._loading_defaults = False
@@ -3148,6 +3381,21 @@ class CollocationDialog(QDialog):
             else:
                 parent.collocation_drop_terms = []
         self._update_drop_summary()
+
+        manual_terms_state = state.get('rank_selected_terms')
+        if isinstance(manual_terms_state, list):
+            cleaned: List[str] = []
+            seen = set()
+            for entry in manual_terms_state:
+                if not isinstance(entry, str):
+                    continue
+                term_clean = entry.strip()
+                if term_clean and term_clean not in seen:
+                    seen.add(term_clean)
+                    cleaned.append(term_clean)
+            self._rank_selected_terms = cleaned
+        else:
+            self._rank_selected_terms = []
 
     def _prefill_from_current_source(self, reset_state: bool = False):
         parent = self.parent()
@@ -3281,6 +3529,19 @@ class CollocationDialog(QDialog):
         else:
             self.drop_terms_view.setHtml('<span style="color:#777777;">(none)</span>')
 
+    def _update_selected_terms_summary(self):
+        terms = list(dict.fromkeys(self._rank_selected_terms))
+        count = len(terms)
+        if count:
+            self.selected_summary_label.setText(f'Selected terms: {count}')
+            body = '<br/>'.join(html.escape(term) for term in terms)
+            self.selected_terms_view.setHtml(body)
+            self.clear_selected_btn.setEnabled(True)
+        else:
+            self.selected_summary_label.setText('No terms selected.')
+            self.selected_terms_view.setHtml('<span style="color:#777777;">(none)</span>')
+            self.clear_selected_btn.setEnabled(False)
+
     def _set_dropped_terms(self, terms: List[str], *, log_change: bool, show_notice: bool = False):
         parent = self.parent()
         if parent is None:
@@ -3334,6 +3595,46 @@ class CollocationDialog(QDialog):
             return
         self._set_dropped_terms([], log_change=True, show_notice=True)
 
+    def clear_selected_terms(self):
+        if not self._rank_selected_terms:
+            return
+        self._rank_selected_terms = []
+        self._update_selected_terms_summary()
+        self._save_state()
+
+    def _update_select_terms_enabled(self):
+        metrics_path = None
+        if isinstance(self._last_output_paths, dict):
+            metrics_path = self._last_output_paths.get('metrics')
+        enabled = bool(metrics_path and os.path.exists(metrics_path))
+        self.select_terms_btn.setEnabled(enabled)
+
+    def _fetch_metric_term_infos(self, metrics_path: str) -> List[dict]:
+        try:
+            df = pd.read_csv(metrics_path)
+        except Exception as exc:
+            raise RuntimeError(f'Unable to read metrics file: {exc}')
+        if df.empty or 'collocate_term' not in df.columns:
+            raise ValueError('No collocate terms are available.')
+        df = df.dropna(subset=['collocate_term']).copy()
+        if df.empty:
+            raise ValueError('No collocate terms are available.')
+        df['collocate_term'] = df['collocate_term'].astype(str)
+        freq_col = 'frequency' if 'frequency' in df.columns else None
+        if freq_col:
+            df = df.sort_values([freq_col, 'collocate_term'], ascending=[False, True]).reset_index(drop=True)
+        else:
+            df = df.sort_values(['collocate_term']).reset_index(drop=True)
+        term_infos: List[dict] = []
+        for idx, row in df.iterrows():
+            info = {
+                'term': row['collocate_term'],
+                'frequency': row.get(freq_col) if freq_col else None,
+                'rank': idx + 1,
+            }
+            term_infos.append(info)
+        return term_infos
+
     def open_drop_terms_dialog(self):
         term = self.term_input.text().strip()
         if not term:
@@ -3356,33 +3657,18 @@ class CollocationDialog(QDialog):
             QMessageBox.warning(self, 'Metrics Not Found', 'Run the collocation analysis before selecting terms to drop.')
             return
         try:
-            df = pd.read_csv(metrics_path)
-        except Exception as exc:
-            QMessageBox.critical(self, 'Read Error', f'Unable to read metrics file:\n{exc}')
+            term_infos = self._fetch_metric_term_infos(metrics_path)
+        except RuntimeError as exc:
+            QMessageBox.critical(self, 'Read Error', str(exc))
             return
-        if df.empty or 'collocate_term' not in df.columns:
+        except ValueError:
             QMessageBox.information(self, 'No Collocates', 'No collocated terms are available to drop.')
             return
-        df = df.dropna(subset=['collocate_term']).copy()
-        df['collocate_term'] = df['collocate_term'].astype(str)
-        freq_col = 'frequency' if 'frequency' in df.columns else None
-        if freq_col:
-            df = df.sort_values([freq_col, 'collocate_term'], ascending=[False, True]).reset_index(drop=True)
-        else:
-            df = df.sort_values(['collocate_term']).reset_index(drop=True)
-
-        term_infos: List[dict] = []
-        for idx, row in df.iterrows():
-            info = {
-                'term': row['collocate_term'],
-                'frequency': row.get(freq_col) if freq_col else None,
-                'rank': idx + 1,
-            }
-            term_infos.append(info)
 
         selected_set = set(self._get_parent_drop_terms())
         top_terms = term_infos[:150]
         known_terms = {info['term'] for info in top_terms}
+        info_map = {info['term']: info for info in term_infos}
 
         # Include selected terms beyond the top 150 and any missing from the file
         for info in term_infos[150:]:
@@ -3392,12 +3678,80 @@ class CollocationDialog(QDialog):
                 known_terms.add(term_name)
         for term_name in selected_set:
             if term_name not in known_terms:
-                top_terms.append({'term': term_name, 'frequency': None, 'rank': None})
+                info = info_map.get(term_name)
+                if info:
+                    top_terms.append(info)
+                else:
+                    top_terms.append({'term': term_name, 'frequency': None, 'rank': None})
                 known_terms.add(term_name)
 
         dialog = TermDropDialog(self, top_terms, selected_set)
         if dialog.exec_() == QDialog.Accepted:
             self._set_dropped_terms(dialog.selected_terms, log_change=True)
+
+    def open_select_terms_dialog(self):
+        if not self.select_terms_btn.isEnabled():
+            return
+        term = self.term_input.text().strip()
+        if not term:
+            QMessageBox.warning(self, 'Search Term Required', 'Enter a search term before selecting terms.')
+            return
+        city_text = self.city_combo.currentText()
+        state_text = self.state_combo.currentText()
+        city = None if not city_text or city_text == 'All Cities' else city_text.strip()
+        state = None if not state_text or state_text == 'All States' else state_text.strip()
+        paths = self._build_output_paths(
+            term,
+            self.start_input.text().strip(),
+            self.end_input.text().strip(),
+            city,
+            state,
+            self._options_with_context(),
+        )
+        metrics_path = paths.get('metrics')
+        if not metrics_path or not os.path.exists(metrics_path):
+            QMessageBox.warning(self, 'Metrics Not Found', 'Run the collocation analysis before selecting terms.')
+            return
+        try:
+            term_infos = self._fetch_metric_term_infos(metrics_path)
+        except RuntimeError as exc:
+            QMessageBox.critical(self, 'Read Error', str(exc))
+            return
+        except ValueError:
+            QMessageBox.information(self, 'No Collocates', 'No collocated terms are available to select.')
+            return
+
+        selected_set = set(self._rank_selected_terms)
+        top_terms = term_infos[:150]
+        known_terms = {info['term'] for info in top_terms}
+        info_map = {info['term']: info for info in term_infos}
+
+        for info in term_infos[150:]:
+            term_name = info['term']
+            if term_name in selected_set and term_name not in known_terms:
+                top_terms.append(info)
+                known_terms.add(term_name)
+        for term_name in selected_set:
+            if term_name not in known_terms:
+                info = info_map.get(term_name)
+                if info:
+                    top_terms.append(info)
+                else:
+                    top_terms.append({'term': term_name, 'frequency': None, 'rank': None})
+                known_terms.add(term_name)
+
+        dialog = TermPlotDialog(self, top_terms, selected_set)
+        if dialog.exec_() == QDialog.Accepted:
+            normalized: List[str] = []
+            seen = set()
+            for item in dialog.selected_terms:
+                term_clean = str(item).strip()
+                if term_clean and term_clean not in seen:
+                    seen.add(term_clean)
+                    normalized.append(term_clean)
+            self._rank_selected_terms = normalized
+            self._update_selected_terms_summary()
+            self._save_state()
 
     def _current_time_bin_unit(self) -> Optional[str]:
         if self.ignore_bin.isChecked():
@@ -3487,6 +3841,7 @@ class CollocationDialog(QDialog):
             'dropped_terms': self._get_parent_drop_terms(),
             'context_left': self.context_left_spin.value(),
             'context_right': self.context_right_spin.value(),
+            'rank_selected_terms': list(self._rank_selected_terms),
         }
         parent.collocation_state = state
 
@@ -3664,6 +4019,7 @@ class CollocationDialog(QDialog):
             self._register_preview(preview)
 
         self._last_output_paths = result
+        self._update_select_terms_enabled()
         self._save_state()
         mode_label = 'GeoJSON' if self.mode_geo.isChecked() else 'JSON'
         self._log_collocation_run(
@@ -3694,8 +4050,49 @@ class CollocationDialog(QDialog):
         if not metrics_path or not os.path.exists(metrics_path):
             QMessageBox.warning(self, 'File Not Found', 'Metrics file not found. Please run the collocation analysis first.')
             return
+        selected_terms = list(dict.fromkeys(self._rank_selected_terms))
         try:
             plot_bar = _import_plot_bar()
+            if selected_terms:
+                try:
+                    df = pd.read_csv(metrics_path)
+                except Exception as exc:
+                    QMessageBox.critical(self, 'Read Error', f'Unable to read metrics file:\n{exc}')
+                    return
+                if df.empty or 'collocate_term' not in df.columns or 'frequency' not in df.columns:
+                    QMessageBox.information(
+                        self,
+                        'No Data',
+                        'Selected terms could not be displayed because the metrics file is missing required data.',
+                    )
+                    selected_terms = []
+                else:
+                    df = df.dropna(subset=['collocate_term']).copy()
+                    df['collocate_term'] = df['collocate_term'].astype(str)
+                    filtered = df[df['collocate_term'].isin(selected_terms)].copy()
+                    available = set(filtered['collocate_term'])
+                    missing = [term for term in selected_terms if term not in available]
+                    if filtered.empty:
+                        QMessageBox.information(
+                            self,
+                            'Terms Not Found',
+                            'None of the selected terms are present in the metrics file. Showing default top terms instead.',
+                        )
+                        selected_terms = []
+                    else:
+                        if missing:
+                            preview = ', '.join(missing[:5])
+                            if len(missing) > 5:
+                                preview += ', …'
+                            QMessageBox.information(
+                                self,
+                                'Terms Not Found',
+                                'The following selected terms are not present in the metrics file and were skipped:\n' + preview,
+                            )
+                        fig = plot_bar(filtered)
+                        if fig is not None:
+                            fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
+                        return
             fig = plot_bar(metrics_path)
         except Exception as exc:
             QMessageBox.critical(self, 'Plot Error', str(exc))
@@ -3810,32 +4207,78 @@ class CollocationDialog(QDialog):
         if not unique_terms:
             QMessageBox.information(self, 'No Rank Data', 'No collocate terms available to plot.')
             return
+        selected_manual = list(dict.fromkeys(self._rank_selected_terms))
         default_top = min(10, len(unique_terms)) or 1
-        settings_dialog = CollocationRankSettingsDialog(self, bins_ordered, len(unique_terms), default_top)
+        settings_dialog = CollocationRankSettingsDialog(
+            self,
+            bins_ordered,
+            len(unique_terms),
+            default_top,
+            selected_terms=selected_manual,
+        )
         if settings_dialog.exec_() != QDialog.Accepted:
             return
         settings = settings_dialog.values()
+        self._rank_selected_terms = list(dict.fromkeys(settings.get('selected_terms', [])))
+        self._update_selected_terms_summary()
+        self._save_state()
         top_n = settings['top_n']
         use_global = settings['use_global']
         show_labels = settings['show_labels']
+        home_idx = settings['home_bin_index']
+        home_idx = max(0, min(home_idx, len(bins_ordered) - 1))
+        use_selected_terms = bool(settings.get('use_selected_terms'))
+
+        unique_term_set = set(unique_terms)
+        manual_terms = [term for term in self._rank_selected_terms if term in unique_term_set]
+        missing_manual = [term for term in self._rank_selected_terms if term not in unique_term_set]
+        manual_mode = use_selected_terms and bool(manual_terms)
+        if manual_mode and missing_manual:
+            missing_preview = ', '.join(missing_manual[:5])
+            if len(missing_manual) > 5:
+                missing_preview += ', …'
+            QMessageBox.information(
+                self,
+                'Terms Not Found',
+                'The following selected terms are not available for the current filters and will be skipped:\n' + missing_preview,
+            )
+        elif use_selected_terms and not manual_mode and self._rank_selected_terms:
+            QMessageBox.information(
+                self,
+                'Terms Not Found',
+                'None of the manually selected terms are available for the current filters. The chart will use the Top N terms instead.',
+            )
 
         averages = None
-        if use_global:
+        legend_order: List[str]
+        home_label_value = None
+
+        if manual_mode:
+            top_terms = manual_terms
+            legend_order = manual_terms
+        elif use_global:
             averages = df.groupby('collocate_term')['ordinal_rank'].mean().dropna()
             top_terms = averages.sort_values().head(top_n).index.tolist()
+            if not top_terms:
+                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+                return
+            ordered_series = averages.reindex(top_terms).dropna().sort_values()
+            legend_order = ordered_series.index.tolist() if not ordered_series.empty else list(top_terms)
         else:
-            home_idx = settings['home_bin_index']
-            home_idx = max(0, min(home_idx, len(bins_ordered) - 1))
-            home_label = bins_ordered[home_idx]
-            df_home = df[df['time_bin'] == home_label].dropna(subset=['ordinal_rank'])
+            home_label_value = bins_ordered[home_idx]
+            df_home = df[df['time_bin'] == home_label_value].dropna(subset=['ordinal_rank'])
             if df_home.empty:
                 QMessageBox.information(self, 'No Data', 'The selected bin contains no collocates.')
                 return
             df_home_sorted = df_home.sort_values('ordinal_rank')
             top_terms = df_home_sorted.head(top_n)['collocate_term'].tolist()
+            if not top_terms:
+                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+                return
+            legend_order = top_terms
 
-        if not top_terms:
-            QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+        if manual_mode and not top_terms:
+            QMessageBox.information(self, 'No Data', 'None of the selected terms are available for the current filters.')
             return
 
         df_top = df[df['collocate_term'].isin(top_terms)].copy()
@@ -3843,21 +4286,13 @@ class CollocationDialog(QDialog):
             QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
             return
 
-        if use_global:
-            if averages is None:
-                averages = df_top.groupby('collocate_term')['ordinal_rank'].mean().dropna()
-            ordered_series = averages.reindex(top_terms).dropna().sort_values()
-            legend_order = ordered_series.index.tolist()
-            if not legend_order:
-                legend_order = top_terms
-        else:
-            legend_order = top_terms
-
-        if use_global:
+        if manual_mode:
+            home_label_display = 'Manual selection'
+        elif use_global:
             home_label_display = 'All time (global)'
         else:
             try:
-                home_label_display = str(bins_ordered[home_idx])
+                home_label_display = str(home_label_value)
             except Exception:
                 home_label_display = 'Selected bin'
 

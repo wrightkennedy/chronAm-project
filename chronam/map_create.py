@@ -65,6 +65,7 @@ def _build_collocate_rank_index(
     focus_mode: str = 'all',
     focus_city: Optional[str] = None,
     focus_state: Optional[str] = None,
+    manual_terms: Optional[List[str]] = None,
     rank_limit: int = COLLOCATE_RANK_LIMIT,
     selector_limit: int = COLLOCATE_SELECTOR_LIMIT,
     ) -> Tuple[
@@ -93,11 +94,27 @@ def _build_collocate_rank_index(
         if isinstance(term, str) and str(term).strip()
     }
 
+    manual_terms_norm: List[str] = []
+    manual_terms_seen: Set[str] = set()
+    if manual_terms:
+        for term in manual_terms:
+            if not isinstance(term, str):
+                continue
+            raw = term.strip()
+            if not raw:
+                continue
+            norm = raw.lower()
+            if norm and norm not in manual_terms_seen:
+                manual_terms_seen.add(norm)
+                manual_terms_norm.append(norm)
+
     try:
         requested_top = int(top_n)
     except (TypeError, ValueError):
         requested_top = rank_limit
     top_limit = max(1, min(requested_top, rank_limit))
+    if manual_terms_norm:
+        top_limit = max(top_limit, len(manual_terms_norm))
 
     term_scope_norm = str(term_scope or 'global').strip().lower()
     focus_mode_norm = str(focus_mode or 'all').strip().lower()
@@ -224,6 +241,12 @@ def _build_collocate_rank_index(
         base_time = focus_state_time
 
     selected_terms_ordered = [term for term, _freq in _sorted_counter_terms(base_counter) if term][:top_limit]
+    if manual_terms_norm:
+        manual_filtered = [term for term in manual_terms_norm if term in base_counter or term in global_counts]
+        if manual_filtered:
+            selected_terms_ordered = manual_filtered
+        else:
+            manual_terms_norm = []
     if term_scope_norm.startswith('time') and time_key:
         raw_key = str(time_key).strip()
         key_variants: List[str] = [raw_key] if raw_key else []
@@ -1266,6 +1289,7 @@ def create_map(
     collocate_rank_focus_label: Optional[str] = None,
     collocate_rank_colorize: bool = False,
     collocate_time_slider: bool = False,
+    collocate_rank_terms: Optional[List[str]] = None,
     metadata_enabled: bool = False,
     project_dir: Optional[str] = None,
 ) -> Dict[str, Optional[str]]:
@@ -1303,6 +1327,7 @@ def create_map(
       - collocate_rank_focus: 'all' (default), 'city', or 'state' to control which locations determine the top terms.
       - collocate_rank_focus_city / collocate_rank_focus_state: labels used when collocate_rank_focus filters by city or state.
       - collocate_rank_colorize: when True, apply a graduated color ramp based on collocate article counts.
+      - collocate_rank_terms: optional explicit list of collocate terms to include (overrides top-N when provided).
       - collocate_time_slider: when True, expose an interactive time slider for collocate views (points mode only).
 
     Returns:
@@ -1588,6 +1613,7 @@ def create_map(
             focus_mode=collocate_rank_focus,
             focus_city=collocate_rank_focus_city,
             focus_state=collocate_rank_focus_state,
+            manual_terms=collocate_rank_terms,
         )
         if collocate_hits_by_city:
             for group in groups:
