@@ -8,7 +8,7 @@ import threading
 import time
 import urllib.parse
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 from PyQt5.QtCore import (
@@ -21,7 +21,7 @@ from PyQt5.QtCore import (
     pyqtProperty,
     pyqtSignal,
 )
-from PyQt5.QtGui import QIntValidator, QKeySequence, QPainter, QPen, QTextCursor
+from PyQt5.QtGui import QDesktopServices, QIntValidator, QKeySequence, QPainter, QPen, QTextCursor
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -36,6 +36,7 @@ from PyQt5.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -45,6 +46,9 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QSizePolicy,
+    QStyle,
+    QToolButton,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -55,10 +59,9 @@ from PyQt5.QtWidgets import (
 
 from chronam import download_data
 from chronam.config import DEFAULT_CSV_FILENAME, default_csv_path
-from chronam.map_create import create_map
-from chronam.merge import merge_geojson
+from chronam.map_create import create_map, _build_time_index, _parse_date
 from chronam.collocate import run_collocation, build_collocation_output_paths
-from chronam.visualize import plot_bar, plot_rank_changes
+from chronam.utils import term_directory_name
 
 
 def reveal_in_file_manager(path: str):
@@ -83,13 +86,128 @@ DATASET_FOLDER_WARNING = (
 )
 
 
+def resolve_locations_csv(parent: Optional[QWidget]) -> Optional[str]:
+    candidates = []
+    if parent is not None:
+        explicit = getattr(parent, 'locations_csv_path', None)
+        if explicit:
+            candidates.append(explicit)
+    # Always prefer packaged default next
+    candidates.append(default_csv_path())
+    if parent is not None:
+        dataset = getattr(parent, 'dataset_folder', None)
+        if dataset:
+            candidates.append(os.path.join(os.path.dirname(dataset), DEFAULT_CSV_FILENAME))
+        project_folder = getattr(parent, 'project_folder', None)
+        if project_folder:
+            candidates.append(os.path.join(project_folder, 'data', DEFAULT_CSV_FILENAME))
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            return cand
+    return candidates[0] if candidates else None
+
+
+def _import_merge_geojson():
+    try:
+        from chronam.merge import merge_geojson as _merge
+    except Exception as exc:  # pragma: no cover - import-time failure surfaced to UI
+        raise RuntimeError('Add Geographic Info requires geopandas/shapely. Please install the geospatial stack.') from exc
+    return _merge
+
+
+def _import_plot_bar():
+    try:
+        from chronam.visualize import plot_bar as _plot
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError('Collocation bar charts require matplotlib. Install it to view charts.') from exc
+    return _plot
+
+
+def _import_plot_rank_changes():
+    try:
+        from chronam.visualize import plot_rank_changes as _plot
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError('Collocation rank charts require matplotlib. Install it to view charts.') from exc
+    return _plot
+
+
+def _import_plot_articles_by_year():
+    try:
+        from chronam.visualize import plot_articles_by_year as _plot
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError('Yearly article charts require matplotlib. Install it to view charts.') from exc
+    return _plot
+
+
+def _summarize_geojson_outputs(out_paths: List[str]):
+    total_articles = 0
+    places_all = set()
+    html_lines = []
+    for path in out_paths:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                geo = json.load(f)
+            features = geo.get('features', [])
+            total_articles += len(features)
+            for feat in features:
+                props = feat.get('properties', {})
+                places_all.add((props.get('Title'), props.get('SN')))
+            encoded = urllib.parse.quote(path)
+            html_lines.append(
+                f'<div>Output GeoJSON: <a href="chronam-open:{encoded}">{html.escape(path)}</a></div>'
+            )
+        except Exception:
+            continue
+    return total_articles, places_all, html_lines
+
+
+def append_geojson_project_log(parent: 'MainWindow', out_paths: List[str]):  # type: ignore
+    total_articles, places_all, html_lines = _summarize_geojson_outputs(out_paths)
+    if not html_lines:
+        html_lines = ['<div>No GeoJSON files created.</div>']
+    stats = getattr(out_paths, 'stats', None)
+    summary_lines = []
+    if stats:
+        total_articles_stat = stats.get("total_articles", total_articles)
+        matched_lccn = stats.get("matched_lccn", 0)
+        matched_title = stats.get("matched_title", 0)
+        matched_total = matched_lccn + matched_title
+        total_base = total_articles_stat or (matched_total + stats.get("unmatched", 0)) or 1
+        pct = lambda count: (count / total_base * 100.0) if total_base else 0.0
+        summary_lines.append(
+            f'<div>Added geographic info for {matched_total:,} articles across {len(places_all):,} locations.</div>'
+        )
+        summary_lines.append(
+            f'<div>Matched {matched_lccn:,} articles via LCCN ({pct(matched_lccn):.2f}%) and '
+            f'{matched_title:,} via title/date fallback ({pct(matched_title):.2f}%).</div>'
+        )
+        unmatched_total = stats.get("unmatched", max(total_articles_stat - matched_total, 0))
+        summary_lines.append(
+            f'<div>{unmatched_total:,} articles had no geographic match ({pct(unmatched_total):.2f}%).</div>'
+        )
+        unmatched_path = stats.get("unmatched_path")
+        if unmatched_path:
+            encoded = urllib.parse.quote(unmatched_path)
+            summary_lines.append(
+                f'<div>Unmatched table: <a href="chronam-open:{encoded}">{html.escape(unmatched_path)}</a></div>'
+            )
+        summary_lines.append(
+            f'<div>Total articles processed: {total_articles_stat:,}</div>'
+        )
+    else:
+        summary_lines.append(
+            f'<div>Added geographic info for {total_articles:,} articles across {len(places_all):,} locations.</div>'
+        )
+    parent.append_project_log('Add Geographic Info', summary_lines + html_lines)
+
+
 def _default_map_settings() -> dict:
     """Return a fresh copy of the map rendering defaults."""
     return {
         'mode': 'points',
-        'time_unit': 'week',
+        'time_unit': 'month',
         'time_step': 1,
-        'linger_unit': 'week',
+        'linger_unit': 'month',
         'linger_step': 2,
         'disable_time': False,
         'heat_radius': 15,
@@ -189,9 +307,11 @@ class MainWindow(QMainWindow):
         self.search_log_history = []
         self.project_log_entries = []
         self.project_file = None
-        self.collocation_state = {'dropped_terms': []}
+        self.collocation_state = {'dropped_terms': [], 'term_groups': []}
         self.collocation_drop_terms = []
+        self.collocation_term_groups: List[dict] = []
         self.map_settings = _default_map_settings()
+        self.metadata_enabled = True
         self.init_ui()
         self._close_filter = CloseShortcutFilter()
         QApplication.instance().installEventFilter(self._close_filter)
@@ -250,12 +370,17 @@ class MainWindow(QMainWindow):
         self.btn_download.clicked.connect(self.action_download)
         self.btn_update = QPushButton('B) Add Geographic Info')
         self.btn_update.clicked.connect(self.action_update_locations)
-        self.btn_collocate = QPushButton('C) Run Collocation Analysis')
+        self.btn_collocate = QPushButton('C) Collocation Analysis')
         self.btn_collocate.clicked.connect(self.action_collocate)
         self.btn_map = QPushButton('D) Create Map')
         self.btn_map.clicked.connect(self.open_create_map_dialog)
         for btn in (self.btn_download, self.btn_update, self.btn_collocate, self.btn_map):
             main_layout.addWidget(btn)
+
+        self.metadata_checkbox = QCheckBox('Create metadata JSON for all output files')
+        self.metadata_checkbox.setChecked(self.metadata_enabled)
+        self.metadata_checkbox.stateChanged.connect(self._on_metadata_checkbox_toggled)
+        main_layout.addWidget(self.metadata_checkbox)
 
         self._init_project_log()
         self._update_primary_button_styles()
@@ -445,6 +570,9 @@ class MainWindow(QMainWindow):
             else:
                 btn.setStyleSheet('')
 
+    def _on_metadata_checkbox_toggled(self, state: int):
+        self.metadata_enabled = state == Qt.Checked
+
     @staticmethod
     def _search_tool_highlight_style() -> str:
         return (
@@ -484,9 +612,15 @@ class MainWindow(QMainWindow):
         self.locations_csv_path = None
         self.search_log_history.clear()
         self.project_log_entries.clear()
-        self.collocation_state = {'dropped_terms': []}
+        self.collocation_state = {'dropped_terms': [], 'term_groups': []}
         self.collocation_drop_terms = []
+        self.collocation_term_groups = []
         self.map_settings = _default_map_settings()
+        self.metadata_enabled = True
+        if hasattr(self, 'metadata_checkbox'):
+            self.metadata_checkbox.blockSignals(True)
+            self.metadata_checkbox.setChecked(True)
+            self.metadata_checkbox.blockSignals(False)
 
         self.ensure_dataset_folder(prompt=False)
         self._update_loaded_file_labels()
@@ -540,6 +674,53 @@ class MainWindow(QMainWindow):
             self.collocation_drop_terms = []
         if isinstance(self.collocation_state, dict):
             self.collocation_state['dropped_terms'] = list(self.collocation_drop_terms)
+
+        groups_value = data.get('collocation_term_groups')
+        if groups_value is None and isinstance(self.collocation_state, dict):
+            groups_value = self.collocation_state.get('term_groups')
+        self.collocation_term_groups = []
+        if isinstance(groups_value, list):
+            for entry in groups_value:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get('name', '')).strip()
+                if not name:
+                    continue
+                terms_raw = entry.get('terms') or []
+                terms: List[str] = []
+                seen_terms: Set[str] = set()
+                for term in terms_raw:
+                    term_str = str(term).strip()
+                    if not term_str:
+                        continue
+                    lower = term_str.lower()
+                    if lower in seen_terms:
+                        continue
+                    seen_terms.add(lower)
+                    terms.append(term_str)
+                if not terms:
+                    continue
+                group_record: Dict[str, Any] = {'name': name, 'terms': terms}
+                freq_val = entry.get('total_frequency')
+                try:
+                    if freq_val is not None:
+                        group_record['total_frequency'] = float(freq_val)
+                except (TypeError, ValueError):
+                    pass
+                missing_terms = entry.get('missing_terms')
+                if isinstance(missing_terms, list):
+                    cleaned_missing = [str(term).strip() for term in missing_terms if str(term).strip()]
+                    if cleaned_missing:
+                        group_record['missing_terms'] = cleaned_missing
+                self.collocation_term_groups.append(group_record)
+        if isinstance(self.collocation_state, dict):
+            self.collocation_state['term_groups'] = [dict(group) for group in self.collocation_term_groups]
+
+        self.metadata_enabled = bool(data.get('metadata_enabled', True))
+        if hasattr(self, 'metadata_checkbox'):
+            self.metadata_checkbox.blockSignals(True)
+            self.metadata_checkbox.setChecked(self.metadata_enabled)
+            self.metadata_checkbox.blockSignals(False)
 
         search_log = data.get('search_log_history')
         if search_log is None:
@@ -599,6 +780,8 @@ class MainWindow(QMainWindow):
             'map_settings': dict(self.map_settings),
             'collocation_state': dict(self.collocation_state),
             'collocation_drop_terms': list(self.collocation_drop_terms),
+            'collocation_term_groups': [dict(group) for group in self.collocation_term_groups],
+            'metadata_enabled': bool(self.metadata_enabled),
         }
 
         try:
@@ -678,7 +861,7 @@ class MainWindow(QMainWindow):
         return None
 
     def open_json_file(self):
-        start_dir = os.path.join(self.project_folder, 'data', 'raw') if self.project_folder else ''
+        start_dir = os.path.join(self.project_folder, 'data', 'processed') if self.project_folder else ''
         if not (start_dir and os.path.isdir(start_dir)):
             start_dir = self.project_folder or ''
         file_path, _ = QFileDialog.getOpenFileName(self, 'Load JSON File', start_dir, 'JSON Files (*.json)')
@@ -721,6 +904,7 @@ class DownloadDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle('Search Dataset')
         self.setMinimumSize(600, 400)
+        self._csv_hint_shown = False
 
         layout = QVBoxLayout(self)
 
@@ -762,10 +946,28 @@ class DownloadDialog(QDialog):
         self.clean_urls_cb = QCheckBox('Change article URLs to end in .pdf (replaces .jp2)')
         self.clean_urls_cb.setChecked(True)
         self.clean_hyphen_cb = QCheckBox('Collapse hyphenated breaks (remove "- " sequences)')
+        self.clean_geo_cb = QCheckBox('Add Geographic Info (create GeoJSON output)')
+        self.clean_geo_unmatched_cb = QCheckBox('Create table of unmatched articles')
+        self.clean_geo_unmatched_cb.setEnabled(False)
+        self.clean_geo_cb.toggled.connect(self.clean_geo_unmatched_cb.setEnabled)
+        self.clean_geo_cb.toggled.connect(lambda checked: None if checked else self.clean_geo_unmatched_cb.setChecked(False))
+        self.clean_geo_cb.setChecked(True)
         cleaning_layout.addWidget(self.clean_lowercase_cb)
         cleaning_layout.addWidget(self.clean_urls_cb)
         cleaning_layout.addWidget(self.clean_hyphen_cb)
+        cleaning_layout.addWidget(self.clean_geo_cb)
+        cleaning_layout.addWidget(self.clean_geo_unmatched_cb)
         layout.addWidget(cleaning_group)
+
+        outputs_group = QGroupBox('Summary Outputs')
+        outputs_layout = QVBoxLayout(outputs_group)
+        outputs_layout.setContentsMargins(9, 9, 9, 9)
+        self.yearly_csv_cb = QCheckBox('Create yearly summary CSV')
+        self.yearly_chart_cb = QCheckBox('Show yearly article chart')
+        self.yearly_chart_cb.setChecked(True)
+        outputs_layout.addWidget(self.yearly_csv_cb)
+        outputs_layout.addWidget(self.yearly_chart_cb)
+        layout.addWidget(outputs_group)
 
         self.log = QTextBrowser()
         self.log.setOpenLinks(False)
@@ -799,6 +1001,11 @@ class DownloadDialog(QDialog):
         self.refresh_dataset_label()
         self._current_run_lines = []
 
+        self._current_term = ''
+        self._current_start = ''
+        self._current_end = ''
+        self._current_term_dir: Optional[str] = None
+
     def showEvent(self, event):
         self.refresh_dataset_label()
         super().showEvent(event)
@@ -815,6 +1022,7 @@ class DownloadDialog(QDialog):
         self.dataset_label.setText(folder_text)
         self.dataset_change_btn.setEnabled(True)
         self.dataset_years_label.setText(self._format_year_summary(years))
+        self._apply_year_defaults(years)
 
     def _change_dataset_folder(self):
         start_dir = getattr(self.parent(), 'dataset_folder', None) or self.parent().project_folder
@@ -827,6 +1035,84 @@ class DownloadDialog(QDialog):
         self.raise_()
         self.activateWindow()
         self.setFocus(Qt.ActiveWindowFocusReason)
+
+    def _store_csv_path(self, path: Optional[str]):
+        if not (path and os.path.exists(path)):
+            return
+        parent = self.parent()
+        if parent is not None:
+            parent.locations_csv_path = path
+
+    def _prompt_csv_path(self) -> Optional[str]:
+        parent = self.parent()
+        if not self._csv_hint_shown:
+            QMessageBox.information(
+                self,
+                'Locate Locations CSV',
+                f'Locate the newspaper locations table named "{DEFAULT_CSV_FILENAME}".'
+            )
+            self._csv_hint_shown = True
+        if parent and getattr(parent, 'project_folder', None):
+            start = resolve_locations_csv(parent)
+            if not start or not os.path.isfile(start):
+                start = parent.project_folder
+        else:
+            start = resolve_locations_csv(None) or os.getcwd()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            f'Select Locations CSV ({DEFAULT_CSV_FILENAME})',
+            start,
+            'CSV Files (*.csv)'
+        )
+        if path:
+            self._store_csv_path(path)
+        return path or None
+
+    def _ensure_geo_csv_path(self) -> Optional[str]:
+        candidate = resolve_locations_csv(self.parent())
+        if candidate and os.path.exists(candidate):
+            self._store_csv_path(candidate)
+            return candidate
+        return self._prompt_csv_path()
+
+    def _add_geo_after_search(self, json_path: str) -> List[str]:
+        parent = self.parent()
+        if parent is None:
+            return []
+        csv_path = self._ensure_geo_csv_path()
+        if not (csv_path and os.path.exists(csv_path)):
+            self._log_plain('Skipped geographic info — locations CSV not selected.')
+            return []
+        unmatched_csv_path = None
+        if self.clean_geo_unmatched_cb.isChecked():
+            base_name = os.path.splitext(os.path.basename(json_path))[0]
+            unmatched_csv_path = os.path.join(
+                parent.project_folder,
+                'data',
+                'processed',
+                f'unmatched_{base_name}.csv'
+            )
+        try:
+            merge_geojson = _import_merge_geojson()
+            out_paths = merge_geojson(
+                parent.project_folder,
+                csv_path=csv_path,
+                json_path=json_path,
+                unmatched_csv_path=unmatched_csv_path
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, 'Add Geographic Info', f'Could not add geographic info: {exc}')
+            self._log_plain(f'Adding geographic info failed: {exc}')
+            return []
+
+        if out_paths:
+            parent.geojson_file = out_paths[-1]
+            if parent.locations_csv_path and not os.path.samefile(parent.locations_csv_path, csv_path):
+                parent.locations_csv_path = csv_path
+            parent.collocation_state = {}
+            parent.collocation_drop_terms = []
+            parent._update_loaded_file_labels()
+        return out_paths
 
     def _ensure_log_visible(self):
         self.log.moveCursor(QTextCursor.End)
@@ -868,6 +1154,35 @@ class DownloadDialog(QDialog):
             else:
                 text_parts.append(f"{start}-{end}")
         return "Years available: " + ", ".join(text_parts)
+
+    def _apply_year_defaults(self, years: List[int]):
+        if not years:
+            return
+        if self.start_input.text().strip() or self.end_input.text().strip():
+            return
+
+        sorted_years = sorted(set(years))
+        if not sorted_years:
+            return
+
+        best_start = best_end = sorted_years[0]
+        current_start = current_end = sorted_years[0]
+
+        for year in sorted_years[1:]:
+            if year == current_end + 1:
+                current_end = year
+            else:
+                if (current_end - current_start) > (best_end - best_start):
+                    best_start, best_end = current_start, current_end
+                current_start = current_end = year
+
+        if (current_end - current_start) > (best_end - best_start):
+            best_start, best_end = current_start, current_end
+
+        start_date = f"{best_start:04d}-01-01"
+        end_date = f"{best_end:04d}-12-31"
+        self.start_input.setText(start_date)
+        self.end_input.setText(end_date)
 
     def _log_plain(self, text: str):
         safe = html.escape(text)
@@ -947,10 +1262,10 @@ class DownloadDialog(QDialog):
         self.refresh_dataset_label()
 
         # Single output path for the full range
-        out_path = os.path.join(
-            self.parent().project_folder, 'data', 'raw',
-            f"{term}_{start}_{end}.json"
-        )
+        processed_root = os.path.join(self.parent().project_folder, 'data', 'processed')
+        term_dir = os.path.join(processed_root, term_directory_name(term))
+        os.makedirs(term_dir, exist_ok=True)
+        out_path = os.path.join(term_dir, f"{term}_{start}_{end}.json")
         if os.path.exists(out_path):
             if QMessageBox.warning(
                 self, 'Overwrite Warning', f'Will overwrite:\n{out_path}',
@@ -959,6 +1274,11 @@ class DownloadDialog(QDialog):
                 self._log_plain('Search cancelled — existing file retained.')
                 self._finalize_project_log()
                 return
+
+        self._current_term = term
+        self._current_start = start
+        self._current_end = end
+        self._current_term_dir = term_dir
 
         if self.log.toPlainText().strip():
             self._log_blank()
@@ -987,7 +1307,8 @@ class DownloadDialog(QDialog):
                 'lowercase_articles': self.clean_lowercase_cb.isChecked(),
                 'urls_to_pdf': self.clean_urls_cb.isChecked(),
                 'collapse_hyphenated_breaks': self.clean_hyphen_cb.isChecked(),
-            }
+            },
+            metadata_enabled=getattr(self.parent(), 'metadata_enabled', True),
         )
         self.thread.progress.connect(self.update_progress)
         self.thread.finished.connect(self.download_finished)
@@ -1069,7 +1390,32 @@ class DownloadDialog(QDialog):
         else:
             self._log_plain(f"Found {count:,} articles — elapsed {elapsed:.1f}s")
 
-
+    def _collect_year_counts(self, result_paths: List[str]) -> Tuple[Dict[str, int], Optional[str]]:
+        counts: Dict[str, int] = {}
+        detected_term: Optional[str] = None
+        for path in result_paths:
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+            except Exception as exc:
+                self._log_plain(f'Yearly summary skipped for {os.path.basename(path)}: {exc}')
+                continue
+            if not isinstance(payload, dict):
+                continue
+            term_val = payload.get('search_term')
+            if isinstance(term_val, str) and term_val.strip() and not detected_term:
+                detected_term = term_val.strip()
+            articles = payload.get('articles') or []
+            if not isinstance(articles, list):
+                continue
+            for article in articles:
+                if not isinstance(article, dict):
+                    continue
+                date_val = str(article.get('date') or '')
+                year = date_val[:4]
+                if year.isdigit():
+                    counts[year] = counts.get(year, 0) + 1
+        return counts, detected_term
 
     def cancel_download(self):
         if self._search_running and self.thread and self.thread.isRunning():
@@ -1113,6 +1459,8 @@ class DownloadDialog(QDialog):
             p = self.parent()
             p.json_file = last_json
             p._update_loaded_file_labels()
+            p.collocation_state = {}
+            p.collocation_drop_terms = []
 
         total_articles = 0
         total_years = len(self.logged_years)
@@ -1140,6 +1488,94 @@ class DownloadDialog(QDialog):
             summary += f" and finished in {elapsed:.1f}s"
             self._log_plain(summary)
             self._log_plain('No JSON created.')
+
+        yearly_counts: Dict[str, int] = {}
+        summary_term: Optional[str] = None
+        if result and (self.yearly_csv_cb.isChecked() or self.yearly_chart_cb.isChecked()):
+            yearly_counts, summary_term = self._collect_year_counts(result)
+
+        if yearly_counts:
+            rows: List[Tuple[int, int]] = []
+            for year_str, count in yearly_counts.items():
+                try:
+                    year_int = int(year_str)
+                except ValueError:
+                    continue
+                rows.append((year_int, int(count)))
+            rows.sort()
+
+            if rows:
+                df_counts = pd.DataFrame(rows, columns=['year', 'article_count'])
+                term_label = summary_term or self._current_term or self.search_input.text().strip() or 'term'
+                start_label = self._current_start or self.start_input.text().strip() or 'start'
+                end_label = self._current_end or self.end_input.text().strip() or 'end'
+                df_counts.insert(0, 'search_term', term_label)
+
+                term_dir = self._current_term_dir or (os.path.dirname(result[-1]) if result else None)
+                if term_dir:
+                    os.makedirs(term_dir, exist_ok=True)
+
+                if self.yearly_csv_cb.isChecked() and term_dir:
+                    csv_name = f"{term_label}_{start_label}_{end_label}_yearly_counts.csv"
+                    csv_path = os.path.join(term_dir, csv_name)
+                    try:
+                        df_counts.to_csv(csv_path, index=False)
+                    except Exception as exc:
+                        self._log_plain(f'Yearly summary CSV failed: {exc}')
+                    else:
+                        self._log_link('Yearly summary CSV', csv_path)
+
+                if self.yearly_chart_cb.isChecked():
+                    try:
+                        plot_year = _import_plot_articles_by_year()
+                        title = f'Articles per Year — {term_label}'
+                        plot_year(df_counts, title=title)
+                        self._log_plain('Opened yearly article chart.')
+                    except Exception as exc:
+                        self._log_plain(f'Yearly chart failed: {exc}')
+            else:
+                self._log_plain('Yearly summaries skipped — no dated articles found.')
+        elif result and (self.yearly_csv_cb.isChecked() or self.yearly_chart_cb.isChecked()):
+            self._log_plain('Yearly summaries skipped — no articles with valid dates.')
+
+        geojson_outputs: List[str] = []
+        if self.clean_geo_cb.isChecked() and result:
+            geojson_outputs = self._add_geo_after_search(result[-1])
+            if geojson_outputs:
+                total_articles_geo, places_all, _ = _summarize_geojson_outputs(geojson_outputs)
+                stats = getattr(geojson_outputs, 'stats', None)
+                if stats:
+                    total_articles_stat = stats.get('total_articles', total_articles_geo)
+                    matched_lccn = stats.get('matched_lccn', 0)
+                    matched_title = stats.get('matched_title', 0)
+                    matched_total = matched_lccn + matched_title
+                    total_base = total_articles_stat or (matched_total + stats.get('unmatched', 0)) or 1
+                    self._log_plain(
+                        f'Added geographic info for {matched_total:,} articles across {len(places_all):,} locations.'
+                    )
+                    pct = lambda count: (count / total_base * 100.0) if total_base else 0.0
+                    self._log_plain(
+                        f"Matched {matched_lccn:,} articles via LCCN ({pct(matched_lccn):.2f}%) and "
+                        f"{matched_title:,} via title/date fallback ({pct(matched_title):.2f}%)."
+                    )
+                    unmatched_total = stats.get('unmatched', max(total_articles_stat - matched_total, 0))
+                    self._log_plain(
+                        f"{unmatched_total:,} articles had no geographic match ({pct(unmatched_total):.2f}%)."
+                    )
+                    unmatched_path = stats.get('unmatched_path')
+                    if unmatched_path:
+                        self._log_link('Unmatched table saved to', unmatched_path)
+                    elif self.clean_geo_unmatched_cb.isChecked() and unmatched_total == 0:
+                        self._log_plain('No unmatched table created — all articles were matched.')
+                else:
+                    self._log_plain(
+                        f'Added geographic info for {total_articles_geo:,} articles across {len(places_all):,} locations.'
+                    )
+                for out_path in geojson_outputs:
+                    self._log_link('GeoJSON saved to', out_path)
+                parent_ref = self.parent()
+                if parent_ref is not None:
+                    append_geojson_project_log(parent_ref, geojson_outputs)
 
         self._cancel_event.clear()
         self._cancel_requested = False
@@ -1183,6 +1619,9 @@ class UpdateLocationsDialog(QDialog):
 
         layout.addLayout(form)
 
+        self.unmatched_checkbox = QCheckBox('Create table of unmatched articles')
+        layout.addWidget(self.unmatched_checkbox)
+
         layout.addStretch()
 
         btn_row = QHBoxLayout()
@@ -1212,21 +1651,7 @@ class UpdateLocationsDialog(QDialog):
         self.json_label.setText(self._display_name(path))
 
     def _default_csv_path(self) -> Optional[str]:
-        parent = self.parent()
-        candidates = []
-        explicit = getattr(parent, 'locations_csv_path', None)
-        if explicit:
-            candidates.append(explicit)
-        dataset = getattr(parent, 'dataset_folder', None)
-        if dataset:
-            candidates.append(os.path.join(os.path.dirname(dataset), DEFAULT_CSV_FILENAME))
-        if parent is not None:
-            candidates.append(os.path.join(parent.project_folder, 'data', DEFAULT_CSV_FILENAME))
-        candidates.append(default_csv_path())
-        for cand in candidates:
-            if cand and os.path.exists(cand):
-                return cand
-        return candidates[0] if candidates else None
+        return resolve_locations_csv(self.parent())
 
     def prompt_csv(self, show_hint: bool = False) -> Optional[str]:
         parent = self.parent()
@@ -1290,17 +1715,30 @@ class UpdateLocationsDialog(QDialog):
             QMessageBox.critical(self, 'Error', f'Could not read metadata: {exc}')
             return
 
+        unmatched_csv_path = None
+        if self.unmatched_checkbox.isChecked():
+            base_name = os.path.splitext(os.path.basename(self.json_path))[0]
+            unmatched_csv_path = os.path.join(
+                parent.project_folder,
+                'data',
+                'processed',
+                f'unmatched_{base_name}.csv'
+            )
         try:
+            merge_geojson = _import_merge_geojson()
             out_paths = merge_geojson(
                 parent.project_folder,
                 csv_path=self.csv_path,
                 search_term=term,
                 year=year,
-                json_path=self.json_path
+                json_path=self.json_path,
+                unmatched_csv_path=unmatched_csv_path
             )
             if out_paths:
                 last_geo = out_paths[-1]
                 parent.geojson_file = last_geo
+                if parent.locations_csv_path and not os.path.samefile(parent.locations_csv_path, self.csv_path):
+                    parent.locations_csv_path = self.csv_path
                 parent._update_loaded_file_labels()
             self._log_merge_stats(out_paths)
             self.accept()
@@ -1314,32 +1752,9 @@ class UpdateLocationsDialog(QDialog):
 
     def _log_merge_stats(self, out_paths):
         parent = self.parent()
-        lines = []
-        total_articles = 0
-        places_all = set()
-        for path in out_paths:
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    geo = json.load(f)
-                features = geo.get('features', [])
-                total_articles += len(features)
-                places = set()
-                for feat in features:
-                    props = feat.get('properties', {})
-                    places.add((props.get('Title'), props.get('SN')))
-                places_all.update(places)
-                encoded = urllib.parse.quote(path)
-                lines.append(
-                    f'<div>Output GeoJSON: <a href="chronam-open:{encoded}">{html.escape(path)}</a></div>'
-                )
-            except Exception:
-                continue
-
-        if not lines:
-            lines.append('<div>No GeoJSON files created.</div>')
-
-        summary = f'<div>Joined {len(places_all):,} places to {total_articles:,} articles.</div>'
-        parent.append_project_log('Add Geographic Info', [summary] + lines)
+        if parent is None:
+            return
+        append_geojson_project_log(parent, out_paths)
 
 class CSVPreviewDialog(QDialog):
     def __init__(self, csv_path, parent=None, max_rows=100):
@@ -1359,10 +1774,58 @@ class CSVPreviewDialog(QDialog):
 
 
 class CollocationRankSettingsDialog(QDialog):
-    def __init__(self, parent, bins: List[str], max_terms: int, default_top_n: int = 10):
+    def __init__(
+        self,
+        parent,
+        bins: List[str],
+        max_terms: int,
+        default_top_n: int = 10,
+        *,
+        selected_terms: Optional[Iterable[str]] = None,
+        csv_status: Optional[str] = None,
+        csv_path: Optional[str] = None,
+        drop_terms: Optional[Iterable[str]] = None,
+        log_scale: bool = True,
+    ):
         super().__init__(parent)
-        self.setWindowTitle('Rank Chart Settings')
+        self.setWindowTitle('Bump Chart Settings')
         layout = QVBoxLayout(self)
+
+        self._csv_path = csv_path
+        self._drop_terms = [str(t).strip() for t in (drop_terms or []) if str(t).strip()]
+        self._initial_log_scale = bool(log_scale)
+        status_text = ''
+        status_kind = (csv_status or '').strip().lower()
+        if status_kind == 'created':
+            status_text = 'By-time CSV generated for these settings. The first build can take longer than future updates.'
+        elif status_kind == 'existing':
+            if csv_path and os.path.exists(csv_path):
+                folder = os.path.dirname(csv_path) or os.path.abspath(csv_path)
+                status_text = (
+                    f'Existing by-time CSV located. '
+                    f'<a href="open">Open containing folder</a> ({html.escape(folder)}).'
+                )
+            else:
+                status_text = 'Existing by-time CSV located.'
+        elif status_kind == 'drop_terms':
+            status_text = 'Drop terms active; a new by-time CSV will be generated when you click OK.'
+        elif status_kind == 'missing':
+            status_text = 'By-time CSV not found yet. It will be generated when you click OK.'
+        elif csv_status:
+            status_text = html.escape(str(csv_status))
+
+        if status_text:
+            info_label = QLabel(status_text)
+            info_label.setWordWrap(True)
+            info_label.setStyleSheet('color: #555555; font-size: 11px;')
+            info_label.setTextFormat(Qt.RichText)
+            info_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+            info_label.setOpenExternalLinks(False)
+            info_label.linkActivated.connect(self._handle_info_link)
+            layout.addWidget(info_label)
+        else:
+            info_label = None
+        self._info_label = info_label
 
         form = QFormLayout()
 
@@ -1382,7 +1845,30 @@ class CollocationRankSettingsDialog(QDialog):
         self.labels_check = QCheckBox('Show term labels on chart')
         form.addRow(self.labels_check)
 
+        self.log_scale_check = QCheckBox('Use log scale (y-axis)')
+        self.log_scale_check.setChecked(self._initial_log_scale)
+        form.addRow(self.log_scale_check)
+
         layout.addLayout(form)
+
+        self._selected_terms: List[str] = list(dict.fromkeys(selected_terms or []))
+        has_selected = bool(self._selected_terms)
+
+        self.use_selected_check = QCheckBox('Use selected terms from Collocation tool (overrides Top N)')
+        self.use_selected_check.setChecked(has_selected)
+        self.use_selected_check.setEnabled(has_selected)
+        layout.addWidget(self.use_selected_check)
+        self.use_selected_check.toggled.connect(self._handle_use_selected_toggle)
+
+        self.selection_label = QLabel()
+        self.selection_label.setWordWrap(True)
+        self.selection_label.setStyleSheet('color: #555555; font-size: 11px;')
+        layout.addWidget(self.selection_label)
+
+        self.drop_terms_label = QLabel()
+        self.drop_terms_label.setWordWrap(True)
+        self.drop_terms_label.setStyleSheet('color: #555555; font-size: 11px;')
+        layout.addWidget(self.drop_terms_label)
 
         self.global_check.toggled.connect(self.home_combo.setDisabled)
 
@@ -1391,14 +1877,316 @@ class CollocationRankSettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        self._update_selection_summary()
+        self._update_drop_terms_note()
+
     def values(self) -> dict:
         return {
             'top_n': self.top_spin.value(),
             'home_bin_index': self.home_combo.currentIndex(),
             'use_global': self.global_check.isChecked(),
             'show_labels': self.labels_check.isChecked(),
+            'use_selected_terms': self.use_selected_check.isChecked(),
+            'selected_terms': list(self._selected_terms),
+            'log_scale': self.log_scale_check.isChecked(),
         }
 
+    def _update_selection_summary(self):
+        count = len(self._selected_terms)
+        if count:
+            preview = ', '.join(self._selected_terms[:3])
+            if count > 3:
+                preview += ', …'
+            self.selection_label.setText(
+                f'Selected {count} term(s): {html.escape(preview)}.'
+            )
+        else:
+            self.selection_label.setText('No specific terms selected. Top N terms will be used.')
+        self._apply_top_spin_enabled()
+
+    def _handle_use_selected_toggle(self, checked: bool):
+        if checked and not self._selected_terms:
+            self.use_selected_check.setChecked(False)
+            return
+        self._apply_top_spin_enabled()
+
+    def _apply_top_spin_enabled(self):
+        use_selected = self.use_selected_check.isChecked() and bool(self._selected_terms)
+        self.top_spin.setEnabled(not use_selected)
+        if self._selected_terms:
+            base_text = self.selection_label.text().split(' (', 1)[0]
+            base_text = base_text.rstrip('.')
+            if use_selected:
+                self.selection_label.setText(f'{base_text} (overrides Top N).')
+            else:
+                self.selection_label.setText(f'{base_text}.')
+
+    def _handle_info_link(self, link: str):
+        if link != 'open':
+            return
+        if self._csv_path:
+            reveal_in_file_manager(self._csv_path)
+
+    def _update_drop_terms_note(self):
+        if not self._drop_terms:
+            self.drop_terms_label.setText('No drop terms active; all collocates are considered.')
+            return
+        preview = ', '.join(self._drop_terms[:3])
+        if len(self._drop_terms) > 3:
+            preview += ', …'
+        count = len(self._drop_terms)
+        self.drop_terms_label.setText(
+            f'Drop terms active ({count}): {html.escape(preview)}. The chart applies these after you click OK.'
+        )
+
+
+
+class CollocateMapSettingsDialog(QDialog):
+    def __init__(
+        self,
+        parent,
+        *,
+        time_bins: List[Tuple[str, str]],
+        cities: List[Tuple[str, str]],
+        states: List[str],
+        default_top_n: int = 25,
+        max_top_n: int = 150,
+        selected_terms: Optional[Iterable[str]] = None,
+        use_selected_default: bool = False,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle('Collocate Map Settings')
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+
+        self.map_type_combo = QComboBox()
+        self.map_type_combo.addItem('Select Term Rank Map', 'rank')
+        self.map_type_combo.addItem('Top Ranked Term by Location', 'top_term')
+        form.addRow('Map type:', self.map_type_combo)
+
+        self.top_spin = QSpinBox()
+        self.top_spin.setRange(1, max_top_n)
+        self.top_spin.setValue(max(1, min(default_top_n, max_top_n)))
+        form.addRow('Top N terms:', self.top_spin)
+
+        self._selected_terms = list(dict.fromkeys(selected_terms or []))
+        self.use_selected_terms_check = QCheckBox('Use selected terms from Collocation tool (overrides Top N)')
+        has_selected = bool(self._selected_terms)
+        default_selected = has_selected and use_selected_default
+        self.use_selected_terms_check.setChecked(default_selected)
+        self.use_selected_terms_check.setEnabled(has_selected)
+        form.addRow(self.use_selected_terms_check)
+
+        self.selected_terms_label = QLabel()
+        self.selected_terms_label.setWordWrap(True)
+        self.selected_terms_label.setStyleSheet('color: #555555; font-size: 11px;')
+        form.addRow(self.selected_terms_label)
+
+        self.colorize_check = QCheckBox('Color markers by collocate article count')
+        self.colorize_check.setChecked(True)
+        form.addRow(self.colorize_check)
+
+        self.export_csv_check = QCheckBox('Export collocate CSV with XY')
+        self.export_csv_check.setToolTip('Writes a CSV summarizing collocates with coordinates for further analysis.')
+        form.addRow(self.export_csv_check)
+
+        time_row = QWidget()
+        time_layout = QHBoxLayout(time_row)
+        time_layout.setContentsMargins(0, 0, 0, 0)
+        time_layout.setSpacing(6)
+        self.enable_time_slider = QCheckBox('Enable time slider')
+        self.enable_time_slider.setEnabled(bool(time_bins))
+        if time_bins:
+            self.enable_time_slider.setChecked(True)
+        info_btn = QToolButton()
+        info_btn.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxInformation))
+        info_btn.setAutoRaise(True)
+        info_btn.setStyleSheet('QToolButton { background: transparent; border: none; }')
+        info_btn.setToolTip(
+            'To change the time bin size, re-run the collocation analysis and adjust the Bin Size and Time Unit options.'
+        )
+        time_layout.addWidget(self.enable_time_slider)
+        time_layout.addWidget(info_btn)
+        time_layout.addStretch(1)
+        form.addRow('Time controls:', time_row)
+
+        layout.addLayout(form)
+
+        self.use_selected_terms_check.toggled.connect(self._apply_top_spin_enabled)
+        self.map_type_combo.currentIndexChanged.connect(lambda *_: self._apply_map_type_constraints())
+        self._apply_map_type_constraints()
+
+        scope_box = QGroupBox('Term selection scope')
+        scope_layout = QVBoxLayout(scope_box)
+        self.global_radio = QRadioButton('Use entire time period')
+        self.time_radio = QRadioButton('Home time bin')
+        self.global_radio.setChecked(True)
+        self.time_radio.setEnabled(bool(time_bins))
+        scope_layout.addWidget(self.global_radio)
+        scope_layout.addWidget(self.time_radio)
+        self.time_combo = QComboBox()
+        for key, label in time_bins:
+            display = f'{key}: {label}' if label else str(key)
+            self.time_combo.addItem(display, key)
+        self.time_combo.setEnabled(False)
+        scope_layout.addWidget(self.time_combo)
+        layout.addWidget(scope_box)
+
+        def _update_time_enabled():
+            enabled = self.time_radio.isChecked() and self.time_combo.count() > 0
+            self.time_combo.setEnabled(enabled)
+            has_bins = self.time_combo.count() > 0
+            self.enable_time_slider.setEnabled(has_bins)
+            if not has_bins:
+                self.enable_time_slider.setChecked(False)
+
+        self.global_radio.toggled.connect(lambda _checked: _update_time_enabled())
+        self.time_radio.toggled.connect(lambda _checked: _update_time_enabled())
+
+        location_box = QGroupBox('Location weighting')
+        location_layout = QVBoxLayout(location_box)
+        self.loc_all_radio = QRadioButton('All cities')
+        self.loc_city_radio = QRadioButton('Specific city')
+        self.loc_state_radio = QRadioButton('Specific state')
+        self.loc_all_radio.setChecked(True)
+        location_layout.addWidget(self.loc_all_radio)
+        location_layout.addWidget(self.loc_city_radio)
+        self.city_combo = QComboBox()
+        for city, state in cities:
+            label = city or ''
+            if state:
+                label = f'{label}, {state}' if label else state
+            self.city_combo.addItem(label, (city or '', state or ''))
+        self.city_combo.setEnabled(False)
+        if not cities:
+            self.loc_city_radio.setEnabled(False)
+        location_layout.addWidget(self.city_combo)
+        location_layout.addWidget(self.loc_state_radio)
+        self.state_combo = QComboBox()
+        for state in states:
+            self.state_combo.addItem(state)
+        self.state_combo.setEnabled(False)
+        if not states:
+            self.loc_state_radio.setEnabled(False)
+        location_layout.addWidget(self.state_combo)
+        layout.addWidget(location_box)
+
+        def _update_location_controls():
+            self.city_combo.setEnabled(
+                self.loc_city_radio.isEnabled()
+                and self.loc_city_radio.isChecked()
+                and self.city_combo.count() > 0
+            )
+            self.state_combo.setEnabled(
+                self.loc_state_radio.isEnabled()
+                and self.loc_state_radio.isChecked()
+                and self.state_combo.count() > 0
+            )
+
+        self.loc_all_radio.toggled.connect(lambda _checked: _update_location_controls())
+        self.loc_city_radio.toggled.connect(lambda _checked: _update_location_controls())
+        self.loc_state_radio.toggled.connect(lambda _checked: _update_location_controls())
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        _update_time_enabled()
+        _update_location_controls()
+
+    def _update_selected_terms_summary(self):
+        variant = str(self.map_type_combo.currentData() or 'rank').lower()
+        if variant == 'top_term':
+            self.selected_terms_label.setText('Top ranked term map selects the leading collocate term for each location automatically.')
+            return
+        count = len(self._selected_terms)
+        if count:
+            preview = ', '.join(self._selected_terms[:3])
+            if count > 3:
+                preview += ', …'
+            self.selected_terms_label.setText(
+                f'Selected {count} term(s): {html.escape(preview)}.'
+            )
+        else:
+            self.selected_terms_label.setText('No selected terms available; Top N terms will be used.')
+
+    def _apply_top_spin_enabled(self):
+        variant = str(self.map_type_combo.currentData() or 'rank').lower()
+        use_selected = self.use_selected_terms_check.isChecked() and bool(self._selected_terms) and variant != 'top_term'
+        self.top_spin.setEnabled(not use_selected)
+        if variant == 'top_term':
+            return
+        if self._selected_terms:
+            base_text = self.selected_terms_label.text().split(' (', 1)[0]
+            base_text = base_text.rstrip('.')
+            if use_selected:
+                self.selected_terms_label.setText(f'{base_text} (overrides Top N).')
+            else:
+                self.selected_terms_label.setText(f'{base_text}.')
+
+    def _apply_map_type_constraints(self):
+        variant = str(self.map_type_combo.currentData() or 'rank').lower()
+        top_term_mode = variant == 'top_term'
+        if top_term_mode:
+            self.use_selected_terms_check.setChecked(False)
+            self.use_selected_terms_check.setEnabled(False)
+            self.use_selected_terms_check.hide()
+            self.colorize_check.setChecked(False)
+            self.colorize_check.setEnabled(False)
+        else:
+            self.use_selected_terms_check.setEnabled(bool(self._selected_terms))
+            self.use_selected_terms_check.show()
+            self.colorize_check.setEnabled(True)
+        self._update_selected_terms_summary()
+        self._apply_top_spin_enabled()
+
+    def values(self) -> dict:
+        term_scope = 'global'
+        time_key = None
+        time_label = ''
+        if self.time_radio.isChecked() and self.time_combo.count() > 0:
+            term_scope = 'time'
+            data = self.time_combo.currentData()
+            time_key = str(data if data is not None else self.time_combo.currentText()).strip()
+            display_text = str(self.time_combo.currentText()).strip()
+            if display_text:
+                if ':' in display_text:
+                    time_label = display_text.split(':', 1)[1].strip()
+                else:
+                    time_label = display_text
+
+        location_scope = 'all'
+        city_val = ''
+        state_val = ''
+        location_label = 'All cities'
+        if self.loc_city_radio.isChecked() and self.city_combo.count() > 0:
+            data = self.city_combo.currentData()
+            if isinstance(data, tuple):
+                city_val, state_val = data
+            location_scope = 'city'
+            location_label = str(self.city_combo.currentText()).strip() or 'Selected city'
+        elif self.loc_state_radio.isChecked() and self.state_combo.count() > 0:
+            location_scope = 'state'
+            state_val = str(self.state_combo.currentText()).strip()
+            location_label = f'State: {state_val}' if state_val else 'Selected state'
+
+        return {
+            'map_type': self.map_type_combo.currentData(),
+            'top_n': self.top_spin.value(),
+            'term_scope': term_scope,
+            'time_key': time_key,
+            'time_label': time_label,
+            'location_scope': location_scope,
+            'location_city': str(city_val or ''),
+            'location_state': str(state_val or ''),
+            'colorize': self.colorize_check.isChecked(),
+            'location_label': location_label,
+            'enable_time_slider': self.enable_time_slider.isEnabled() and self.enable_time_slider.isChecked(),
+            'use_selected_terms': self.use_selected_terms_check.isChecked(),
+            'export_csv': self.export_csv_check.isChecked(),
+        }
 
 
 class MapToolDialog(QDialog):
@@ -1595,14 +2383,14 @@ class MapToolDialog(QDialog):
         self.normalize_check.setChecked(bool(defaults.get('normalize', False)))
 
         self.time_step.setValue(max(1, int(defaults.get('time_step', 1))))
-        idx = self.time_unit.findText(str(defaults.get('time_unit', 'week')), Qt.MatchFixedString)
+        idx = self.time_unit.findText(str(defaults.get('time_unit', 'month')), Qt.MatchFixedString)
         if idx >= 0:
             self.time_unit.setCurrentIndex(idx)
 
         self.disable_time.setChecked(bool(defaults.get('disable_time', False)))
 
         self.linger_step.setValue(max(0, int(defaults.get('linger_step', 2))))
-        idx = self.linger_unit.findText(str(defaults.get('linger_unit', 'week')), Qt.MatchFixedString)
+        idx = self.linger_unit.findText(str(defaults.get('linger_unit', 'month')), Qt.MatchFixedString)
         if idx >= 0:
             self.linger_unit.setCurrentIndex(idx)
 
@@ -1770,6 +2558,9 @@ class MapToolDialog(QDialog):
                 lightweight=cfg.get('lightweight'),
                 table_mode=cfg.get('table_mode'),
                 table_row_limit=cfg.get('table_row_limit'),
+                collocate_term_groups=getattr(parent, 'collocation_term_groups', []),
+                metadata_enabled=getattr(parent, 'metadata_enabled', True) if parent else True,
+                project_dir=parent.project_folder if parent else None,
             )
         except Exception as exc:
             QMessageBox.critical(self, 'Map Error', f'Failed to create map:\n{exc}')
@@ -1873,18 +2664,33 @@ class MapToolDialog(QDialog):
         self.status_label.setText(html.escape('Map created successfully. ' + '; '.join(parts)))
 
 
-class TermDropDialog(QDialog):
-    def __init__(self, parent: Optional[QWidget], terms: List[dict], selected_terms: set):
+class TermSelectionDialog(QDialog):
+    def __init__(
+        self,
+        parent: Optional[QWidget],
+        terms: List[dict],
+        selected_terms: Iterable[str],
+        *,
+        window_title: str,
+        info_text: str,
+        action_verb: str,
+    ):
         super().__init__(parent)
-        self.setWindowTitle('Select Terms to Drop')
+        self.setWindowTitle(window_title)
         self.setMinimumSize(480, 620)
         self.selected_terms: List[str] = list(selected_terms)
         self._initializing = True
+        self._action_verb = action_verb
+        self._term_frequency: Dict[str, Optional[float]] = {}
+        self._item_by_term: Dict[str, QListWidgetItem] = {}
+        self._item_original_text: Dict[str, str] = {}
 
         layout = QVBoxLayout(self)
-        info = QLabel('Select collocate terms to exclude from the analysis (top 150 shown).')
+        self._main_layout = layout
+        info = QLabel(info_text)
         info.setWordWrap(True)
         layout.addWidget(info)
+        self.info_label = info
 
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText('Search terms...')
@@ -1901,6 +2707,7 @@ class TermDropDialog(QDialog):
         layout.addLayout(length_row)
 
         controls = QHBoxLayout()
+        self.controls_layout = controls
         self.show_selected_btn = QPushButton('Show Selected Terms')
         self.show_selected_btn.setCheckable(True)
         controls.addWidget(self.show_selected_btn)
@@ -1922,6 +2729,11 @@ class TermDropDialog(QDialog):
             existing.add(term)
             rank = info_row.get('rank')
             frequency = info_row.get('frequency')
+            try:
+                freq_numeric = float(frequency)
+            except (TypeError, ValueError):
+                freq_numeric = None
+            self._term_frequency[term] = freq_numeric
             parts = []
             if isinstance(rank, int):
                 parts.append(f"#{rank}")
@@ -1935,17 +2747,20 @@ class TermDropDialog(QDialog):
             item = QListWidgetItem(item_text)
             item.setData(Qt.UserRole, term)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if term in selected_terms else Qt.Unchecked)
+            item.setCheckState(Qt.Checked if term in self.selected_terms else Qt.Unchecked)
             self.list_widget.addItem(item)
+            self._item_by_term[term] = item
+            self._item_original_text[term] = item_text
         self.list_widget.blockSignals(False)
 
         button_row = QHBoxLayout()
+        self._button_row_layout = button_row
         button_row.addStretch(1)
-        self.drop_btn = QPushButton('Drop 0 Term(s)')
-        self.drop_btn.setDefault(True)
-        self.drop_btn.setAutoDefault(True)
+        self.action_btn = QPushButton(f'{self._action_verb} 0 Term(s)')
+        self.action_btn.setDefault(True)
+        self.action_btn.setAutoDefault(True)
         self.cancel_btn = QPushButton('Cancel')
-        button_row.addWidget(self.drop_btn)
+        button_row.addWidget(self.action_btn)
         button_row.addWidget(self.cancel_btn)
         layout.addLayout(button_row)
 
@@ -1954,7 +2769,7 @@ class TermDropDialog(QDialog):
         self.clear_btn.clicked.connect(self._clear_checks)
         self.length_spin.valueChanged.connect(self._handle_length_selection)
         self.list_widget.itemChanged.connect(self._handle_item_changed)
-        self.drop_btn.clicked.connect(self._accept_selection)
+        self.action_btn.clicked.connect(self._accept_selection)
         self.cancel_btn.clicked.connect(self.reject)
 
         self._initializing = False
@@ -1965,7 +2780,7 @@ class TermDropDialog(QDialog):
             self._update_show_selected_button_text(self.show_selected_btn.isChecked())
 
         self._apply_filters()
-        self._update_drop_button_text()
+        self._update_action_button_text()
 
     def _gather_selected(self) -> List[str]:
         terms: List[str] = []
@@ -1989,7 +2804,7 @@ class TermDropDialog(QDialog):
             matches_selection = (not show_selected) or item.checkState() == Qt.Checked
             item.setHidden(not (matches_search and matches_selection))
         self._update_show_selected_button_text(show_selected)
-        self._update_drop_button_text()
+        self._update_action_button_text()
 
     def _clear_checks(self):
         self.list_widget.blockSignals(True)
@@ -2023,16 +2838,16 @@ class TermDropDialog(QDialog):
         if self.show_selected_btn.isChecked():
             self._apply_filters()
         else:
-            self._update_drop_button_text()
+            self._update_action_button_text()
 
     def _accept_selection(self):
         self.selected_terms = self._gather_selected()
         self.accept()
 
-    def _update_drop_button_text(self):
+    def _update_action_button_text(self):
         count = len(self._gather_selected())
-        self.drop_btn.setText(f'Drop {count} Term(s)')
-        self.drop_btn.setEnabled(count > 0)
+        self.action_btn.setText(f'{self._action_verb} {count} Term(s)')
+        self.action_btn.setEnabled(count > 0)
 
     def _on_toggle_show_selected(self, checked: bool):
         self._update_show_selected_button_text(checked)
@@ -2041,6 +2856,397 @@ class TermDropDialog(QDialog):
     def _update_show_selected_button_text(self, checked: bool):
         self.show_selected_btn.setText('Show All Terms' if checked else 'Show Selected Terms')
 
+
+class TermDropDialog(TermSelectionDialog):
+    def __init__(self, parent: Optional[QWidget], terms: List[dict], selected_terms: Iterable[str]):
+        super().__init__(
+            parent,
+            terms,
+            selected_terms,
+            window_title='Select Terms to Drop',
+            info_text='Select collocate terms to exclude from the analysis (top 150 shown).',
+            action_verb='Drop',
+        )
+
+
+class TermPlotDialog(TermSelectionDialog):
+    def __init__(self, parent: Optional[QWidget], terms: List[dict], selected_terms: Iterable[str]):
+        super().__init__(
+            parent,
+            terms,
+            selected_terms,
+            window_title='Select Terms to Visualize',
+            info_text='Select specific collocate terms to use in charts and maps (top 150 shown).',
+            action_verb='Select',
+        )
+
+
+class TermGroupDialog(TermSelectionDialog):
+    def __init__(
+        self,
+        parent: Optional[QWidget],
+        terms: List[dict],
+        existing_groups: Iterable[dict],
+    ):
+        self.groups: List[dict] = []
+        self.created_groups: List[dict] = []
+        self._group_term_lookup: Dict[str, str] = {}
+        self._group_name_set: Set[str] = set()
+        super().__init__(
+            parent,
+            terms,
+            [],
+            window_title='Group Terms',
+            info_text='Select collocate terms to group together, then assign a display name for the group.',
+            action_verb='Create',
+        )
+
+        self.group_btn = QPushButton('Group Terms')
+        self.group_btn.clicked.connect(self._create_group_from_selection)
+        self.controls_layout.insertWidget(0, self.group_btn)
+
+        groups_box = QGroupBox('Current Groups')
+        groups_layout = QVBoxLayout(groups_box)
+        groups_layout.setContentsMargins(8, 8, 8, 8)
+        self.groups_list = QListWidget()
+        self.groups_list.setSelectionMode(QListWidget.SingleSelection)
+        groups_layout.addWidget(self.groups_list)
+
+        group_buttons = QHBoxLayout()
+        self.edit_group_btn = QPushButton('Edit')
+        group_buttons.addWidget(self.edit_group_btn)
+        self.rename_group_btn = QPushButton('Rename')
+        self.remove_group_btn = QPushButton('Remove')
+        group_buttons.addWidget(self.rename_group_btn)
+        group_buttons.addWidget(self.remove_group_btn)
+        group_buttons.addStretch(1)
+        groups_layout.addLayout(group_buttons)
+
+        # Explicit naming option
+        self.explicit_names_box = QCheckBox('Explicit Group Names')
+        self.explicit_names_box.setToolTip('If checked, new group names default to "*<term1> (<term1>; <term2>; …)". You can still rename.')
+        groups_layout.addWidget(self.explicit_names_box)
+
+        insert_index = max(0, self._main_layout.count() - 1)
+        self._main_layout.insertWidget(insert_index, groups_box)
+
+        self.groups_list.itemSelectionChanged.connect(self._update_group_controls)
+        self.groups_list.itemDoubleClicked.connect(lambda _item: self._rename_selected_group())
+        self.edit_group_btn.clicked.connect(self._edit_selected_group)
+        self.rename_group_btn.clicked.connect(self._rename_selected_group)
+        self.remove_group_btn.clicked.connect(self._remove_selected_group)
+
+        self._load_existing_groups(existing_groups)
+        self._update_group_controls()
+        self._update_group_button_enabled()
+        self._update_action_button_text()
+
+    def _load_existing_groups(self, existing_groups: Iterable[dict]):
+        for entry in existing_groups or []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get('name', '')).strip()
+            if not name:
+                continue
+            terms_raw = entry.get('terms') or []
+            terms: List[str] = []
+            seen: Set[str] = set()
+            for term in terms_raw:
+                term_str = str(term).strip()
+                if not term_str:
+                    continue
+                lower = term_str.lower()
+                if lower in seen:
+                    continue
+                seen.add(lower)
+                terms.append(term_str)
+            total_freq = entry.get('total_frequency')
+            freq_candidates = [self._term_frequency.get(term) for term in terms if self._term_frequency.get(term) is not None]
+            if freq_candidates:
+                total_freq = float(sum(freq_candidates))
+            missing_terms = [term for term in terms if term not in self._item_by_term]
+            group_data = {
+                'name': name,
+                'terms': terms,
+            }
+            if total_freq is not None:
+                group_data['total_frequency'] = total_freq
+            if missing_terms:
+                group_data['missing_terms'] = list(missing_terms)
+            self.groups.append(group_data)
+            self._group_name_set.add(name.lower())
+            for term in terms:
+                self._group_term_lookup[term.lower()] = name
+                if term in self._item_by_term:
+                    self._set_item_group_state(term, name)
+        self._refresh_group_list()
+
+    def _selected_terms_available(self) -> bool:
+        for term in self._gather_selected():
+            if term.lower() not in self._group_term_lookup:
+                return True
+        return False
+
+    def _create_group_from_selection(self):
+        selected_terms = [term for term in self._gather_selected() if term.lower() not in self._group_term_lookup]
+        if not selected_terms:
+            QMessageBox.information(self, 'Select Terms', 'Select one or more ungrouped terms to create a new group.')
+            return
+        # Default name with leading marker
+        term1 = selected_terms[0]
+        if self.explicit_names_box.isChecked():
+            parts = '; '.join(selected_terms)
+            default_name = f"*{term1} ({parts})"
+        else:
+            default_name = f"*{term1}"
+        name, ok = QInputDialog.getText(self, 'Group Name', 'Enter display name for this group:', QLineEdit.Normal, default_name)
+        if not ok:
+            return
+        display_name = str(name).strip()
+        if not display_name:
+            QMessageBox.warning(self, 'Name Required', 'Enter a non-empty display name for the group.')
+            return
+        if display_name.lower() in self._group_name_set:
+            QMessageBox.warning(self, 'Duplicate Name', 'A group with this name already exists. Choose a different name.')
+            return
+        terms_sorted = list(dict.fromkeys(selected_terms))
+        freq_values = [self._term_frequency.get(term) for term in terms_sorted if self._term_frequency.get(term) is not None]
+        total_freq = float(sum(freq_values)) if freq_values else None
+        group_data: Dict[str, Any] = {
+            'name': display_name,
+            'terms': terms_sorted,
+        }
+        if total_freq is not None:
+            group_data['total_frequency'] = total_freq
+        self.groups.append(group_data)
+        self._group_name_set.add(display_name.lower())
+        for term in terms_sorted:
+            self._group_term_lookup[term.lower()] = display_name
+            self._set_item_group_state(term, display_name)
+        self._refresh_group_list()
+        self._update_group_button_enabled()
+        self._update_action_button_text()
+
+    def _edit_selected_group(self):
+        item = self.groups_list.currentItem()
+        if item is None:
+            return
+        name = item.data(Qt.UserRole) or ''
+        group = next((grp for grp in self.groups if grp.get('name') == name), None)
+        if group is None:
+            return
+        current_terms = list(dict.fromkeys(group.get('terms', []) or []))
+        # Build term info list from existing items; include any missing terms from the group
+        info_rows: List[dict] = []
+        seen: Set[str] = set()
+        for term, _item in self._item_by_term.items():
+            if term in seen:
+                continue
+            seen.add(term)
+            info_rows.append({
+                'term': term,
+                'frequency': self._term_frequency.get(term),
+                'rank': None,
+            })
+        for term in current_terms:
+            if term not in seen:
+                seen.add(term)
+                info_rows.append({'term': term, 'frequency': None, 'rank': None})
+
+        dlg = TermSelectionDialog(
+            self,
+            info_rows,
+            current_terms,
+            window_title='Edit Group Members',
+            info_text='Add or remove terms in this group. Terms already in other groups are disabled.',
+            action_verb='Apply',
+        )
+        # Disable items belonging to other groups
+        for i in range(dlg.list_widget.count()):
+            it = dlg.list_widget.item(i)
+            term_val = it.data(Qt.UserRole) or ''
+            in_other = (term_val.lower() in self._group_term_lookup) and (self._group_term_lookup.get(term_val.lower()) != name)
+            if in_other:
+                it.setFlags(it.flags() & ~Qt.ItemIsEnabled)
+                txt = it.text()
+                if '(in another group)' not in txt:
+                    it.setText(f"{txt} (in another group)")
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        new_terms = list(dict.fromkeys(dlg.selected_terms))
+        # Update mappings for removed terms
+        removed = [t for t in current_terms if t not in new_terms]
+        added = [t for t in new_terms if t not in current_terms]
+        for t in removed:
+            self._group_term_lookup.pop(t.lower(), None)
+            self._set_item_group_state(t, None)
+        for t in added:
+            self._group_term_lookup[t.lower()] = name
+            self._set_item_group_state(t, name)
+        # Update group data
+        freq_values = [self._term_frequency.get(term) for term in new_terms if self._term_frequency.get(term) is not None]
+        total_freq = float(sum(freq_values)) if freq_values else None
+        group['terms'] = new_terms
+        if total_freq is not None:
+            group['total_frequency'] = total_freq
+        else:
+            group.pop('total_frequency', None)
+        # Update missing terms set
+        missing_terms = [t for t in new_terms if t not in self._item_by_term]
+        if missing_terms:
+            group['missing_terms'] = list(missing_terms)
+        else:
+            group.pop('missing_terms', None)
+        self._refresh_group_list()
+        self._update_group_controls()
+        self._update_action_button_text()
+
+    def _rename_selected_group(self):
+        item = self.groups_list.currentItem()
+        if item is None:
+            return
+        name = item.data(Qt.UserRole) or ''
+        group = next((grp for grp in self.groups if grp.get('name') == name), None)
+        if group is None:
+            return
+        new_name, ok = QInputDialog.getText(self, 'Rename Group', 'Enter a new display name for this group:', QLineEdit.Normal, name)
+        if not ok:
+            return
+        new_display = str(new_name).strip()
+        if not new_display:
+            QMessageBox.warning(self, 'Name Required', 'Enter a non-empty display name for the group.')
+            return
+        if new_display.lower() != name.lower() and new_display.lower() in self._group_name_set:
+            QMessageBox.warning(self, 'Duplicate Name', 'A group with this name already exists. Choose a different name.')
+            return
+        self._group_name_set.discard(name.lower())
+        self._group_name_set.add(new_display.lower())
+        group['name'] = new_display
+        for term in group.get('terms', []):
+            if term.lower() in self._group_term_lookup:
+                self._group_term_lookup[term.lower()] = new_display
+            self._set_item_group_state(term, new_display)
+        self._refresh_group_list()
+        self._update_action_button_text()
+
+    def _remove_selected_group(self):
+        item = self.groups_list.currentItem()
+        if item is None:
+            return
+        name = item.data(Qt.UserRole) or ''
+        index = next((idx for idx, grp in enumerate(self.groups) if grp.get('name') == name), None)
+        if index is None:
+            return
+        group = self.groups.pop(index)
+        self._group_name_set.discard(name.lower())
+        for term in group.get('terms', []):
+            self._group_term_lookup.pop(term.lower(), None)
+            self._set_item_group_state(term, None)
+        self._refresh_group_list()
+        self._update_group_button_enabled()
+        self._update_action_button_text()
+
+    def _set_item_group_state(self, term: str, group_name: Optional[str]):
+        item = self._item_by_term.get(term)
+        if item is None:
+            return
+        self.list_widget.blockSignals(True)
+        if group_name:
+            base_text = self._item_original_text.get(term, term)
+            item.setText(f"{base_text} [Grouped → {group_name}]")
+            item.setCheckState(Qt.Unchecked)
+            item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+        else:
+            base_text = self._item_original_text.get(term, term)
+            item.setText(base_text)
+            flags = item.flags()
+            item.setFlags(flags | Qt.ItemIsEnabled)
+            item.setCheckState(Qt.Unchecked)
+        self.list_widget.blockSignals(False)
+
+    def _refresh_group_list(self):
+        self.groups_list.blockSignals(True)
+        self.groups_list.clear()
+        for group in self.groups:
+            label = self._format_group_description(group)
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, group.get('name'))
+            self.groups_list.addItem(item)
+        self.groups_list.blockSignals(False)
+        self._update_group_controls()
+
+    def _format_group_description(self, group: dict) -> str:
+        name = group.get('name', '') or ''
+        terms = group.get('terms', []) or []
+        missing = {str(term).strip().lower() for term in group.get('missing_terms', []) or []}
+        decorated_terms = []
+        for term in terms:
+            term_str = str(term)
+            if term_str.lower() in missing:
+                decorated_terms.append(f"{term_str} (not in list)")
+            else:
+                decorated_terms.append(term_str)
+        terms_text = '; '.join(decorated_terms) if decorated_terms else '(none)'
+        freq = group.get('total_frequency')
+        freq_text = ''
+        if isinstance(freq, (float, int)):
+            value = float(freq)
+            if abs(value - round(value)) < 1e-6:
+                freq_text = f" (Total: {int(round(value)):,})"
+            else:
+                freq_text = f" (Total: {value:.2f})"
+        return f"{name}: {terms_text}{freq_text}"
+
+    def _update_group_controls(self):
+        has_selection = self.groups_list.currentRow() >= 0
+        if hasattr(self, 'edit_group_btn'):
+            self.edit_group_btn.setEnabled(has_selection)
+        self.rename_group_btn.setEnabled(has_selection)
+        self.remove_group_btn.setEnabled(has_selection)
+
+    def _update_group_button_enabled(self):
+        self.group_btn.setEnabled(self._selected_terms_available())
+
+    def _handle_item_changed(self, item):
+        super()._handle_item_changed(item)
+        self._update_group_button_enabled()
+
+    def _clear_checks(self):
+        super()._clear_checks()
+        self._update_group_button_enabled()
+
+    def _handle_length_selection(self, value: int):
+        super()._handle_length_selection(value)
+        self._clear_grouped_checks()
+        self._update_group_button_enabled()
+
+    def _clear_grouped_checks(self):
+        self.list_widget.blockSignals(True)
+        for term, item in self._item_by_term.items():
+            if term.lower() in self._group_term_lookup:
+                item.setCheckState(Qt.Unchecked)
+        self.list_widget.blockSignals(False)
+
+    def _update_action_button_text(self):
+        group_count = len(self.groups)
+        total_terms = sum(len(group.get('terms', []) or []) for group in self.groups)
+        self.action_btn.setText(f'Create {group_count} Group(s) from {total_terms} Term(s)')
+        self.action_btn.setEnabled(group_count > 0)
+
+    def _accept_selection(self):
+        def serialize(group: dict) -> dict:
+            data = {
+                'name': group.get('name'),
+                'terms': list(group.get('terms', []) or []),
+            }
+            if group.get('total_frequency') is not None:
+                data['total_frequency'] = float(group['total_frequency'])
+            if group.get('missing_terms'):
+                data['missing_terms'] = list(group.get('missing_terms'))
+            return data
+
+        self.created_groups = [serialize(group) for group in self.groups]
+        self.accept()
 class CollocationDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2049,25 +3255,41 @@ class CollocationDialog(QDialog):
         layout = QVBoxLayout(self)
         self._last_output_paths = None
         self._preview_windows = []
+        self._collocate_map_settings: Optional[dict] = None
+        self._rank_selected_terms: List[str] = []
+        self._drop_section_button: Optional[QToolButton] = None
+        self._selected_section_button: Optional[QToolButton] = None
+        self._group_section_button: Optional[QToolButton] = None
+        self._drop_terms_prev_count = 0
+        self._selected_terms_prev_count = 0
+        self._group_terms_prev_count = 0
+        self._rank_log_scale: bool = True
 
         # --- Source selection & status line ---
         mode_row = QHBoxLayout()
-        self.mode_geo = QRadioButton('Use GeoJSON')
         self.mode_json = QRadioButton('Use JSON results')
+        self.mode_geo = QRadioButton('Use GeoJSON')
         self.mode_group = QButtonGroup(self)
         self.mode_group.addButton(self.mode_geo)
         self.mode_group.addButton(self.mode_json)
 
-        # Default selection based on loaded files
-        if getattr(parent, 'geojson_file', None):
-            self.mode_geo.setChecked(True)
-        elif getattr(parent, 'json_file', None):
-            self.mode_json.setChecked(True)
-        else:
-            self.mode_geo.setChecked(True)
+        info_icon = QLabel()
+        info_icon.setToolTip('JSON results run much faster than GeoJSON for collocation analysis.')
+        info_icon.setPixmap(self.style().standardIcon(QStyle.SP_MessageBoxInformation).pixmap(16, 16))
+        mode_row.addWidget(info_icon, 0, Qt.AlignVCenter)
 
-        mode_row.addWidget(self.mode_geo)
+        # Default selection based on loaded files (prefer JSON for speed)
+        json_available = getattr(parent, 'json_file', None)
+        geo_available = getattr(parent, 'geojson_file', None)
+        if json_available:
+            self.mode_json.setChecked(True)
+        elif geo_available:
+            self.mode_geo.setChecked(True)
+        else:
+            self.mode_json.setChecked(True)
+
         mode_row.addWidget(self.mode_json)
+        mode_row.addWidget(self.mode_geo)
 
         self.choose_btn = QPushButton('Choose File…')
         mode_row.addWidget(self.choose_btn)
@@ -2125,45 +3347,59 @@ class CollocationDialog(QDialog):
         self.ignore_bin.setChecked(True)
         form.addRow(self.ignore_bin)
 
-        # Additional collocation options (checkboxes)
+        # Additional collocation options (checkboxes) added lower in layout
+        self._checkbox_order = [
+            'include_page_count',
+            'include_first_last_date',
+            'include_cooccurrence_rate',
+            'include_relative_position',
+            'drop_stopwords',
+            'write_occurrences_geojson',
+        ]
+        self._checkbox_labels = {
+            'write_occurrences_geojson': 'Output occurrences GeoJSON',
+        }
+        self._checkbox_defaults = {opt: True for opt in self._checkbox_order}
+        self._checkbox_defaults['write_occurrences_geojson'] = False
         self.checks = {}
-        for opt in ['include_page_count', 'include_first_last_date', 'include_cooccurrence_rate', 'include_relative_position', 'drop_stopwords']:
-            cb = QCheckBox(opt)
-            cb.setChecked(True)
-            form.addRow(cb)
+        for opt in self._checkbox_order:
+            cb = QCheckBox(self._checkbox_labels.get(opt, opt))
+            cb.setChecked(self._checkbox_defaults.get(opt, True))
             self.checks[opt] = cb
 
         form_widget = QWidget()
         form_widget.setLayout(form)
 
-        options_row = QHBoxLayout()
-        options_row.setContentsMargins(0, 0, 0, 0)
-        options_row.addWidget(form_widget, 1)
+        main_columns = QHBoxLayout()
+        main_columns.setContentsMargins(0, 0, 0, 0)
+
+        left_column = QVBoxLayout()
+        left_column.setContentsMargins(0, 0, 0, 0)
+        left_column.addWidget(form_widget, 1)
 
         drop_column = QVBoxLayout()
         drop_column.setContentsMargins(0, 0, 0, 0)
         drop_column.setSpacing(6)
-        self.select_drop_terms_btn = QPushButton('Select Terms to Drop')
+        self.select_drop_terms_btn = QPushButton('Drop Terms')
         self.select_drop_terms_btn.clicked.connect(self.open_drop_terms_dialog)
         drop_column.addWidget(self.select_drop_terms_btn)
 
-        summary_row = QHBoxLayout()
-        summary_row.setContentsMargins(0, 0, 0, 0)
+        drop_summary_row = QHBoxLayout()
+        drop_summary_row.setContentsMargins(0, 0, 0, 0)
         self.drop_summary_label = QLabel()
         self.drop_summary_label.setWordWrap(True)
         self.drop_summary_label.setStyleSheet('color: #555555; font-size: 11px;')
-        summary_row.addWidget(self.drop_summary_label, 1)
+        drop_summary_row.addWidget(self.drop_summary_label, 1)
         self.clear_drop_btn = QPushButton('Clear')
         self.clear_drop_btn.setFixedHeight(22)
         self.clear_drop_btn.setMaximumWidth(70)
         self.clear_drop_btn.clicked.connect(self.clear_dropped_terms)
-        summary_row.addWidget(self.clear_drop_btn, 0)
-        drop_column.addLayout(summary_row)
+        drop_summary_row.addWidget(self.clear_drop_btn, 0)
+        drop_column.addLayout(drop_summary_row)
 
         self.drop_terms_view = QTextBrowser()
         self.drop_terms_view.setReadOnly(True)
         self.drop_terms_view.setMinimumHeight(120)
-        self.drop_terms_view.setMaximumWidth(260)
         self.drop_terms_view.setStyleSheet('font-size: 11px;')
         drop_column.addWidget(self.drop_terms_view)
 
@@ -2173,36 +3409,166 @@ class CollocationDialog(QDialog):
         drop_column.addWidget(self.clear_notice_label)
         drop_column.addStretch(1)
 
-        options_row.addLayout(drop_column, 0)
-        layout.addLayout(options_row)
+        drop_content = QWidget()
+        drop_content.setLayout(drop_column)
+        drop_section, drop_toggle = self._create_collapsible_section('Drop Terms', drop_content, expanded=False)
+        drop_section.setMaximumWidth(260)
+        self._drop_section_button = drop_toggle
+
+        group_column = QVBoxLayout()
+        group_column.setContentsMargins(0, 0, 0, 0)
+        group_column.setSpacing(6)
+        self.group_terms_btn = QPushButton('Group Terms')
+        self.group_terms_btn.clicked.connect(self.open_group_terms_dialog)
+        self.group_terms_btn.setEnabled(False)
+        group_column.addWidget(self.group_terms_btn)
+
+        group_summary_row = QHBoxLayout()
+        group_summary_row.setContentsMargins(0, 0, 0, 0)
+        self.group_summary_label = QLabel()
+        self.group_summary_label.setWordWrap(True)
+        self.group_summary_label.setStyleSheet('color: #555555; font-size: 11px;')
+        group_summary_row.addWidget(self.group_summary_label, 1)
+        self.clear_groups_btn = QPushButton('Clear')
+        self.clear_groups_btn.setFixedHeight(22)
+        self.clear_groups_btn.setMaximumWidth(70)
+        self.clear_groups_btn.clicked.connect(self.clear_group_terms)
+        group_summary_row.addWidget(self.clear_groups_btn, 0)
+        group_column.addLayout(group_summary_row)
+
+        self.group_terms_view = QTextBrowser()
+        self.group_terms_view.setReadOnly(True)
+        self.group_terms_view.setMinimumHeight(120)
+        self.group_terms_view.setStyleSheet('font-size: 11px;')
+        group_column.addWidget(self.group_terms_view)
+        group_column.addStretch(1)
+
+        group_content = QWidget()
+        group_content.setLayout(group_column)
+        group_section, group_toggle = self._create_collapsible_section('Group Terms', group_content, expanded=False)
+        group_section.setMaximumWidth(260)
+        self._group_section_button = group_toggle
+
+        select_column = QVBoxLayout()
+        select_column.setContentsMargins(0, 0, 0, 0)
+        select_column.setSpacing(6)
+        self.select_terms_btn = QPushButton('Select Terms')
+        self.select_terms_btn.clicked.connect(self.open_select_terms_dialog)
+        self.select_terms_btn.setEnabled(False)
+        select_column.addWidget(self.select_terms_btn)
+
+        select_summary_row = QHBoxLayout()
+        select_summary_row.setContentsMargins(0, 0, 0, 0)
+        self.selected_summary_label = QLabel()
+        self.selected_summary_label.setWordWrap(True)
+        self.selected_summary_label.setStyleSheet('color: #555555; font-size: 11px;')
+        select_summary_row.addWidget(self.selected_summary_label, 1)
+        self.clear_selected_btn = QPushButton('Clear')
+        self.clear_selected_btn.setFixedHeight(22)
+        self.clear_selected_btn.setMaximumWidth(70)
+        self.clear_selected_btn.clicked.connect(self.clear_selected_terms)
+        select_summary_row.addWidget(self.clear_selected_btn, 0)
+        select_column.addLayout(select_summary_row)
+
+        self.selected_terms_view = QTextBrowser()
+        self.selected_terms_view.setReadOnly(True)
+        self.selected_terms_view.setMinimumHeight(120)
+        self.selected_terms_view.setStyleSheet('font-size: 11px;')
+        select_column.addWidget(self.selected_terms_view)
+        select_column.addStretch(1)
+
+        selected_content = QWidget()
+        selected_content.setLayout(select_column)
+        selected_section, selected_toggle = self._create_collapsible_section('Selected Terms', selected_content, expanded=False)
+        selected_section.setMaximumWidth(260)
+        self._selected_section_button = selected_toggle
+
+        right_column = QVBoxLayout()
+        right_column.setContentsMargins(0, 0, 0, 0)
+        right_column.setSpacing(12)
+        right_column.addWidget(drop_section)
+        right_column.addWidget(group_section)
+        right_column.addWidget(selected_section)
+
+        options_group = QGroupBox('Collocation Options')
+        options_group.setAlignment(Qt.AlignLeft)
+        options_group_layout = QVBoxLayout(options_group)
+        options_group_layout.setContentsMargins(12, 12, 12, 12)
+        for opt in self._checkbox_order:
+            cb = self.checks[opt]
+            options_group_layout.addWidget(cb)
+        options_group_layout.addStretch(1)
+        left_column.addWidget(options_group)
+        left_column.addStretch(1)
+
+        context_group = QGroupBox('Context Window (words)')
+        context_group.setAlignment(Qt.AlignLeft)
+        context_layout = QHBoxLayout(context_group)
+        context_layout.setContentsMargins(12, 12, 12, 12)
+        context_layout.setSpacing(6)
+        context_label = QLabel('Size:')
+        context_layout.addWidget(context_label)
+        self.context_left_spin = QSpinBox()
+        self.context_left_spin.setRange(0, 99)
+        self.context_left_spin.setValue(5)
+        self.context_left_spin.setFixedWidth(46)
+        context_layout.addWidget(self.context_left_spin)
+        self.keyword_label = QLabel('<keyword>')
+        self.keyword_label.setTextFormat(Qt.PlainText)
+        self.keyword_label.setMinimumWidth(110)
+        self.keyword_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        context_layout.addWidget(self.keyword_label, 1)
+        self.context_right_spin = QSpinBox()
+        self.context_right_spin.setRange(0, 99)
+        self.context_right_spin.setValue(5)
+        self.context_right_spin.setFixedWidth(46)
+        context_layout.addWidget(self.context_right_spin)
+        context_layout.addStretch(1)
+        context_group.setMaximumWidth(260)
+        right_column.addWidget(context_group)
+        right_column.addStretch(1)
+
+        main_columns.addLayout(left_column, 0)
+        main_columns.addLayout(right_column, 1)
+        layout.addLayout(main_columns)
+
+        self._update_selected_terms_summary()
 
         self._loading_defaults = True
         self._restore_state_or_defaults()
         self._loading_defaults = False
         self._update_drop_summary()
+        self._update_group_summary()
+        self._update_selected_terms_summary()
+        self._update_context_keyword_label()
         self._set_clear_notice('')
+        self._update_select_terms_enabled()
 
         self.bin_size.textEdited.connect(self._handle_bin_control_change)
         self.bin_unit.currentIndexChanged.connect(self._handle_bin_control_change)
         self.ignore_bin.stateChanged.connect(lambda *_: self._save_state())
         self.city_combo.currentIndexChanged.connect(lambda *_: self._save_state())
         self.state_combo.currentIndexChanged.connect(lambda *_: self._save_state())
-        self.term_input.textEdited.connect(lambda _text: self._save_state())
+        self.term_input.textEdited.connect(self._on_term_edited)
         self.start_input.textEdited.connect(lambda _text: self._save_state())
         self.end_input.textEdited.connect(lambda _text: self._save_state())
         self.mode_geo.toggled.connect(lambda _: self._save_state())
         self.mode_json.toggled.connect(lambda _: self._save_state())
         for cb in self.checks.values():
             cb.stateChanged.connect(lambda *_: self._save_state())
+        self.context_left_spin.valueChanged.connect(lambda *_: self._save_state())
+        self.context_right_spin.valueChanged.connect(lambda *_: self._save_state())
 
         # Action buttons
         btn_run = QPushButton('Run Collocation')
         btn_bar = QPushButton('Show Bar Chart')
         btn_rank = QPushButton('Show Rank Changes')
+        btn_map_collocate = QPushButton('Create Collocate‑Rank Map (lightweight)')
         btn_run.clicked.connect(self.run_collocate)
         btn_bar.clicked.connect(self.show_bar)
         btn_rank.clicked.connect(self.show_rank)
-        for b in (btn_run, btn_bar, btn_rank):
+        btn_map_collocate.clicked.connect(self.create_collocate_rank_map)
+        for b in (btn_run, btn_bar, btn_rank, btn_map_collocate):
             layout.addWidget(b)
 
     def _source_text(self):
@@ -2211,19 +3577,293 @@ class CollocationDialog(QDialog):
             return f"GeoJSON: {os.path.basename(p) if p else '<none selected>'}"
         else:
             p = getattr(self.parent(), 'json_file', None)
-            return f"JSON: {os.path.basename(p) if p else '<none selected>'}"
+        return f"JSON: {os.path.basename(p) if p else '<none selected>'}"
+
+    def create_collocate_rank_map(self):
+        parent = self.parent()
+        if parent is None:
+            QMessageBox.warning(self, 'Unavailable', 'Parent window not available.')
+            return
+        # Require a GeoJSON source to derive per‑city ranks
+        geo_path = getattr(parent, 'geojson_file', None)
+        if not geo_path or not os.path.exists(geo_path):
+            # Try to prompt for a GeoJSON
+            p, _ = QFileDialog.getOpenFileName(self, 'Select GeoJSON File', parent.project_folder or os.getcwd(), 'GeoJSON Files (*.geojson *.json)')
+            if p:
+                parent.geojson_file = p
+                parent._update_loaded_file_labels()
+                geo_path = p
+        if not geo_path or not os.path.exists(geo_path):
+            QMessageBox.warning(self, 'GeoJSON Required', 'Please add geographic info and select a GeoJSON file first.')
+            return
+
+        term = self.term_input.text().strip()
+        if not term:
+            QMessageBox.warning(self, 'Search Term Required', 'Enter a search term to build the collocate‑rank map.')
+            return
+
+        # Time configuration
+        ignore_bin = self.ignore_bin.isChecked()
+        size_text = self.bin_size.text().strip()
+        bin_unit = self.bin_unit.currentText().lower()
+        if not ignore_bin and (not size_text or not size_text.isdigit()):
+            QMessageBox.warning(self, 'Invalid Bin Size', 'Please enter an integer ≥ 1.')
+            return
+        time_unit = bin_unit if not ignore_bin else 'month'
+        time_step = int(size_text) if (not ignore_bin and size_text.isdigit()) else 1
+
+        # Remember the requested date window for downstream map configuration
+        start_value = self.start_input.text().strip()
+        end_value = self.end_input.text().strip()
+
+        # Collocation options influence tokenization
+        opts = self._collect_options()
+        drop_stop = bool(opts.get('drop_stopwords', False))
+        context_left = self.context_left_spin.value()
+        context_right = self.context_right_spin.value()
+        context_window = max(context_left, context_right)
+
+        # Gather geo metadata for settings dialog
+        try:
+            with open(geo_path, 'r', encoding='utf-8') as f:
+                geo_payload = json.load(f)
+        except Exception as exc:
+            QMessageBox.critical(self, 'GeoJSON Error', f'Unable to read GeoJSON file:\n{exc}')
+            return
+
+        features = geo_payload.get('features') or []
+        city_pairs: Set[Tuple[str, str]] = set()
+        state_set: Set[str] = set()
+        date_values: List[datetime] = []
+        for feat in features:
+            if not isinstance(feat, dict):
+                continue
+            props = feat.get('properties') or {}
+            if not isinstance(props, dict):
+                continue
+            city_val = str(props.get('City') or '').strip()
+            state_val = str(props.get('State') or '').strip()
+            if city_val:
+                city_pairs.add((city_val, state_val))
+            if state_val:
+                state_set.add(state_val)
+            if not ignore_bin:
+                dt = _parse_date(props.get('date'))
+                if dt:
+                    date_values.append(dt)
+
+        time_bin_pairs: List[Tuple[str, str]] = []
+        if not ignore_bin and date_values:
+            try:
+                index_list = _build_time_index(min(date_values), max(date_values), time_unit, max(1, time_step))
+                for idx, dt in enumerate(index_list, start=1):
+                    label = dt.strftime('%Y-%m-%d')
+                    time_bin_pairs.append((str(idx), label))
+            except Exception:
+                time_bin_pairs = []
+
+        sorted_cities = sorted(
+            [pair for pair in city_pairs if pair[0]],
+            key=lambda p: (p[0].lower(), p[1].lower()),
+        )
+        sorted_states = sorted(state_set, key=lambda s: s.lower())
+
+        default_top = self._collocate_map_settings.get('top_n') if isinstance(self._collocate_map_settings, dict) else 25
+        manual_terms_current = list(dict.fromkeys(self._rank_selected_terms))
+        use_selected_default = bool(manual_terms_current)
+        if isinstance(self._collocate_map_settings, dict) and 'use_selected_terms' in self._collocate_map_settings:
+            use_selected_default = bool(self._collocate_map_settings.get('use_selected_terms')) and bool(manual_terms_current)
+        settings_dialog = CollocateMapSettingsDialog(
+            self,
+            time_bins=time_bin_pairs,
+            cities=sorted_cities,
+            states=sorted_states,
+            default_top_n=max(1, min(int(default_top or 25), 150)),
+            max_top_n=150,
+            selected_terms=manual_terms_current,
+            use_selected_default=use_selected_default,
+        )
+        if self._collocate_map_settings:
+            prev = self._collocate_map_settings
+            prev_map_type = str(prev.get('map_type', 'rank')).lower()
+            idx = settings_dialog.map_type_combo.findData(prev_map_type)
+            if idx >= 0:
+                settings_dialog.map_type_combo.setCurrentIndex(idx)
+            settings_dialog._apply_map_type_constraints()
+            settings_dialog.colorize_check.setChecked(bool(prev.get('colorize')))
+            settings_dialog.export_csv_check.setChecked(bool(prev.get('export_csv')))
+            if prev.get('term_scope') == 'time' and settings_dialog.time_combo.count() > 0:
+                desired = prev.get('time_key')
+                if desired is not None:
+                    for idx in range(settings_dialog.time_combo.count()):
+                        if str(settings_dialog.time_combo.itemData(idx)) == str(desired):
+                            settings_dialog.time_radio.setChecked(True)
+                            settings_dialog.time_combo.setCurrentIndex(idx)
+                            break
+            if prev.get('location_scope') == 'city' and settings_dialog.city_combo.count() > 0:
+                city_val = prev.get('location_city') or ''
+                state_val = prev.get('location_state') or ''
+                for idx in range(settings_dialog.city_combo.count()):
+                    data = settings_dialog.city_combo.itemData(idx)
+                    if isinstance(data, tuple) and data == (city_val, state_val):
+                        settings_dialog.loc_city_radio.setChecked(True)
+                        settings_dialog.city_combo.setCurrentIndex(idx)
+                        break
+            elif prev.get('location_scope') == 'state' and settings_dialog.state_combo.count() > 0:
+                state_val = prev.get('location_state') or ''
+                index = settings_dialog.state_combo.findText(state_val, Qt.MatchFixedString)
+                if index >= 0:
+                    settings_dialog.loc_state_radio.setChecked(True)
+                    settings_dialog.state_combo.setCurrentIndex(index)
+            if prev.get('enable_time_slider') and settings_dialog.enable_time_slider.isEnabled():
+                settings_dialog.enable_time_slider.setChecked(True)
+            if settings_dialog.use_selected_terms_check.isEnabled():
+                settings_dialog.use_selected_terms_check.setChecked(bool(prev.get('use_selected_terms')))
+            settings_dialog._apply_map_type_constraints()
+
+        if settings_dialog.exec_() != QDialog.Accepted:
+            return
+
+        map_settings = settings_dialog.values()
+        map_type = str(map_settings.get('map_type', 'rank') or 'rank').lower()
+        self._collocate_map_settings = map_settings
+
+        enable_time_slider = bool(map_settings.get('enable_time_slider')) and bool(time_bin_pairs)
+        if not enable_time_slider:
+            map_settings['enable_time_slider'] = False
+
+        manual_terms = list(dict.fromkeys(self._rank_selected_terms))
+        use_selected_terms = bool(map_settings.get('use_selected_terms')) if map_type != 'top_term' else False
+        default_top_n = int(map_settings.get('top_n', 25))
+        if use_selected_terms and manual_terms:
+            metrics_path = None
+            if isinstance(self._last_output_paths, dict):
+                metrics_path = self._last_output_paths.get('metrics')
+            if metrics_path and os.path.exists(metrics_path):
+                try:
+                    term_infos = self._fetch_metric_term_infos(metrics_path)
+                except (RuntimeError, ValueError):
+                    term_infos = []
+                if term_infos:
+                    available_terms = {info['term'] for info in term_infos}
+                    missing_manual = [term for term in manual_terms if term not in available_terms]
+                    if missing_manual and len(missing_manual) == len(manual_terms):
+                        QMessageBox.information(
+                            self,
+                            'Terms Not Found',
+                            'None of the selected terms are available in the current metrics. The map will use the Top N terms instead.',
+                        )
+                        manual_terms = []
+                        use_selected_terms = False
+                    elif missing_manual:
+                        preview = ', '.join(missing_manual[:5])
+                        if len(missing_manual) > 5:
+                            preview += ', …'
+                        QMessageBox.information(
+                            self,
+                            'Terms Not Found',
+                            'The following selected terms are not available in the current metrics and will be skipped:\n' + preview,
+                        )
+                        manual_terms = [term for term in manual_terms if term in available_terms]
+        else:
+            use_selected_terms = False
+        top_n = len(manual_terms) if use_selected_terms and manual_terms else default_top_n
+        map_settings['use_selected_terms'] = use_selected_terms
+        self._collocate_map_settings['use_selected_terms'] = use_selected_terms
+        map_settings['map_type'] = map_type
+        self._collocate_map_settings['map_type'] = map_type
+        export_csv = bool(map_settings.get('export_csv'))
+        map_settings['export_csv'] = export_csv
+        self._collocate_map_settings['export_csv'] = export_csv
+        term_scope = map_settings.get('term_scope', 'global')
+        time_key = map_settings.get('time_key') or None
+        time_label = map_settings.get('time_label') or ''
+        location_scope = map_settings.get('location_scope', 'all')
+        location_city = map_settings.get('location_city') or ''
+        location_state = map_settings.get('location_state') or ''
+        location_label = map_settings.get('location_label') or ''
+
+        try:
+            # Create lightweight map with embedded collocate rank index
+            result = create_map(
+                geo_path,
+                mode='points',
+                time_unit=time_unit,
+                time_step=time_step,
+                linger_unit='week',
+                linger_step=0,
+                disable_time=not enable_time_slider,
+                lightweight=True,
+                table_mode='minimal',
+                table_row_limit=1000,
+                # Extended kwargs consumed by map_create
+                collocate_rank_mode=True,
+                collocate_drop_stopwords=drop_stop,
+                collocate_drop_terms=self._get_parent_drop_terms(),
+                collocate_term_groups=self._get_parent_term_groups(),
+                collocate_rank_top_n=top_n,
+                collocate_rank_term_scope=term_scope,
+                collocate_rank_time_key=time_key,
+                collocate_rank_focus=location_scope,
+                collocate_rank_focus_city=location_city or None,
+                collocate_rank_focus_state=location_state or None,
+                collocate_rank_terms=manual_terms if use_selected_terms and manual_terms else None,
+                collocate_window=context_window,
+                collocate_rank_time_label=time_label or None,
+                collocate_rank_focus_label=location_label or None,
+                collocate_rank_colorize=bool(map_settings.get('colorize')),
+                collocate_time_slider=enable_time_slider,
+                collocate_map_variant=map_type,
+                metadata_enabled=getattr(parent, 'metadata_enabled', True),
+                project_dir=parent.project_folder if parent else None,
+                time_start_override=start_value or None,
+                time_end_override=end_value or None,
+                collocate_export_csv=export_csv,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, 'Map Error', str(exc))
+            return
+
+        map_path = (result or {}).get('map_path')
+        if map_path and os.path.exists(map_path):
+            self._set_clear_notice('')
+            encoded = urllib.parse.quote(map_path)
+            log_lines = [
+                f'<div>Created map: <a href="chronam-open:{encoded}">{html.escape(map_path)}</a></div>'
+            ]
+            map_type_display = 'Top Ranked Term by Location' if map_type == 'top_term' else 'Select Term Rank Map'
+            log_lines.append(f'<div>Map type: {html.escape(map_type_display)}</div>')
+            csv_export_path = (result or {}).get('collocate_csv')
+            if csv_export_path:
+                encoded_csv = urllib.parse.quote(csv_export_path)
+                log_lines.append(
+                    f'<div>Collocate CSV: <a href="chronam-open:{encoded_csv}">{html.escape(csv_export_path)}</a></div>'
+                )
+            if parent and hasattr(parent, 'append_project_log'):
+                parent.append_project_log('Collocate‑Rank Map', log_lines)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(map_path))
+        else:
+            QMessageBox.information(self, 'No Map Created', 'The map was not created.')
 
     def choose_source_file(self):
         parent = self.parent()
         if self.mode_geo.isChecked():
-            p, _ = QFileDialog.getOpenFileName(self, 'Select GeoJSON File', parent.project_folder, 'GeoJSON Files (*.geojson *.json)')
+            start_dir = parent.project_folder if parent else os.getcwd()
+            processed_dir = os.path.join(start_dir, 'data', 'processed')
+            if os.path.isdir(processed_dir):
+                start_dir = processed_dir
+            p, _ = QFileDialog.getOpenFileName(self, 'Select GeoJSON File', start_dir, 'GeoJSON Files (*.geojson *.json)')
             if p:
                 parent.geojson_file = p
                 parent._update_loaded_file_labels()
                 # Update city/state lists for new GeoJSON
                 self.populate_city_state()
         else:
-            p, _ = QFileDialog.getOpenFileName(self, 'Select JSON Results', parent.project_folder, 'JSON Files (*.json)')
+            start_dir = parent.project_folder if parent else os.getcwd()
+            processed_dir = os.path.join(start_dir, 'data', 'processed')
+            if os.path.isdir(processed_dir):
+                start_dir = processed_dir
+            p, _ = QFileDialog.getOpenFileName(self, 'Select JSON Results', start_dir, 'JSON Files (*.json)')
             if p:
                 parent.json_file = p
                 parent._update_loaded_file_labels()
@@ -2231,6 +3871,10 @@ class CollocationDialog(QDialog):
         self.source_label.setText(self._source_text())
         if parent is not None:
             parent.collocation_state = {}
+        self._last_output_paths = None
+        self._rank_selected_terms = []
+        self._update_selected_terms_summary()
+        self._update_select_terms_enabled()
         self._loading_defaults = True
         self._prefill_from_current_source(reset_state=True)
         self._loading_defaults = False
@@ -2244,28 +3888,52 @@ class CollocationDialog(QDialog):
         if state:
             self._apply_state(state)
         else:
+            # Prefer JSON by default if available; else GeoJSON; else JSON
+            json_available = getattr(parent, 'json_file', None) if parent is not None else None
+            geo_available = getattr(parent, 'geojson_file', None) if parent is not None else None
+            if json_available and not geo_available:
+                self.mode_json.setChecked(True)
+            elif geo_available and not json_available:
+                self.mode_geo.setChecked(True)
+            elif json_available and geo_available:
+                self.mode_json.setChecked(True)
+            else:
+                self.mode_json.setChecked(True)
             self.on_mode_toggle()
             self._prefill_from_current_source()
+        self.source_label.setText(self._source_text())
 
     def _apply_state(self, state: dict):
         parent = self.parent()
         mode = state.get('mode', 'geo')
         self.mode_geo.blockSignals(True)
         self.mode_json.blockSignals(True)
-        if mode == 'json' and getattr(parent, 'json_file', None):
-            self.mode_json.setChecked(True)
-        elif mode == 'geo' and getattr(parent, 'geojson_file', None):
+        json_available = getattr(parent, 'json_file', None) if parent is not None else None
+        geo_available = getattr(parent, 'geojson_file', None) if parent is not None else None
+        chosen = None
+        if mode == 'json' and json_available:
+            chosen = 'json'
+        elif mode == 'geo' and geo_available:
+            chosen = 'geo'
+        elif json_available and not geo_available:
+            chosen = 'json'
+        elif geo_available and not json_available:
+            chosen = 'geo'
+        elif json_available:
+            chosen = 'json'
+        elif geo_available:
+            chosen = 'geo'
+        if chosen == 'geo':
             self.mode_geo.setChecked(True)
-        elif getattr(parent, 'json_file', None):
-            self.mode_json.setChecked(True)
         else:
-            self.mode_geo.setChecked(True)
+            self.mode_json.setChecked(True)
         self.mode_geo.blockSignals(False)
         self.mode_json.blockSignals(False)
         self.on_mode_toggle()
 
         # Prefill term/date from current source if missing in saved state
         self._prefill_from_current_source()
+        self.source_label.setText(self._source_text())
 
         city = state.get('city')
         if city:
@@ -2285,6 +3953,7 @@ class CollocationDialog(QDialog):
                 self.state_combo.setCurrentIndex(idx)
 
         self.term_input.setText(state.get('term', self.term_input.text()))
+        self._update_context_keyword_label()
         self.start_input.setText(state.get('start', self.start_input.text()))
         self.end_input.setText(state.get('end', self.end_input.text()))
 
@@ -2302,7 +3971,21 @@ class CollocationDialog(QDialog):
 
         opts = state.get('options', {})
         for key, cb in self.checks.items():
-            cb.setChecked(bool(opts.get(key, True)))
+            default = self._checkbox_defaults.get(key, cb.isChecked())
+            cb.setChecked(bool(opts.get(key, default)))
+
+        context_left = state.get('context_left')
+        if context_left is not None:
+            try:
+                self.context_left_spin.setValue(int(context_left))
+            except (TypeError, ValueError):
+                pass
+        context_right = state.get('context_right')
+        if context_right is not None:
+            try:
+                self.context_right_spin.setValue(int(context_right))
+            except (TypeError, ValueError):
+                pass
 
         drop_terms_state = state.get('dropped_terms')
         if parent is not None:
@@ -2314,6 +3997,28 @@ class CollocationDialog(QDialog):
             else:
                 parent.collocation_drop_terms = []
         self._update_drop_summary()
+
+        groups_state = state.get('term_groups')
+        if groups_state is not None:
+            self._set_term_groups(groups_state, log_change=False)
+        else:
+            self._update_group_summary()
+
+        manual_terms_state = state.get('rank_selected_terms')
+        if isinstance(manual_terms_state, list):
+            cleaned: List[str] = []
+            seen = set()
+            for entry in manual_terms_state:
+                if not isinstance(entry, str):
+                    continue
+                term_clean = entry.strip()
+                if term_clean and term_clean not in seen:
+                    seen.add(term_clean)
+                    cleaned.append(term_clean)
+            self._rank_selected_terms = cleaned
+        else:
+            self._rank_selected_terms = []
+        self._rank_log_scale = bool(state.get('rank_log_scale', True))
 
     def _prefill_from_current_source(self, reset_state: bool = False):
         parent = self.parent()
@@ -2335,10 +4040,12 @@ class CollocationDialog(QDialog):
 
         if meta.get('term'):
             self.term_input.setText(meta.get('term'))
+            self._update_context_keyword_label()
         if meta.get('start_date'):
             self.start_input.setText(meta.get('start_date'))
         if meta.get('end_date'):
             self.end_input.setText(meta.get('end_date'))
+        self._update_context_keyword_label()
 
     def _extract_metadata_from_source(self, path: Optional[str], is_geo: bool) -> dict:
         result = {'term': '', 'start_date': '', 'end_date': ''}
@@ -2406,11 +4113,254 @@ class CollocationDialog(QDialog):
     def _collect_options(self) -> dict:
         return {opt: cb.isChecked() for opt, cb in self.checks.items()}
 
+    def _options_with_context(self) -> dict:
+        opts = self._collect_options()
+        opts = dict(opts)
+        opts['window_left'] = self.context_left_spin.value()
+        opts['window_right'] = self.context_right_spin.value()
+        return opts
+
+    def _generate_by_time_csv(
+        self,
+        *,
+        city: Optional[str],
+        state: Optional[str],
+        start_value: Optional[str],
+        end_value: Optional[str],
+        term: str,
+        time_bin_unit: Optional[str],
+        drop_terms: List[str],
+        options_runtime: dict,
+        options_hash: dict,
+        window_left: int,
+        window_right: int,
+        metadata_enabled: bool,
+        prefer_geo: bool,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        parent = self.parent()
+        if parent is None:
+            return None, 'Parent window not available.'
+        json_path = getattr(parent, 'json_file', None)
+        geo_path = getattr(parent, 'geojson_file', None)
+        candidates = []
+        if prefer_geo:
+            candidates.extend([(geo_path, True), (json_path, False)])
+        else:
+            candidates.extend([(json_path, False), (geo_path, True)])
+        options_runtime = dict(options_runtime)
+        source_path = None
+        source_is_geo = False
+        for candidate, is_geo in candidates:
+            if candidate and os.path.exists(candidate):
+                source_path = candidate
+                source_is_geo = is_geo
+                break
+        if not source_path:
+            return None, 'Locate a JSON or GeoJSON results file before building rank changes.'
+        if not source_is_geo:
+            options_runtime['write_occurrences_geojson'] = False
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            result = run_collocation(
+                parent.project_folder,
+                city=city,
+                state=state,
+                start_date=start_value or None,
+                end_date=end_value or None,
+                term=term,
+                time_bin_unit=time_bin_unit,
+                json_path=None if source_is_geo else source_path,
+                geojson_path=source_path if source_is_geo else None,
+                ignore_bin=self.ignore_bin.isChecked(),
+                write_by_time=True,
+                drop_terms=drop_terms,
+                term_groups=self._get_parent_term_groups(),
+                window_left=window_left,
+                window_right=window_right,
+                metadata_enabled=metadata_enabled,
+                write_metrics=False,
+                **options_runtime,
+            )
+        except Exception as exc:
+            return None, str(exc)
+        finally:
+            QApplication.restoreOverrideCursor()
+        built_path = result.get('by_time') if isinstance(result, dict) else None
+        if built_path and os.path.exists(built_path):
+            return built_path, None
+        predicted = self._build_output_paths(term, start_value, end_value, city, state, options_hash)
+        expected = predicted.get('by_time')
+        if expected and os.path.exists(expected):
+            return expected, None
+        return None, 'By-time data could not be created. Please run the collocation analysis first.'
+
+    def _derive_time_bins_from_inputs(self) -> List[str]:
+        start_text = self.start_input.text().strip()
+        end_text = self.end_input.text().strip()
+        bin_unit = self._current_time_bin_unit()
+
+        if not start_text or not end_text or not bin_unit:
+            return []
+
+        try:
+            start_dt = pd.to_datetime(start_text, errors='raise')
+            end_dt = pd.to_datetime(end_text, errors='raise')
+        except Exception:
+            return []
+
+        if pd.isna(start_dt) or pd.isna(end_dt):
+            return []
+
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+
+        parts = bin_unit.strip().split()
+        if len(parts) != 2:
+            return []
+        try:
+            size = int(parts[0])
+        except ValueError:
+            return []
+        unit = parts[1].lower()
+        if size <= 0:
+            return []
+
+        current = start_dt
+        end_inclusive = end_dt
+        bins: List[str] = []
+        max_bins = 600
+
+        while current <= end_inclusive and len(bins) < max_bins:
+            bins.append(current.date().isoformat())
+            if unit.startswith('day'):
+                current = current + pd.Timedelta(days=size)
+            elif unit.startswith('week'):
+                current = current + pd.Timedelta(weeks=size)
+            elif unit.startswith('month'):
+                current = current + pd.DateOffset(months=size)
+            elif unit.startswith('year'):
+                current = current + pd.DateOffset(years=size)
+            else:
+                return []
+
+        if not bins:
+            bins.append(start_dt.date().isoformat())
+        return bins
+
+    def _update_context_keyword_label(self):
+        if not hasattr(self, 'keyword_label'):
+            return
+        term_text = self.term_input.text().strip()
+        display = term_text if term_text else '<keyword>'
+        self.keyword_label.setText(display)
+
+    def _on_term_edited(self, _text: str):
+        self._update_context_keyword_label()
+        self._save_state()
+
     def _get_parent_drop_terms(self) -> List[str]:
         parent = self.parent()
         if parent is None:
             return []
         return list(getattr(parent, 'collocation_drop_terms', []))
+
+    def _get_parent_term_groups(self) -> List[dict]:
+        parent = self.parent()
+        if parent is None:
+            return []
+        groups = getattr(parent, 'collocation_term_groups', [])
+        cleaned: List[dict] = []
+        for entry in groups or []:
+            if isinstance(entry, dict):
+                cleaned.append(dict(entry))
+        return cleaned
+
+    def _normalize_term_groups_for_storage(self, groups: Iterable[dict]) -> List[dict]:
+        normalized: List[dict] = []
+        for entry in groups or []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get('name', '')).strip()
+            if not name:
+                continue
+            terms_raw = entry.get('terms') or []
+            terms: List[str] = []
+            seen_terms: Set[str] = set()
+            for term in terms_raw:
+                term_str = str(term).strip()
+                if not term_str:
+                    continue
+                lower = term_str.lower()
+                if lower in seen_terms:
+                    continue
+                seen_terms.add(lower)
+                terms.append(term_str)
+            if not terms:
+                continue
+            data: Dict[str, Any] = {'name': name, 'terms': terms}
+            total_freq = entry.get('total_frequency')
+            try:
+                if total_freq is not None:
+                    data['total_frequency'] = float(total_freq)
+            except (TypeError, ValueError):
+                pass
+            missing_terms = entry.get('missing_terms')
+            if isinstance(missing_terms, list):
+                cleaned_missing = [str(term).strip() for term in missing_terms if str(term).strip()]
+                if cleaned_missing:
+                    data['missing_terms'] = cleaned_missing
+            normalized.append(data)
+        return normalized
+
+    def _set_term_groups(self, groups: Iterable[dict], *, log_change: bool, show_notice: bool = False):
+        parent = self.parent()
+        if parent is None:
+            return
+        normalized = self._normalize_term_groups_for_storage(groups)
+        previous = list(getattr(parent, 'collocation_term_groups', []))
+        parent.collocation_term_groups = normalized
+        state = dict(getattr(parent, 'collocation_state', {}) or {})
+        state['term_groups'] = [dict(group) for group in normalized]
+        parent.collocation_state = state
+        self._update_group_summary()
+        self._save_state()
+        if log_change and normalized != previous:
+            self._log_term_groups_change(previous, normalized)
+        if show_notice:
+            self._set_clear_notice('Run the collocation analysis again to apply changes.')
+
+    def _log_term_groups_change(self, previous: List[dict], current: List[dict]):
+        parent = self.parent()
+        if parent is None:
+            return
+        if not current:
+            parent.append_project_log('Collocation Analysis', ['<div>Term groups cleared.</div>'])
+            return
+        items = []
+        for group in current:
+            name = html.escape(str(group.get('name', '')))
+            terms = group.get('terms', []) or []
+            missing = {str(term).strip().lower() for term in group.get('missing_terms', []) or []}
+            term_parts = []
+            for term in terms:
+                rendered = html.escape(str(term))
+                if str(term).strip().lower() in missing:
+                    rendered = f"{rendered} (not in list)"
+                term_parts.append(rendered)
+            freq = group.get('total_frequency')
+            freq_text = ''
+            if isinstance(freq, (float, int)):
+                value = float(freq)
+                if abs(value - round(value)) < 1e-6:
+                    freq_text = f" (Total: {int(round(value)):,})"
+                else:
+                    freq_text = f" (Total: {value:.2f})"
+            items.append(f'<li><strong>{name}</strong>: {"; ".join(term_parts)}{freq_text}</li>')
+        lines = [
+            f'<div>Updated term groups ({len(current)})</div>',
+            f'<div style="max-height:220px; overflow-y:auto;"><ul>{"".join(items)}</ul></div>',
+        ]
+        parent.append_project_log('Collocation Analysis', lines)
 
     def _update_drop_summary(self):
         terms = self._get_parent_drop_terms()
@@ -2426,6 +4376,74 @@ class CollocationDialog(QDialog):
             self.drop_terms_view.setHtml(body)
         else:
             self.drop_terms_view.setHtml('<span style="color:#777777;">(none)</span>')
+        if count == 0:
+            if self._drop_section_button is not None and self._drop_section_button.isChecked():
+                self._drop_section_button.setChecked(False)
+        elif self._drop_terms_prev_count == 0 and self._drop_section_button is not None and not self._drop_section_button.isChecked():
+            self._drop_section_button.setChecked(True)
+        self._drop_terms_prev_count = count
+
+    def _update_selected_terms_summary(self):
+        terms = list(dict.fromkeys(self._rank_selected_terms))
+        count = len(terms)
+        if count:
+            self.selected_summary_label.setText(f'Selected terms: {count}')
+            body = '<br/>'.join(html.escape(term) for term in terms)
+            self.selected_terms_view.setHtml(body)
+            self.clear_selected_btn.setEnabled(True)
+        else:
+            self.selected_summary_label.setText('No terms selected.')
+            self.selected_terms_view.setHtml('<span style="color:#777777;">(none)</span>')
+            self.clear_selected_btn.setEnabled(False)
+        if count == 0:
+            if self._selected_section_button is not None and self._selected_section_button.isChecked():
+                self._selected_section_button.setChecked(False)
+        elif self._selected_terms_prev_count == 0 and self._selected_section_button is not None and not self._selected_section_button.isChecked():
+            self._selected_section_button.setChecked(True)
+        self._selected_terms_prev_count = count
+
+    def _update_group_summary(self):
+        groups = self._get_parent_term_groups()
+        count = len(groups)
+        term_total = sum(len(group.get('terms', []) or []) for group in groups)
+        if count:
+            self.group_summary_label.setText(f'Term groups: {count} (covering {term_total} term(s))')
+            self.clear_groups_btn.setEnabled(True)
+        else:
+            self.group_summary_label.setText('No term groups defined.')
+            self.clear_groups_btn.setEnabled(False)
+        if groups:
+            lines = []
+            for group in groups:
+                name = html.escape(str(group.get('name', '')))
+                terms = group.get('terms', []) or []
+                missing = {str(term).strip().lower() for term in group.get('missing_terms', []) or []}
+                term_parts = []
+                for term in terms:
+                    rendered = html.escape(str(term))
+                    if str(term).strip().lower() in missing:
+                        rendered = f"{rendered} <span style=\"color:#b45309;\">(not in list)</span>"
+                    term_parts.append(rendered)
+                terms_html = '; '.join(term_parts) if term_parts else '(none)'
+                freq = group.get('total_frequency')
+                freq_text = ''
+                if isinstance(freq, (float, int)):
+                    value = float(freq)
+                    if abs(value - round(value)) < 1e-6:
+                        freq_text = f" (Total: {int(round(value)):,})"
+                    else:
+                        freq_text = f" (Total: {value:.2f})"
+                lines.append(f'<div><strong>{name}</strong>: {terms_html}{freq_text}</div>')
+            body = ''.join(lines)
+        else:
+            body = '<span style="color:#777777;">(none)</span>'
+        self.group_terms_view.setHtml(body)
+        if count == 0:
+            if self._group_section_button is not None and self._group_section_button.isChecked():
+                self._group_section_button.setChecked(False)
+        elif self._group_terms_prev_count == 0 and self._group_section_button is not None and not self._group_section_button.isChecked():
+            self._group_section_button.setChecked(True)
+        self._group_terms_prev_count = count
 
     def _set_dropped_terms(self, terms: List[str], *, log_change: bool, show_notice: bool = False):
         parent = self.parent()
@@ -2480,6 +4498,52 @@ class CollocationDialog(QDialog):
             return
         self._set_dropped_terms([], log_change=True, show_notice=True)
 
+    def clear_selected_terms(self):
+        if not self._rank_selected_terms:
+            return
+        self._rank_selected_terms = []
+        self._update_selected_terms_summary()
+        self._save_state()
+
+    def clear_group_terms(self):
+        if not self._get_parent_term_groups():
+            return
+        self._set_term_groups([], log_change=True, show_notice=True)
+
+    def _update_select_terms_enabled(self):
+        metrics_path = None
+        if isinstance(self._last_output_paths, dict):
+            metrics_path = self._last_output_paths.get('metrics')
+        enabled = bool(metrics_path and os.path.exists(metrics_path))
+        self.select_terms_btn.setEnabled(enabled)
+        self.group_terms_btn.setEnabled(enabled)
+
+    def _fetch_metric_term_infos(self, metrics_path: str) -> List[dict]:
+        try:
+            df = pd.read_csv(metrics_path)
+        except Exception as exc:
+            raise RuntimeError(f'Unable to read metrics file: {exc}')
+        if df.empty or 'collocate_term' not in df.columns:
+            raise ValueError('No collocate terms are available.')
+        df = df.dropna(subset=['collocate_term']).copy()
+        if df.empty:
+            raise ValueError('No collocate terms are available.')
+        df['collocate_term'] = df['collocate_term'].astype(str)
+        freq_col = 'frequency' if 'frequency' in df.columns else None
+        if freq_col:
+            df = df.sort_values([freq_col, 'collocate_term'], ascending=[False, True]).reset_index(drop=True)
+        else:
+            df = df.sort_values(['collocate_term']).reset_index(drop=True)
+        term_infos: List[dict] = []
+        for idx, row in df.iterrows():
+            info = {
+                'term': row['collocate_term'],
+                'frequency': row.get(freq_col) if freq_col else None,
+                'rank': idx + 1,
+            }
+            term_infos.append(info)
+        return term_infos
+
     def open_drop_terms_dialog(self):
         term = self.term_input.text().strip()
         if not term:
@@ -2495,40 +4559,25 @@ class CollocationDialog(QDialog):
             self.end_input.text().strip(),
             city,
             state,
-            self._collect_options(),
+            self._options_with_context(),
         )
         metrics_path = paths.get('metrics')
         if not metrics_path or not os.path.exists(metrics_path):
             QMessageBox.warning(self, 'Metrics Not Found', 'Run the collocation analysis before selecting terms to drop.')
             return
         try:
-            df = pd.read_csv(metrics_path)
-        except Exception as exc:
-            QMessageBox.critical(self, 'Read Error', f'Unable to read metrics file:\n{exc}')
+            term_infos = self._fetch_metric_term_infos(metrics_path)
+        except RuntimeError as exc:
+            QMessageBox.critical(self, 'Read Error', str(exc))
             return
-        if df.empty or 'collocate_term' not in df.columns:
+        except ValueError:
             QMessageBox.information(self, 'No Collocates', 'No collocated terms are available to drop.')
             return
-        df = df.dropna(subset=['collocate_term']).copy()
-        df['collocate_term'] = df['collocate_term'].astype(str)
-        freq_col = 'frequency' if 'frequency' in df.columns else None
-        if freq_col:
-            df = df.sort_values([freq_col, 'collocate_term'], ascending=[False, True]).reset_index(drop=True)
-        else:
-            df = df.sort_values(['collocate_term']).reset_index(drop=True)
-
-        term_infos: List[dict] = []
-        for idx, row in df.iterrows():
-            info = {
-                'term': row['collocate_term'],
-                'frequency': row.get(freq_col) if freq_col else None,
-                'rank': idx + 1,
-            }
-            term_infos.append(info)
 
         selected_set = set(self._get_parent_drop_terms())
         top_terms = term_infos[:150]
         known_terms = {info['term'] for info in top_terms}
+        info_map = {info['term']: info for info in term_infos}
 
         # Include selected terms beyond the top 150 and any missing from the file
         for info in term_infos[150:]:
@@ -2538,12 +4587,139 @@ class CollocationDialog(QDialog):
                 known_terms.add(term_name)
         for term_name in selected_set:
             if term_name not in known_terms:
-                top_terms.append({'term': term_name, 'frequency': None, 'rank': None})
+                info = info_map.get(term_name)
+                if info:
+                    top_terms.append(info)
+                else:
+                    top_terms.append({'term': term_name, 'frequency': None, 'rank': None})
                 known_terms.add(term_name)
 
         dialog = TermDropDialog(self, top_terms, selected_set)
         if dialog.exec_() == QDialog.Accepted:
             self._set_dropped_terms(dialog.selected_terms, log_change=True)
+
+    def open_group_terms_dialog(self):
+        if not self.group_terms_btn.isEnabled():
+            return
+        term = self.term_input.text().strip()
+        if not term:
+            QMessageBox.warning(self, 'Search Term Required', 'Enter a search term before grouping terms.')
+            return
+        city_text = self.city_combo.currentText()
+        state_text = self.state_combo.currentText()
+        city = None if not city_text or city_text == 'All Cities' else city_text.strip()
+        state = None if not state_text or state_text == 'All States' else state_text.strip()
+        paths = self._build_output_paths(
+            term,
+            self.start_input.text().strip(),
+            self.end_input.text().strip(),
+            city,
+            state,
+            self._options_with_context(),
+        )
+        metrics_path = paths.get('metrics')
+        if not metrics_path or not os.path.exists(metrics_path):
+            QMessageBox.warning(self, 'Metrics Not Found', 'Run the collocation analysis before grouping terms.')
+            return
+        try:
+            term_infos = self._fetch_metric_term_infos(metrics_path)
+        except RuntimeError as exc:
+            QMessageBox.critical(self, 'Read Error', str(exc))
+            return
+        except ValueError:
+            QMessageBox.information(self, 'No Collocates', 'No collocated terms are available to group.')
+            return
+
+        existing_groups = self._get_parent_term_groups()
+        top_terms = term_infos[:150]
+        known_terms = {info['term'] for info in top_terms}
+        info_map = {info['term']: info for info in term_infos}
+
+        for group in existing_groups:
+            for term_name in group.get('terms', []) or []:
+                if term_name in known_terms:
+                    continue
+                info = info_map.get(term_name)
+                if info:
+                    top_terms.append(info)
+                else:
+                    top_terms.append({'term': term_name, 'frequency': None, 'rank': None})
+                known_terms.add(term_name)
+
+        dialog = TermGroupDialog(self, top_terms, existing_groups)
+        if dialog.exec_() == QDialog.Accepted:
+            self._set_term_groups(dialog.created_groups, log_change=True, show_notice=True)
+            # Return focus to Collocation dialog
+            try:
+                self.raise_()
+                self.activateWindow()
+                self.setFocus()
+            except Exception:
+                pass
+
+    def open_select_terms_dialog(self):
+        if not self.select_terms_btn.isEnabled():
+            return
+        term = self.term_input.text().strip()
+        if not term:
+            QMessageBox.warning(self, 'Search Term Required', 'Enter a search term before selecting terms.')
+            return
+        city_text = self.city_combo.currentText()
+        state_text = self.state_combo.currentText()
+        city = None if not city_text or city_text == 'All Cities' else city_text.strip()
+        state = None if not state_text or state_text == 'All States' else state_text.strip()
+        paths = self._build_output_paths(
+            term,
+            self.start_input.text().strip(),
+            self.end_input.text().strip(),
+            city,
+            state,
+            self._options_with_context(),
+        )
+        metrics_path = paths.get('metrics')
+        if not metrics_path or not os.path.exists(metrics_path):
+            QMessageBox.warning(self, 'Metrics Not Found', 'Run the collocation analysis before selecting terms.')
+            return
+        try:
+            term_infos = self._fetch_metric_term_infos(metrics_path)
+        except RuntimeError as exc:
+            QMessageBox.critical(self, 'Read Error', str(exc))
+            return
+        except ValueError:
+            QMessageBox.information(self, 'No Collocates', 'No collocated terms are available to select.')
+            return
+
+        selected_set = set(self._rank_selected_terms)
+        top_terms = term_infos[:150]
+        known_terms = {info['term'] for info in top_terms}
+        info_map = {info['term']: info for info in term_infos}
+
+        for info in term_infos[150:]:
+            term_name = info['term']
+            if term_name in selected_set and term_name not in known_terms:
+                top_terms.append(info)
+                known_terms.add(term_name)
+        for term_name in selected_set:
+            if term_name not in known_terms:
+                info = info_map.get(term_name)
+                if info:
+                    top_terms.append(info)
+                else:
+                    top_terms.append({'term': term_name, 'frequency': None, 'rank': None})
+                known_terms.add(term_name)
+
+        dialog = TermPlotDialog(self, top_terms, selected_set)
+        if dialog.exec_() == QDialog.Accepted:
+            normalized: List[str] = []
+            seen = set()
+            for item in dialog.selected_terms:
+                term_clean = str(item).strip()
+                if term_clean and term_clean not in seen:
+                    seen.add(term_clean)
+                    normalized.append(term_clean)
+            self._rank_selected_terms = normalized
+            self._update_selected_terms_summary()
+            self._save_state()
 
     def _current_time_bin_unit(self) -> Optional[str]:
         if self.ignore_bin.isChecked():
@@ -2558,6 +4734,8 @@ class CollocationDialog(QDialog):
         if parent is None:
             raise RuntimeError('Collocation dialog has no parent window')
         time_bin_unit = self._current_time_bin_unit()
+        trimmed_options = dict(options)
+        trimmed_options.pop('write_occurrences_geojson', None)
         return build_collocation_output_paths(
             parent.project_folder,
             term=term,
@@ -2567,8 +4745,9 @@ class CollocationDialog(QDialog):
             state=state,
             time_bin_unit=time_bin_unit,
             ignore_bin=self.ignore_bin.isChecked(),
-            options=options,
+            options=trimmed_options,
             drop_terms=self._get_parent_drop_terms(),
+            term_groups=self._get_parent_term_groups(),
         )
 
     def _register_preview(self, preview: QDialog):
@@ -2582,8 +4761,39 @@ class CollocationDialog(QDialog):
 
         preview.destroyed.connect(_cleanup)
 
+    def _create_collapsible_section(self, title: str, content: QWidget, *, expanded: bool = False) -> Tuple[QWidget, QToolButton]:
+        section = QWidget()
+        section_layout = QVBoxLayout(section)
+        section_layout.setContentsMargins(0, 0, 0, 0)
+        section_layout.setSpacing(0)
+
+        toggle = QToolButton(section)
+        toggle.setText(title)
+        toggle.setCheckable(True)
+        toggle.setChecked(expanded)
+        toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        toggle.setStyleSheet('QToolButton { border: none; font-weight: 600; padding: 2px 0; }')
+        toggle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        section_layout.addWidget(toggle)
+
+        body = QWidget(section)
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(12, 6, 0, 0)
+        body_layout.setSpacing(6)
+        body_layout.addWidget(content)
+        section_layout.addWidget(body)
+        body.setVisible(expanded)
+
+        def handle_toggle(checked: bool):
+            toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+            body.setVisible(checked)
+
+        toggle.toggled.connect(handle_toggle)
+        return section, toggle
+
     def _confirm_overwrite_if_needed(self, paths: dict) -> bool:
-        existing = [p for p in (paths.get('metrics'), paths.get('by_time'), paths.get('occurrences')) if p and os.path.exists(p)]
+        existing = [p for p in (paths.get('metrics'), paths.get('occurrences')) if p and os.path.exists(p)]
         if not existing:
             return True
         box = QMessageBox(self)
@@ -2631,6 +4841,11 @@ class CollocationDialog(QDialog):
             'ignore_bin': self.ignore_bin.isChecked(),
             'options': self._collect_options(),
             'dropped_terms': self._get_parent_drop_terms(),
+            'term_groups': self._get_parent_term_groups(),
+            'context_left': self.context_left_spin.value(),
+            'context_right': self.context_right_spin.value(),
+            'rank_selected_terms': list(self._rank_selected_terms),
+            'rank_log_scale': bool(getattr(self, '_rank_log_scale', True)),
         }
         parent.collocation_state = state
 
@@ -2651,6 +4866,9 @@ class CollocationDialog(QDialog):
             self.city_combo.setCurrentIndex(0)
             self.state_combo.setCurrentIndex(0)
             self._prefill_from_current_source()
+        occ_cb = self.checks.get('write_occurrences_geojson')
+        if occ_cb is not None:
+            occ_cb.setEnabled(self.mode_geo.isChecked())
         if not self._loading_defaults:
             self._save_state()
 
@@ -2720,15 +4938,21 @@ class CollocationDialog(QDialog):
                 return
 
         time_bin_unit = self._current_time_bin_unit()
-        write_by_time = not ignore_bin
-        opts = self._collect_options()
+        write_by_time = False
+        opts_bool = self._collect_options()
+        window_left = self.context_left_spin.value()
+        window_right = self.context_right_spin.value()
+        options_with_context = dict(opts_bool)
+        options_with_context['window_left'] = window_left
+        options_with_context['window_right'] = window_right
 
         parent = self.parent()
         if parent is None:
             QMessageBox.warning(self, 'Unavailable', 'Parent window not available.')
             return
+        metadata_enabled = getattr(parent, 'metadata_enabled', True)
 
-        predicted_paths = self._build_output_paths(term, start or None, end or None, city, state, opts)
+        predicted_paths = self._build_output_paths(term, start or None, end or None, city, state, options_with_context)
         if not self._confirm_overwrite_if_needed(predicted_paths):
             return
 
@@ -2750,11 +4974,14 @@ class CollocationDialog(QDialog):
                     time_bin_unit=time_bin_unit,
                     json_path=json_path,
                     geojson_path=None,
-                    write_occurrences_geojson=False,
                     ignore_bin=ignore_bin,
                     write_by_time=write_by_time,
                     drop_terms=parent.collocation_drop_terms,
-                    **opts,
+                    term_groups=getattr(parent, 'collocation_term_groups', []),
+                    window_left=window_left,
+                    window_right=window_right,
+                    metadata_enabled=metadata_enabled,
+                    **opts_bool,
                 )
             else:
                 geo_path = getattr(parent, 'geojson_file', None)
@@ -2773,11 +5000,14 @@ class CollocationDialog(QDialog):
                     time_bin_unit=time_bin_unit,
                     geojson_path=geo_path,
                     json_path=None,
-                    write_occurrences_geojson=True,
                     ignore_bin=ignore_bin,
                     write_by_time=write_by_time,
                     drop_terms=parent.collocation_drop_terms,
-                    **opts,
+                    term_groups=getattr(parent, 'collocation_term_groups', []),
+                    window_left=window_left,
+                    window_right=window_right,
+                    metadata_enabled=metadata_enabled,
+                    **opts_bool,
                 )
         except Exception as e:
             QMessageBox.critical(self, 'Error', str(e))
@@ -2796,6 +5026,7 @@ class CollocationDialog(QDialog):
             self._register_preview(preview)
 
         self._last_output_paths = result
+        self._update_select_terms_enabled()
         self._save_state()
         mode_label = 'GeoJSON' if self.mode_geo.isChecked() else 'JSON'
         self._log_collocation_run(
@@ -2807,7 +5038,7 @@ class CollocationDialog(QDialog):
             state or 'All',
             time_bin_unit,
             ignore_bin,
-            opts,
+            options_with_context,
             result,
         )
         self._set_clear_notice('')
@@ -2821,12 +5052,61 @@ class CollocationDialog(QDialog):
         state_text = self.state_combo.currentText()
         city = None if not city_text or city_text == 'All Cities' else city_text.strip()
         state = None if not state_text or state_text == 'All States' else state_text.strip()
-        paths = self._build_output_paths(term, self.start_input.text().strip(), self.end_input.text().strip(), city, state, self._collect_options())
+        start_value = self.start_input.text().strip()
+        end_value = self.end_input.text().strip()
+        options_with_context = self._options_with_context()
+        paths = self._build_output_paths(term, start_value, end_value, city, state, options_with_context)
         metrics_path = paths.get('metrics')
         if not metrics_path or not os.path.exists(metrics_path):
             QMessageBox.warning(self, 'File Not Found', 'Metrics file not found. Please run the collocation analysis first.')
             return
-        fig = plot_bar(metrics_path)
+        selected_terms = list(dict.fromkeys(self._rank_selected_terms))
+        try:
+            plot_bar = _import_plot_bar()
+            if selected_terms:
+                try:
+                    df = pd.read_csv(metrics_path)
+                except Exception as exc:
+                    QMessageBox.critical(self, 'Read Error', f'Unable to read metrics file:\n{exc}')
+                    return
+                if df.empty or 'collocate_term' not in df.columns or 'frequency' not in df.columns:
+                    QMessageBox.information(
+                        self,
+                        'No Data',
+                        'Selected terms could not be displayed because the metrics file is missing required data.',
+                    )
+                    selected_terms = []
+                else:
+                    df = df.dropna(subset=['collocate_term']).copy()
+                    df['collocate_term'] = df['collocate_term'].astype(str)
+                    filtered = df[df['collocate_term'].isin(selected_terms)].copy()
+                    available = set(filtered['collocate_term'])
+                    missing = [term for term in selected_terms if term not in available]
+                    if filtered.empty:
+                        QMessageBox.information(
+                            self,
+                            'Terms Not Found',
+                            'None of the selected terms are present in the metrics file. Showing default top terms instead.',
+                        )
+                        selected_terms = []
+                    else:
+                        if missing:
+                            preview = ', '.join(missing[:5])
+                            if len(missing) > 5:
+                                preview += ', …'
+                            QMessageBox.information(
+                                self,
+                                'Terms Not Found',
+                                'The following selected terms are not present in the metrics file and were skipped:\n' + preview,
+                            )
+                        fig = plot_bar(filtered)
+                        if fig is not None:
+                            fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
+                        return
+            fig = plot_bar(metrics_path)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Plot Error', str(exc))
+            return
         if fig is not None:
             fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
 
@@ -2847,11 +5127,28 @@ class CollocationDialog(QDialog):
             summary_parts.append('Time bin: ignored')
         else:
             summary_parts.append(f"Time bin: {time_bin_unit or 'default'}")
-        enabled_opts = [name for name, enabled in options.items() if enabled]
+
+        context_left = options.get('window_left')
+        context_right = options.get('window_right')
+        if context_left is not None or context_right is not None:
+            try:
+                left_val = int(context_left) if context_left is not None else 0
+            except (TypeError, ValueError):
+                left_val = 0
+            try:
+                right_val = int(context_right) if context_right is not None else 0
+            except (TypeError, ValueError):
+                right_val = 0
+            summary_parts.append(f"Context: {left_val} left / {right_val} right")
+
+        enabled_opts = [name for name, enabled in options.items() if isinstance(enabled, bool) and enabled]
         summary_parts.append(f"Options: {', '.join(enabled_opts) if enabled_opts else 'none'}")
         drop_count = len(getattr(parent, 'collocation_drop_terms', []))
         if drop_count:
             summary_parts.append(f"Dropped terms: {drop_count}")
+        group_count = len(getattr(parent, 'collocation_term_groups', []))
+        if group_count:
+            summary_parts.append(f"Term groups: {group_count}")
         lines = [f"<div>{html.escape('; '.join(summary_parts))}</div>"]
 
         def link_line(label: str, path: Optional[str]):
@@ -2879,6 +5176,33 @@ class CollocationDialog(QDialog):
                     f'<div><strong>Dropped terms list:</strong></div>'
                     f'<div style="max-height:220px; overflow-y:auto;"><ul>{items}</ul></div>'
                 )
+        if group_count:
+            groups = getattr(parent, 'collocation_term_groups', []) or []
+            if groups:
+                group_items = []
+                for group in groups:
+                    name = html.escape(str(group.get('name', '')))
+                    terms = group.get('terms', []) or []
+                    missing = {str(term).strip().lower() for term in group.get('missing_terms', []) or []}
+                    term_parts = []
+                    for term in terms:
+                        rendered = html.escape(str(term))
+                        if str(term).strip().lower() in missing:
+                            rendered = f"{rendered} (not in list)"
+                        term_parts.append(rendered)
+                    freq = group.get('total_frequency')
+                    freq_text = ''
+                    if isinstance(freq, (float, int)):
+                        value = float(freq)
+                        if abs(value - round(value)) < 1e-6:
+                            freq_text = f" (Total: {int(round(value)):,})"
+                        else:
+                            freq_text = f" (Total: {value:.2f})"
+                    group_items.append(f'<li><strong>{name}</strong>: {"; ".join(term_parts)}{freq_text}</li>')
+                lines.append(
+                    '<div><strong>Term groups:</strong></div>'
+                    f'<div style="max-height:220px; overflow-y:auto;"><ul>{"".join(group_items)}</ul></div>'
+                )
 
         parent.append_project_log('Collocation Analysis', lines)
 
@@ -2899,56 +5223,217 @@ class CollocationDialog(QDialog):
         state_text = self.state_combo.currentText()
         city = None if not city_text or city_text == 'All Cities' else city_text.strip()
         state = None if not state_text or state_text == 'All States' else state_text.strip()
-        paths = self._build_output_paths(term, self.start_input.text().strip(), self.end_input.text().strip(), city, state, self._collect_options())
+        start_value = self.start_input.text().strip()
+        end_value = self.end_input.text().strip()
+        options_with_context = self._options_with_context()
+        paths = self._build_output_paths(term, start_value, end_value, city, state, options_with_context)
         file_path = paths.get('by_time')
-        if not file_path or not os.path.exists(file_path):
-            QMessageBox.warning(self, 'No Data', 'Collocation by-time data not found. Run collocation with a time bin first.')
+        time_bin_unit = self._current_time_bin_unit()
+        if not file_path:
+            QMessageBox.warning(
+                self,
+                'Time Bin Required',
+                'Enable time bin settings before viewing rank changes.',
+            )
             return
-        try:
-            df = pd.read_csv(file_path)
-        except Exception as e:
-            QMessageBox.critical(self, 'Error', f'Could not read by-time data: {e}')
-            return
-        if df.empty or 'time_bin' not in df.columns or 'collocate_term' not in df.columns or 'ordinal_rank' not in df.columns:
-            QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available for the selected parameters.')
-            return
-        try:
-            bins_ordered = sorted(df['time_bin'].unique(), key=lambda x: pd.to_datetime(str(x), errors='coerce'))
-        except Exception:
-            bins_ordered = sorted(df['time_bin'].unique())
+
+        parent = self.parent()
+        metadata_enabled = getattr(parent, 'metadata_enabled', True) if parent is not None else True
+        opts_bool = self._collect_options()
+        window_left = self.context_left_spin.value()
+        window_right = self.context_right_spin.value()
+        drop_terms_raw = self._get_parent_drop_terms()
+        drop_terms = [str(t).strip() for t in drop_terms_raw if str(t).strip()]
+        drop_terms_set = set(drop_terms)
+        prefer_geo = self.mode_geo.isChecked()
+
+        csv_exists = bool(file_path and os.path.exists(file_path))
+        df: Optional[pd.DataFrame] = None
+        bins_ordered: List[Any] = []
+        unique_terms: List[str] = []
+
+        if csv_exists:
+            try:
+                df = pd.read_csv(file_path)
+            except Exception:
+                df = None
+                csv_exists = False
+
+        if df is not None:
+            required_cols = {'time_bin', 'collocate_term', 'ordinal_rank'}
+            if not required_cols.issubset(df.columns):
+                df = None
+                csv_exists = False
+            else:
+                if drop_terms_set:
+                    df = df[~df['collocate_term'].isin(drop_terms_set)].reset_index(drop=True)
+                if not df.empty:
+                    try:
+                        bins_ordered = sorted(
+                            df['time_bin'].unique(),
+                            key=lambda x: pd.to_datetime(str(x), errors='coerce'),
+                        )
+                    except Exception:
+                        bins_ordered = sorted(df['time_bin'].unique())
+                    unique_terms = df['collocate_term'].dropna().unique().tolist()
+                else:
+                    df = None
+                    csv_exists = False
+
+        if drop_terms_set:
+            csv_status = 'drop_terms'
+        elif csv_exists:
+            csv_status = 'existing'
+        else:
+            csv_status = 'missing'
+
+        selected_manual = list(dict.fromkeys(self._rank_selected_terms))
+        max_terms_dialog = len(unique_terms) if unique_terms else 150
+        default_top = min(10, max_terms_dialog) if max_terms_dialog else 1
         if not bins_ordered:
-            QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available.')
-            return
-        unique_terms = df['collocate_term'].dropna().unique().tolist()
-        if not unique_terms:
-            QMessageBox.information(self, 'No Rank Data', 'No collocate terms available to plot.')
-            return
-        default_top = min(10, len(unique_terms)) or 1
-        settings_dialog = CollocationRankSettingsDialog(self, bins_ordered, len(unique_terms), default_top)
+            bins_ordered = self._derive_time_bins_from_inputs()
+        settings_dialog = CollocationRankSettingsDialog(
+            self,
+            bins_ordered,
+            max(1, max_terms_dialog),
+            default_top,
+            selected_terms=selected_manual,
+            csv_status=csv_status,
+            csv_path=file_path,
+            drop_terms=drop_terms,
+            log_scale=getattr(self, '_rank_log_scale', True),
+        )
         if settings_dialog.exec_() != QDialog.Accepted:
             return
         settings = settings_dialog.values()
+        self._rank_selected_terms = list(dict.fromkeys(settings.get('selected_terms', [])))
+        self._update_selected_terms_summary()
+        log_scale = bool(settings.get('log_scale', True))
+        self._rank_log_scale = log_scale
+        self._save_state()
+        regen_on_accept = bool(drop_terms_set) or not csv_exists or df is None
+        if regen_on_accept:
+            built_path, error = self._generate_by_time_csv(
+                city=city,
+                state=state,
+                start_value=start_value or None,
+                end_value=end_value or None,
+                term=term,
+                time_bin_unit=time_bin_unit,
+                drop_terms=drop_terms,
+                options_runtime=opts_bool,
+                options_hash=options_with_context,
+                window_left=window_left,
+                window_right=window_right,
+                metadata_enabled=metadata_enabled,
+                prefer_geo=prefer_geo,
+            )
+            if not built_path:
+                QMessageBox.critical(self, 'Error', error or 'Unable to build by-time data.')
+                return
+            file_path = built_path
+            try:
+                df = pd.read_csv(file_path)
+            except Exception as exc:
+                QMessageBox.critical(self, 'Error', f'Could not read by-time data: {exc}')
+                return
+            if drop_terms_set:
+                df = df[~df['collocate_term'].isin(drop_terms_set)].reset_index(drop=True)
+            if df.empty or 'time_bin' not in df.columns or 'collocate_term' not in df.columns or 'ordinal_rank' not in df.columns:
+                QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available for the selected parameters.')
+                return
+            try:
+                bins_ordered = sorted(df['time_bin'].unique(), key=lambda x: pd.to_datetime(str(x), errors='coerce'))
+            except Exception:
+                bins_ordered = sorted(df['time_bin'].unique())
+            if not bins_ordered:
+                bins_ordered = self._derive_time_bins_from_inputs()
+                if not bins_ordered:
+                    QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available.')
+                    return
+            unique_terms = df['collocate_term'].dropna().unique().tolist()
+            if not unique_terms:
+                QMessageBox.information(self, 'No Rank Data', 'No collocate terms available to plot.')
+                return
+
         top_n = settings['top_n']
         use_global = settings['use_global']
         show_labels = settings['show_labels']
+        home_idx = settings['home_bin_index']
+        home_idx = max(0, min(home_idx, len(bins_ordered) - 1))
+        use_selected_terms = bool(settings.get('use_selected_terms'))
 
-        averages = None
-        if use_global:
-            averages = df.groupby('collocate_term')['ordinal_rank'].mean().dropna()
-            top_terms = averages.sort_values().head(top_n).index.tolist()
+        unique_term_set = set(unique_terms)
+        manual_terms = [term for term in self._rank_selected_terms if term in unique_term_set]
+        missing_manual = [term for term in self._rank_selected_terms if term not in unique_term_set]
+        manual_mode = use_selected_terms and bool(manual_terms)
+        if manual_mode and missing_manual:
+            missing_preview = ', '.join(missing_manual[:5])
+            if len(missing_manual) > 5:
+                missing_preview += ', …'
+            QMessageBox.information(
+                self,
+                'Terms Not Found',
+                'The following selected terms are not available for the current filters and will be skipped:\n' + missing_preview,
+            )
+        elif use_selected_terms and not manual_mode and self._rank_selected_terms:
+            QMessageBox.information(
+                self,
+                'Terms Not Found',
+                'None of the manually selected terms are available for the current filters. The chart will use the Top N terms instead.',
+            )
+
+        legend_order: List[str]
+        home_label_value = None
+
+        home_label_value = bins_ordered[home_idx] if bins_ordered else None
+
+        if manual_mode:
+            top_terms = manual_terms
+            legend_order = manual_terms
+        elif use_global:
+            if 'frequency' in df.columns:
+                try:
+                    freq_series = df.groupby('collocate_term')['frequency'].sum(min_count=1)
+                except TypeError:
+                    freq_series = df.groupby('collocate_term')['frequency'].sum()
+            else:
+                freq_series = None
+            if freq_series is None or freq_series.empty:
+                freq_series = df.groupby('collocate_term').size()
+            if freq_series.empty:
+                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+                return
+            summary = freq_series.reset_index()
+            if summary.shape[1] >= 2:
+                summary.columns = ['collocate_term', 'total_frequency'] + list(summary.columns[2:])
+            else:
+                summary.columns = ['collocate_term', 'total_frequency']
+            summary['term_key'] = summary['collocate_term'].astype(str).str.lower()
+            summary = summary.sort_values(['total_frequency', 'term_key'], ascending=[False, True])
+            top_terms = summary.head(top_n)['collocate_term'].tolist()
+            if not top_terms:
+                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+                return
+            legend_order = top_terms
         else:
-            home_idx = settings['home_bin_index']
-            home_idx = max(0, min(home_idx, len(bins_ordered) - 1))
-            home_label = bins_ordered[home_idx]
-            df_home = df[df['time_bin'] == home_label].dropna(subset=['ordinal_rank'])
+            df_home = df[df['time_bin'] == home_label_value].dropna(subset=['ordinal_rank'])
             if df_home.empty:
                 QMessageBox.information(self, 'No Data', 'The selected bin contains no collocates.')
                 return
-            df_home_sorted = df_home.sort_values('ordinal_rank')
-            top_terms = df_home_sorted.head(top_n)['collocate_term'].tolist()
+            if 'frequency' in df_home.columns:
+                freq_home = df_home.groupby('collocate_term')['frequency'].sum()
+            else:
+                freq_home = df_home.groupby('collocate_term').size()
+            freq_home = freq_home.sort_values(ascending=False)
+            top_terms = freq_home.head(top_n).index.tolist()
+            if not top_terms:
+                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+                return
+            legend_order = top_terms
 
-        if not top_terms:
-            QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+        if manual_mode and not top_terms:
+            QMessageBox.information(self, 'No Data', 'None of the selected terms are available for the current filters.')
             return
 
         df_top = df[df['collocate_term'].isin(top_terms)].copy()
@@ -2957,17 +5442,65 @@ class CollocationDialog(QDialog):
             return
 
         if use_global:
-            if averages is None:
-                averages = df_top.groupby('collocate_term')['ordinal_rank'].mean().dropna()
-            ordered_series = averages.reindex(top_terms).dropna().sort_values()
-            legend_order = ordered_series.index.tolist()
-            if not legend_order:
-                legend_order = top_terms
+            home_label_display = 'All time (global)'
         else:
-            legend_order = top_terms
+            try:
+                home_label_display = str(home_label_value)
+            except Exception:
+                home_label_display = 'Selected bin'
 
-        fig = plot_rank_changes(df_top, legend_order=legend_order, show_term_labels=show_labels)
+        city_display = city_text if city else 'All Cities'
+        state_display = state_text if state else 'All States'
+        start_display = start_value or 'All dates'
+        end_display = end_value or 'All dates'
+        if self.ignore_bin.isChecked():
+            time_unit_display = 'Time Bin: none'
+        else:
+            bin_size = self.bin_size.text().strip() or '1'
+            unit_text = self.bin_unit.currentText().strip() or 'unit'
+            time_unit_display = f"Time Bin: {bin_size} {unit_text}".strip()
+        settings_text = self._build_rank_chart_summary(
+            term_count=len(top_terms),
+            home_label=home_label_display,
+            city_label=city_display,
+            state_label=state_display,
+            start_label=start_display,
+            end_label=end_display,
+            time_unit=time_unit_display,
+            keyword=term,
+        )
+
+        try:
+            plot_rank_changes = _import_plot_rank_changes()
+            fig = plot_rank_changes(
+                df_top,
+                legend_order=legend_order,
+                show_term_labels=show_labels,
+                settings_text=settings_text,
+                use_log_scale=log_scale,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, 'Plot Error', str(exc))
+            return
         fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
+
+    def _build_rank_chart_summary(
+        self,
+        *,
+        term_count: int,
+        home_label: str,
+        city_label: str,
+        state_label: str,
+        start_label: str,
+        end_label: str,
+        time_unit: str,
+        keyword: str,
+    ) -> str:
+        keyword_display = keyword or '(none)'
+        line1 = f"Terms plotted: {term_count} | Home bin: {home_label} | Keyword: {keyword_display}"
+        line2 = f"City filter: {city_label} | State filter: {state_label}"
+        line3 = f"Dates: {start_label} – {end_label} | {time_unit or 'Time Bin: n/a'}"
+        return '\n'.join([line1, line2, line3])
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

@@ -74,7 +74,7 @@ VS Code Instructions for first-time use
      *Tip: start small - either use a less common term/phrase or a small date range*
 2. Select "Run Download" *if using the parquet files, the tool runs locally and is not downloading new data*
 3. Watch as the tool identifies and extracts all articles containing the search term within the date range.
-4. The tool creates a JSON file in `data/raw/[search term]_[start date]-[end date].json`
+4. The tool creates a JSON file in `data/processed/[search term]/[search term]_[start date]_[end date].json`
 
 ## Add Geographic Info
 1. 

@@ -12,15 +12,39 @@ Legacy HuggingFace downloader is exposed as download_data_hf for optional use.
 __version__ = "0.2.0"
 
 from .config import init_project
-from .merge import merge_geojson
-from .fetch_metadata import fetch_missing_metadata
-from .collocate import run_collocation, build_collocation_output_paths
-from .visualize import plot_bar, plot_rank_changes
-
-# Local (DuckDB) is the default
 from .duckdb_io import download_data  # noqa: F401
 
-# Legacy remote downloader (lazy import so 'datasets' isn't required unless used)
+
+def merge_geojson(*args, **kwargs):
+    from .merge import merge_geojson as _merge_geojson
+    return _merge_geojson(*args, **kwargs)
+
+
+def fetch_missing_metadata(*args, **kwargs):
+    from .fetch_metadata import fetch_missing_metadata as _fetch
+    return _fetch(*args, **kwargs)
+
+
+def run_collocation(*args, **kwargs):
+    from .collocate import run_collocation as _run
+    return _run(*args, **kwargs)
+
+
+def build_collocation_output_paths(*args, **kwargs):
+    from .collocate import build_collocation_output_paths as _build_paths
+    return _build_paths(*args, **kwargs)
+
+
+def plot_bar(*args, **kwargs):
+    from .visualize import plot_bar as _plot_bar
+    return _plot_bar(*args, **kwargs)
+
+
+def plot_rank_changes(*args, **kwargs):
+    from .visualize import plot_rank_changes as _plot_rank_changes
+    return _plot_rank_changes(*args, **kwargs)
+
+
 def download_data_hf(*args, **kwargs):
     from .download import download_data as _hf_download
     return _hf_download(*args, **kwargs)

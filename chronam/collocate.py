@@ -16,8 +16,10 @@ Key features implemented here:
 import os
 import json
 import hashlib
+import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Any, Set
 
 import pandas as pd
 import numpy as np
@@ -25,6 +27,7 @@ import re
 from collections import Counter, defaultdict
 
 from .config import init_project  # type: ignore
+from .utils import term_directory_name, write_metadata_file
 
 
 # A robust built-in English stopword list (no external deps)
@@ -58,7 +61,12 @@ class CollocationOptions:
     include_cooccurrence_rate: bool = False
     include_relative_position: bool = False
     drop_stopwords: bool = False
-    window: int = 5  # window on each side
+    window_left: int = 5
+    window_right: int = 5
+
+    @property
+    def window(self) -> int:
+        return max(self.window_left, self.window_right)
 
 
 def _tokenize(text: str) -> List[str]:
@@ -199,6 +207,8 @@ def _collocate_from_df(df: pd.DataFrame, term: str, opts: CollocationOptions
     # Prepare by-time nested counters
     by_time_counts: Dict[str, Counter] = defaultdict(Counter)
 
+    track_pages = opts.include_page_count
+
     for _, row in df.iterrows():
         text = row.get("article", "")
         if not isinstance(text, str) or not text.strip():
@@ -213,27 +223,43 @@ def _collocate_from_df(df: pd.DataFrame, term: str, opts: CollocationOptions
             continue
         total_articles += 1
         aid = row.get("article_id") or row.get("filename") or f"row{_}"
-        page = row.get("page")
+        page = row.get("page") if track_pages else None
+        lccn_val = (row.get("lccn") or row.get("SN")) if track_pages else None
         dt = row.get("date")
         pd_dt = pd.to_datetime(dt, errors="coerce")
+        date_key = (
+            pd_dt.date().isoformat() if (track_pages and pd.notna(pd_dt)) else (str(dt).strip() if (track_pages and dt) else "")
+        )
 
         for st in starts:
-            left = max(0, st - opts.window)
-            right = min(len(tokens), st + len(term_tokens) + opts.window)
-            # collocates exclude the term tokens themselves
-            neighbors = tokens[left:st] + tokens[st+len(term_tokens):right]
+            left_idx = max(0, st - max(0, int(opts.window_left)))
+            right_idx = min(len(tokens), st + len(term_tokens) + max(0, int(opts.window_right)))
+            left_segment = tokens[left_idx:st]
+            right_segment = tokens[st+len(term_tokens):right_idx]
+            neighbors = left_segment + right_segment
+            left_len = len(left_segment)
             for j, tok in enumerate(neighbors):
                 if not tok or tok == "" or tok.isdigit():
                     continue
                 per_collocate_count[tok] += 1
                 per_collocate_article_ids[tok].add(aid)
-                if page:
-                    per_collocate_pages[tok].add(str(page))
+                if track_pages:
+                    page_key: Optional[Tuple[str, str, str]] = None
+                    if page or lccn_val or date_key:
+                        page_key = (
+                            str(lccn_val or ""),
+                            date_key,
+                            str(page or ""),
+                        )
+                    elif aid:
+                        page_key = ("", "", f"article:{aid}")
+                    if page_key is not None:
+                        per_collocate_pages[tok].add(page_key)
                 if pd.notna(pd_dt):
                     per_collocate_dates[tok].append(pd_dt)
                 if opts.include_relative_position:
                     # relative position from the first token of the phrase; negative => before
-                    rel = j - len(tokens[left:st])
+                    rel = j - left_len
                     per_collocate_rel_positions[tok].append(rel)
 
             # by-time counting will be assigned after this loop when we know bins
@@ -316,9 +342,11 @@ def _build_by_time(df: pd.DataFrame, term: str, opts: CollocationOptions,
                 continue
             for st in starts:
                 L = len(term_tokens)
-                left = max(0, st - opts.window)
-                right = min(len(toks), st + L + opts.window)
-                neighbors = toks[left:st] + toks[st+L:right]
+                left_idx = max(0, st - max(0, int(opts.window_left)))
+                right_idx = min(len(toks), st + L + max(0, int(opts.window_right)))
+                left_segment = toks[left_idx:st]
+                right_segment = toks[st+L:right_idx]
+                neighbors = left_segment + right_segment
                 for tok in neighbors:
                     if not tok or tok == "" or tok.isdigit():
                         continue
@@ -387,6 +415,221 @@ def _drop_suffix(drop_terms: Optional[List[str]]) -> str:
     return "_drop" if cleaned else "_nodrop"
 
 
+def _normalize_term_groups(term_groups: Optional[List[dict]]) -> List[dict]:
+    if not term_groups:
+        return []
+    normalized: List[dict] = []
+    for entry in term_groups:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get('name', '')).strip()
+        raw_terms = entry.get('terms') or []
+        terms: List[str] = []
+        seen_terms: Set[str] = set()
+        for term in raw_terms:
+            term_str = str(term).strip()
+            if not term_str:
+                continue
+            lowered = term_str.lower()
+            if lowered in seen_terms:
+                continue
+            seen_terms.add(lowered)
+            terms.append(term_str)
+        if not name or not terms:
+            continue
+        normalized.append({
+            'name': name,
+            'terms': terms,
+            'terms_lower': [t.lower() for t in terms],
+        })
+    return normalized
+
+
+def _group_signature(groups: List[dict]) -> str:
+    if not groups:
+        return ''
+    payload = [
+        {
+            'name': group['name'],
+            'terms': sorted(group.get('terms_lower', [])),
+        }
+        for group in groups
+        if group.get('terms_lower')
+    ]
+    if not payload:
+        return ''
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()[:6]
+    return f"_group_{digest}"
+
+
+def _suffix_with_groups(drop_terms: Optional[List[str]], groups: List[dict]) -> str:
+    suffix = _drop_suffix(drop_terms)
+    signature = _group_signature(groups)
+    return f"{suffix}{signature}" if signature else suffix
+
+
+def _as_int_if_close(value: Optional[float]) -> Optional[Any]:
+    if value is None:
+        return None
+    if isinstance(value, (int,)):
+        return value
+    try:
+        float_val = float(value)
+    except (TypeError, ValueError):
+        return value
+    if math.isfinite(float_val) and abs(float_val - round(float_val)) < 1e-9:
+        return int(round(float_val))
+    return float_val
+
+
+def _aggregate_metric_subset(subset: pd.DataFrame, group_name: str, columns: List[str]) -> Dict[str, Any]:
+    aggregated: Dict[str, Any] = {}
+    freq_total = None
+    if 'frequency' in subset.columns:
+        freq_total = pd.to_numeric(subset['frequency'], errors='coerce').fillna(0).sum()
+    article_total = None
+    if 'article_count' in subset.columns:
+        article_total = pd.to_numeric(subset['article_count'], errors='coerce').fillna(0).sum()
+    co_rate = None
+    if 'cooccurrence_rate' in subset.columns and article_total not in (None, 0):
+        denom_candidates = []
+        for _, row in subset[['article_count', 'cooccurrence_rate']].dropna().iterrows():
+            rate = row.get('cooccurrence_rate')
+            count_val = row.get('article_count')
+            if not rate:
+                continue
+            try:
+                denom = float(count_val) / float(rate)
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+            if math.isfinite(denom):
+                denom_candidates.append(denom)
+        total_articles = float(sum(denom_candidates) / len(denom_candidates)) if denom_candidates else None
+        if total_articles:
+            co_rate = article_total / total_articles if total_articles else None
+    weighted_position = None
+    if 'mean_relative_position' in subset.columns and 'frequency' in subset.columns:
+        valid = subset[['mean_relative_position', 'frequency']].dropna()
+        if not valid.empty:
+            weights = pd.to_numeric(valid['frequency'], errors='coerce').fillna(0)
+            weight_sum = float(weights.sum())
+            if weight_sum > 0:
+                weighted_vals = pd.to_numeric(valid['mean_relative_position'], errors='coerce').fillna(0)
+                weighted_position = float((weighted_vals * weights).sum() / weight_sum)
+    for col in columns:
+        if col == 'collocate_term':
+            aggregated[col] = group_name
+        elif col == 'frequency' and freq_total is not None:
+            aggregated[col] = _as_int_if_close(freq_total)
+        elif col == 'article_count' and article_total is not None:
+            aggregated[col] = _as_int_if_close(article_total)
+        elif col == 'page_count' and col in subset.columns:
+            total_pages = pd.to_numeric(subset['page_count'], errors='coerce').fillna(0).sum()
+            aggregated[col] = _as_int_if_close(total_pages)
+        elif col == 'cooccurrence_rate' and co_rate is not None:
+            aggregated[col] = float(co_rate)
+        elif col == 'mean_relative_position' and weighted_position is not None:
+            aggregated[col] = weighted_position
+        elif col == 'first_date' and col in subset.columns:
+            aggregated[col] = subset['first_date'].dropna().min()
+        elif col == 'last_date' and col in subset.columns:
+            aggregated[col] = subset['last_date'].dropna().max()
+        elif col in subset.columns and pd.api.types.is_numeric_dtype(subset[col]):
+            total_val = pd.to_numeric(subset[col], errors='coerce').fillna(0).sum()
+            aggregated[col] = _as_int_if_close(total_val)
+        elif col in subset.columns:
+            non_null = subset[col].dropna()
+            aggregated[col] = non_null.iloc[0] if not non_null.empty else None
+        else:
+            aggregated[col] = None
+    return aggregated
+
+
+def _apply_term_groups_to_metrics(metrics: pd.DataFrame, groups: List[dict]) -> pd.DataFrame:
+    if metrics.empty or not groups:
+        return metrics
+    working = metrics.copy()
+    norm_col = '__group_norm__'
+    working[norm_col] = working['collocate_term'].astype(str).str.lower()
+    columns = [col for col in working.columns if col != norm_col]
+    rows_to_drop: Set[int] = set()
+    new_rows: List[Dict[str, Any]] = []
+    assigned_terms: Set[str] = set()
+    for group in groups:
+        terms_lower = [t for t in group.get('terms_lower', []) if t not in assigned_terms]
+        if not terms_lower:
+            continue
+        subset_mask = working[norm_col].isin(terms_lower)
+        subset = working[subset_mask]
+        if subset.empty:
+            continue
+        assigned_terms.update(terms_lower)
+        rows_to_drop.update(subset.index.tolist())
+        subset_no_norm = subset.drop(columns=[norm_col], errors='ignore')
+        new_rows.append(_aggregate_metric_subset(subset_no_norm, group['name'], columns))
+    if rows_to_drop:
+        working = working.drop(index=list(rows_to_drop))
+    working = working.drop(columns=[norm_col], errors='ignore')
+    if new_rows:
+        working = pd.concat([working, pd.DataFrame(new_rows)], ignore_index=True, sort=False)
+    if 'frequency' in working.columns:
+        working = working.sort_values(['frequency', 'collocate_term'], ascending=[False, True]).reset_index(drop=True)
+    else:
+        working = working.sort_values(['collocate_term']).reset_index(drop=True)
+    return working
+
+
+def _recalculate_ordinal_ranks(by_time: pd.DataFrame) -> pd.DataFrame:
+    if by_time.empty:
+        if 'ordinal_rank' not in by_time.columns:
+            by_time = by_time.copy()
+            by_time['ordinal_rank'] = pd.Series(dtype=int)
+        return by_time
+    working = by_time.copy()
+    working = working.drop(columns=['ordinal_rank'], errors='ignore')
+    frames: List[pd.DataFrame] = []
+    for time_bin, segment in working.groupby('time_bin', sort=False):
+        ordered = segment.sort_values(['frequency', 'collocate_term'], ascending=[False, True]).reset_index(drop=True)
+        ordered['ordinal_rank'] = range(1, len(ordered) + 1)
+        frames.append(ordered)
+    return pd.concat(frames, ignore_index=True) if frames else working
+
+
+def _apply_term_groups_to_by_time(by_time: pd.DataFrame, groups: List[dict]) -> pd.DataFrame:
+    if by_time.empty or not groups:
+        return by_time
+    working = by_time.copy()
+    norm_col = '__group_norm__'
+    working[norm_col] = working['collocate_term'].astype(str).str.lower()
+    rows_to_drop: Set[int] = set()
+    additions: List[Dict[str, Any]] = []
+    assigned_terms: Set[str] = set()
+    for group in groups:
+        terms_lower = [t for t in group.get('terms_lower', []) if t not in assigned_terms]
+        if not terms_lower:
+            continue
+        subset = working[working[norm_col].isin(terms_lower)]
+        if subset.empty:
+            continue
+        assigned_terms.update(terms_lower)
+        rows_to_drop.update(subset.index.tolist())
+        grouped = subset.groupby('time_bin', as_index=False)['frequency'].sum()
+        for _, row in grouped.iterrows():
+            additions.append({
+                'time_bin': row['time_bin'],
+                'collocate_term': group['name'],
+                'frequency': row['frequency'],
+            })
+    if rows_to_drop:
+        working = working.drop(index=list(rows_to_drop))
+    working = working.drop(columns=[norm_col], errors='ignore')
+    if additions:
+        working = pd.concat([working, pd.DataFrame(additions)], ignore_index=True, sort=False)
+    if 'ordinal_rank' in working.columns or additions:
+        working = _recalculate_ordinal_ranks(working)
+    return working
+
+
 def _build_output_paths(
     processed_dir: str,
     term: str,
@@ -396,14 +639,15 @@ def _build_output_paths(
     state: Optional[str],
     time_bin_unit: Optional[str],
     ignore_bin: bool,
-    options: Dict[str, bool],
+    options: Dict[str, Any],
     filename_suffix: str,
 ) -> Dict[str, Optional[str]]:
     stem = _build_output_stem(term, start_date, end_date, city, state, time_bin_unit, ignore_bin, options)
     stem_with_suffix = f"{stem}{filename_suffix}" if filename_suffix else stem
-    metrics = os.path.join(processed_dir, f"collocates_metrics_{stem_with_suffix}.csv")
-    by_time = None if ignore_bin or not time_bin_unit else os.path.join(processed_dir, f"collocates_by_time_{stem_with_suffix}.csv")
-    occurrences = os.path.join(processed_dir, f"occurrences_{stem_with_suffix}.geojson")
+    term_dir = os.path.join(processed_dir, term_directory_name(term))
+    metrics = os.path.join(term_dir, f"collocates_metrics_{stem_with_suffix}.csv")
+    by_time = None if ignore_bin or not time_bin_unit else os.path.join(term_dir, f"collocates_by_time_{stem_with_suffix}.csv")
+    occurrences = os.path.join(term_dir, f"occurrences_{stem_with_suffix}.geojson")
     return {
         "stem": stem_with_suffix,
         "metrics": metrics,
@@ -422,11 +666,14 @@ def build_collocation_output_paths(
     state: Optional[str],
     time_bin_unit: Optional[str],
     ignore_bin: bool,
-    options: Dict[str, bool],
+    options: Dict[str, Any],
     drop_terms: Optional[List[str]] = None,
+    term_groups: Optional[List[dict]] = None,
+    metadata_enabled: bool = True,
 ) -> Dict[str, Optional[str]]:
     processed = init_project(project_dir)["processed"]
-    suffix = _drop_suffix(drop_terms)
+    normalized_groups = _normalize_term_groups(term_groups)
+    suffix = _suffix_with_groups(drop_terms, normalized_groups)
     return _build_output_paths(processed, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, options, suffix)
 
 
@@ -445,18 +692,26 @@ def run_collocation(
     include_cooccurrence_rate: bool = False,
     include_relative_position: bool = False,
     drop_stopwords: bool = False,
+    window_left: int = 5,
+    window_right: int = 5,
     write_occurrences_geojson: bool = False,
     ignore_bin: bool = False,
     write_by_time: bool = True,
     drop_terms: Optional[List[str]] = None,
+    term_groups: Optional[List[dict]] = None,
+    metadata_enabled: bool = True,
+    write_metrics: bool = True,
 ) -> Dict[str, Optional[str]]:
     """
-    Execute collocation analysis. Writes outputs into data/processed.
+    Execute collocation analysis. Writes outputs into data/processed/<term>/.
 
     Returns path to occurrences GeoJSON if write_occurrences_geojson is True, else None.
     """
     if not json_path and not geojson_path:
         raise ValueError("Provide either json_path or geojson_path")
+
+    window_left = int(max(0, min(99, window_left)))
+    window_right = int(max(0, min(99, window_right)))
 
     opts = CollocationOptions(
         include_page_count=include_page_count,
@@ -464,6 +719,8 @@ def run_collocation(
         include_cooccurrence_rate=include_cooccurrence_rate,
         include_relative_position=include_relative_position,
         drop_stopwords=drop_stopwords,
+        window_left=window_left,
+        window_right=window_right,
     )
     opt_dict = {
         "include_page_count": include_page_count,
@@ -471,6 +728,8 @@ def run_collocation(
         "include_cooccurrence_rate": include_cooccurrence_rate,
         "include_relative_position": include_relative_position,
         "drop_stopwords": drop_stopwords,
+        "window_left": window_left,
+        "window_right": window_right,
     }
 
     paths = init_project(project_dir)
@@ -501,18 +760,81 @@ def run_collocation(
 
     drop_terms = drop_terms or []
     drop_set = {str(t).strip() for t in drop_terms if str(t).strip()}
-    suffix = _drop_suffix(list(drop_set))
+    normalized_groups = _normalize_term_groups(term_groups)
+    suffix = _suffix_with_groups(drop_terms, normalized_groups)
+
+    metadata_paths: Dict[str, str] = {}
+    metadata_common = {
+        'tool': 'collocation_analysis',
+        'parameters': {
+            'city': city,
+            'state': state,
+            'start_date': start_date,
+            'end_date': end_date,
+            'term': term,
+            'time_bin_unit': None if ignore_bin else time_bin_unit,
+            'ignore_bin': bool(ignore_bin),
+            'options': opt_dict,
+            'drop_terms': sorted(drop_set),
+            'term_groups': [
+                {'name': group['name'], 'terms': list(group['terms'])}
+                for group in normalized_groups
+            ],
+            'write_occurrences_geojson': bool(write_occurrences_geojson),
+        },
+        'inputs': {
+            'json_path': json_path,
+            'geojson_path': geojson_path,
+        },
+    }
+
+    metrics_path: Optional[str] = None
+    by_time_path: Optional[str] = None
 
     if df.empty:
         # Still write empty CSVs to keep UI predictable
-        empty_paths = _build_output_paths(proc, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, opt_dict, suffix)
-        pd.DataFrame(columns=["collocate_term","frequency"]).to_csv(empty_paths["metrics"], index=False)
-        if write_by_time and empty_paths["by_time"]:
-            pd.DataFrame(columns=["time_bin","collocate_term","frequency","ordinal_rank"]).to_csv(empty_paths["by_time"], index=False)
+        empty_paths = _build_output_paths(
+            proc,
+            term,
+            start_date,
+            end_date,
+            city,
+            state,
+            time_bin_unit,
+            ignore_bin,
+            opt_dict,
+            suffix,
+        )
+        metrics_dir = os.path.dirname(empty_paths.get("metrics") or proc)
+        if metrics_dir:
+            os.makedirs(metrics_dir, exist_ok=True)
+        if write_metrics and empty_paths.get("metrics"):
+            pd.DataFrame(columns=["collocate_term", "frequency"]).to_csv(empty_paths["metrics"], index=False)
+            metrics_meta = dict(metadata_common)
+            metrics_meta.update({
+                'output_type': 'metrics_csv',
+                'row_count': 0,
+            })
+            meta_path = write_metadata_file(project_dir, empty_paths["metrics"], metrics_meta, enabled=metadata_enabled)
+            if meta_path:
+                metadata_paths['metrics'] = meta_path
+            metrics_path = empty_paths["metrics"]
+        if write_by_time and empty_paths.get("by_time"):
+            pd.DataFrame(columns=["time_bin", "collocate_term", "frequency", "ordinal_rank"]).to_csv(empty_paths["by_time"], index=False)
+            by_time_meta = dict(metadata_common)
+            by_time_meta.update({
+                'output_type': 'by_time_csv',
+                'row_count': 0,
+            })
+            meta_path = write_metadata_file(project_dir, empty_paths["by_time"], by_time_meta, enabled=metadata_enabled)
+            if meta_path:
+                metadata_paths['by_time'] = meta_path
+            by_time_path = empty_paths["by_time"]
         return {
-            "metrics": empty_paths["metrics"],
-            "by_time": empty_paths["by_time"] if write_by_time else None,
+            "metrics": metrics_path,
+            "by_time": by_time_path,
             "occurrences": None,
+            "metadata": metadata_paths,
         }
 
     # Build metrics (without time dimension)
@@ -521,9 +843,24 @@ def run_collocation(
     if drop_set:
         metrics = metrics[~metrics['collocate_term'].isin(drop_set)].reset_index(drop=True)
 
+    metrics = _apply_term_groups_to_metrics(metrics, normalized_groups)
+
     # Write metrics CSV
     output_paths = _build_output_paths(proc, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, opt_dict, suffix)
-    metrics.to_csv(output_paths["metrics"], index=False)
+    metrics_dir = os.path.dirname(output_paths.get("metrics") or proc)
+    if metrics_dir:
+        os.makedirs(metrics_dir, exist_ok=True)
+    if write_metrics and output_paths.get("metrics"):
+        metrics.to_csv(output_paths["metrics"], index=False)
+        metrics_meta = dict(metadata_common)
+        metrics_meta.update({
+            'output_type': 'metrics_csv',
+            'row_count': int(len(metrics)),
+        })
+        meta_path = write_metadata_file(project_dir, output_paths["metrics"], metrics_meta, enabled=metadata_enabled)
+        if meta_path:
+            metadata_paths['metrics'] = meta_path
+        metrics_path = output_paths["metrics"]
 
     # Build by-time CSV if requested
     if write_by_time and output_paths["by_time"] and time_bin_unit and isinstance(time_bin_unit, str):
@@ -537,7 +874,17 @@ def run_collocation(
         by_time = _build_by_time(df, term, opts, start_date, end_date, size, unit)
         if drop_set:
             by_time = by_time[~by_time['collocate_term'].isin(drop_set)].reset_index(drop=True)
+        by_time = _apply_term_groups_to_by_time(by_time, normalized_groups)
         by_time.to_csv(output_paths["by_time"], index=False)
+        by_time_meta = dict(metadata_common)
+        by_time_meta.update({
+            'output_type': 'by_time_csv',
+            'row_count': int(len(by_time)),
+        })
+        meta_path = write_metadata_file(project_dir, output_paths["by_time"], by_time_meta, enabled=metadata_enabled)
+        if meta_path:
+            metadata_paths['by_time'] = meta_path
+        by_time_path = output_paths["by_time"]
 
     # Optionally write occurrences geojson (filtered subset)
     occurrence_path = None
@@ -575,12 +922,21 @@ def run_collocation(
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(out, f)
             occurrence_path = out_path
+            occur_meta = dict(metadata_common)
+            occur_meta.update({
+                'output_type': 'occurrences_geojson',
+                'feature_count': len(sel),
+            })
+            meta_path = write_metadata_file(project_dir, occurrence_path, occur_meta, enabled=metadata_enabled)
+            if meta_path:
+                metadata_paths['occurrences'] = meta_path
         except Exception:
             occurrence_path = None
 
     result = {
-        "metrics": output_paths["metrics"],
-        "by_time": output_paths["by_time"] if write_by_time else None,
+        "metrics": metrics_path,
+        "by_time": by_time_path,
         "occurrences": occurrence_path,
+        "metadata": metadata_paths,
     }
     return result
