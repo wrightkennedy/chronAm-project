@@ -1961,7 +1961,7 @@ class CollocateMapSettingsDialog(QDialog):
         form = QFormLayout()
 
         self.map_type_combo = QComboBox()
-        self.map_type_combo.addItem('Rank Map by Term', 'rank')
+        self.map_type_combo.addItem('Select Term Rank Map', 'rank')
         self.map_type_combo.addItem('Top Ranked Term by Location', 'top_term')
         form.addRow('Map type:', self.map_type_combo)
 
@@ -1987,9 +1987,9 @@ class CollocateMapSettingsDialog(QDialog):
         self.colorize_check.setChecked(True)
         form.addRow(self.colorize_check)
 
-        self.export_geojson_check = QCheckBox('Export collocate GeoJSON summary')
-        self.export_geojson_check.setToolTip('Writes a GeoJSON file with per-location collocate data for inspection.')
-        form.addRow(self.export_geojson_check)
+        self.export_csv_check = QCheckBox('Export collocate CSV with XY')
+        self.export_csv_check.setToolTip('Writes a CSV summarizing collocates with coordinates for further analysis.')
+        form.addRow(self.export_csv_check)
 
         time_row = QWidget()
         time_layout = QHBoxLayout(time_row)
@@ -2133,9 +2133,12 @@ class CollocateMapSettingsDialog(QDialog):
             self.use_selected_terms_check.setChecked(False)
             self.use_selected_terms_check.setEnabled(False)
             self.use_selected_terms_check.hide()
+            self.colorize_check.setChecked(False)
+            self.colorize_check.setEnabled(False)
         else:
             self.use_selected_terms_check.setEnabled(bool(self._selected_terms))
             self.use_selected_terms_check.show()
+            self.colorize_check.setEnabled(True)
         self._update_selected_terms_summary()
         self._apply_top_spin_enabled()
 
@@ -2182,7 +2185,7 @@ class CollocateMapSettingsDialog(QDialog):
             'location_label': location_label,
             'enable_time_slider': self.enable_time_slider.isEnabled() and self.enable_time_slider.isChecked(),
             'use_selected_terms': self.use_selected_terms_check.isChecked(),
-            'export_geojson': self.export_geojson_check.isChecked(),
+            'export_csv': self.export_csv_check.isChecked(),
         }
 
 
@@ -3695,7 +3698,7 @@ class CollocationDialog(QDialog):
                 settings_dialog.map_type_combo.setCurrentIndex(idx)
             settings_dialog._apply_map_type_constraints()
             settings_dialog.colorize_check.setChecked(bool(prev.get('colorize')))
-            settings_dialog.export_geojson_check.setChecked(bool(prev.get('export_geojson')))
+            settings_dialog.export_csv_check.setChecked(bool(prev.get('export_csv')))
             if prev.get('term_scope') == 'time' and settings_dialog.time_combo.count() > 0:
                 desired = prev.get('time_key')
                 if desired is not None:
@@ -3776,9 +3779,9 @@ class CollocationDialog(QDialog):
         self._collocate_map_settings['use_selected_terms'] = use_selected_terms
         map_settings['map_type'] = map_type
         self._collocate_map_settings['map_type'] = map_type
-        export_geojson = bool(map_settings.get('export_geojson'))
-        map_settings['export_geojson'] = export_geojson
-        self._collocate_map_settings['export_geojson'] = export_geojson
+        export_csv = bool(map_settings.get('export_csv'))
+        map_settings['export_csv'] = export_csv
+        self._collocate_map_settings['export_csv'] = export_csv
         term_scope = map_settings.get('term_scope', 'global')
         time_key = map_settings.get('time_key') or None
         time_label = map_settings.get('time_label') or ''
@@ -3822,7 +3825,7 @@ class CollocationDialog(QDialog):
                 project_dir=parent.project_folder if parent else None,
                 time_start_override=start_value or None,
                 time_end_override=end_value or None,
-                collocate_export_geojson=export_geojson,
+                collocate_export_csv=export_csv,
             )
         except Exception as exc:
             QMessageBox.critical(self, 'Map Error', str(exc))
@@ -3835,13 +3838,13 @@ class CollocationDialog(QDialog):
             log_lines = [
                 f'<div>Created map: <a href="chronam-open:{encoded}">{html.escape(map_path)}</a></div>'
             ]
-            map_type_display = 'Top Ranked Term by Location' if map_type == 'top_term' else 'Rank Map by Term'
+            map_type_display = 'Top Ranked Term by Location' if map_type == 'top_term' else 'Select Term Rank Map'
             log_lines.append(f'<div>Map type: {html.escape(map_type_display)}</div>')
-            geo_export_path = (result or {}).get('collocate_geojson')
-            if geo_export_path:
-                encoded_geo = urllib.parse.quote(geo_export_path)
+            csv_export_path = (result or {}).get('collocate_csv')
+            if csv_export_path:
+                encoded_csv = urllib.parse.quote(csv_export_path)
                 log_lines.append(
-                    f'<div>Collocate GeoJSON: <a href="chronam-open:{encoded_geo}">{html.escape(geo_export_path)}</a></div>'
+                    f'<div>Collocate CSV: <a href="chronam-open:{encoded_csv}">{html.escape(csv_export_path)}</a></div>'
                 )
             if parent and hasattr(parent, 'append_project_log'):
                 parent.append_project_log('Collocate‑Rank Map', log_lines)

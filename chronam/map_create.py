@@ -3,7 +3,7 @@ import json
 import os
 import re
 import uuid
-import copy
+import csv
 from collections import Counter, defaultdict
 from string import Template as StrTemplate
 
@@ -372,31 +372,55 @@ def _build_collocate_rank_index(
 
 
 # ----------------------------
-# Helpers: serialization/export
+# Helpers: dates and formatting
 # ----------------------------
 
-def _json_safe(value: Any):
-    if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_json_safe(v) for v in value]
-    if isinstance(value, set):
-        return [_json_safe(v) for v in value]
-    if isinstance(value, tuple):
-        return [_json_safe(v) for v in value]
-    if isinstance(value, datetime):
-        return value.isoformat()
-    return value
+
+def _format_date(dt: Optional[datetime]) -> str:
+    if not dt:
+        return ''
+    return dt.strftime('%Y-%m-%d')
 
 
-def _export_collocate_geojson(
+def _export_collocate_csv(
     out_path: str,
+    *,
+    groups: List[Dict[str, Any]],
     popup_dataset: Dict[str, Any],
     summary: Dict[str, Any],
-    config_payload: Dict[str, Any],
+    collocate_map_variant: str,
+    rank_index: Dict[str, Dict[str, Dict[str, int]]],
+    collocate_hits_by_city: Dict[str, Dict[str, Set[int]]],
+    collocate_terms_list: List[str],
+    time_index: List[datetime],
+    range_start: Optional[datetime],
+    range_end: Optional[datetime],
+    collocate_rank_term_scope: str,
+    collocate_rank_time_key: Optional[str],
 ) -> Optional[str]:
-    features: List[Dict[str, Any]] = []
-    for group_id, dataset_entry in popup_dataset.items():
+    rows: List[List[str]] = []
+
+    def city_key(city: Any, state: Any) -> str:
+        return f"{str(city or '').strip().lower()}||{str(state or '').strip().lower()}"
+
+    bin_ranges: Dict[str, Tuple[Optional[datetime], Optional[datetime]]] = {}
+    if time_index:
+        for idx, start_dt in enumerate(time_index):
+            end_dt = None
+            if idx + 1 < len(time_index):
+                end_dt = time_index[idx + 1] - timedelta(days=1)
+            else:
+                end_dt = range_end
+            if end_dt and start_dt and end_dt < start_dt:
+                end_dt = start_dt
+            bin_ranges[str(idx + 1)] = (start_dt, end_dt)
+
+    overall_start = summary.get('date_range', ('', ''))[0]
+    overall_end = summary.get('date_range', ('', ''))[1]
+
+    for group in groups:
+        group_id = group.get('id')
+        dataset_entry = popup_dataset.get(group_id) if isinstance(popup_dataset, dict) else None
         if not isinstance(dataset_entry, dict):
             continue
         lat = dataset_entry.get('lat')
@@ -405,41 +429,149 @@ def _export_collocate_geojson(
             lat_f = float(lat)
             lon_f = float(lon)
         except (TypeError, ValueError):
-            continue
-        props = copy.deepcopy(dataset_entry)
-        props.pop('lat', None)
-        props.pop('lon', None)
-        props['group_id'] = group_id
-        feature = {
-            'type': 'Feature',
-            'geometry': {
-                'type': 'Point',
-                'coordinates': [lon_f, lat_f],
-            },
-            'properties': _json_safe(props),
-        }
-        features.append(feature)
+            lat_f = None
+            lon_f = None
+        city_raw = dataset_entry.get('city') or ''
+        state_raw = dataset_entry.get('state') or ''
+        place_label = dataset_entry.get('place_label') or ''
+        city_display = str(city_raw).strip() or str(place_label).strip() or 'Unknown'
+        c_key = city_key(city_raw, state_raw)
+        hits_map = collocate_hits_by_city.get(c_key, {})
 
-    if not features:
+        if collocate_map_variant == 'top_term':
+            time_bins = dataset_entry.get('time_bins') if isinstance(dataset_entry.get('time_bins'), dict) else {}
+            if time_bins:
+                def _bin_sort(item):
+                    key = item[0]
+                    try:
+                        return float(key)
+                    except (TypeError, ValueError):
+                        return key
+                for bin_key, info in sorted(time_bins.items(), key=_bin_sort):
+                    rank_map = (rank_index.get(c_key) or {}).get(bin_key) or {}
+                    if not rank_map:
+                        continue
+                    top_term = None
+                    top_rank = None
+                    for term, rank_val in rank_map.items():
+                        try:
+                            rank_num = int(rank_val)
+                        except (TypeError, ValueError):
+                            continue
+                        if top_rank is None or rank_num < top_rank or (rank_num == top_rank and term < top_term):
+                            top_rank = rank_num
+                            top_term = term
+                    if not top_term:
+                        continue
+                    indexes = info.get('indexes') or []
+                    allowed = set()
+                    for idx in indexes:
+                        try:
+                            allowed.add(int(idx))
+                        except (TypeError, ValueError):
+                            continue
+                    term_hits = set(hits_map.get(top_term, []))
+                    count = len([idx for idx in term_hits if idx in allowed])
+                    start_dt, end_dt = bin_ranges.get(bin_key, (range_start, range_end))
+                    rows.append([
+                        _format_date(start_dt),
+                        _format_date(end_dt),
+                        str(top_term),
+                        str(count),
+                        city_display,
+                        str(lat_f) if lat_f is not None else '',
+                        str(lon_f) if lon_f is not None else '',
+                    ])
+            else:
+                rank_map = (rank_index.get(c_key) or {}).get('') or {}
+                if not rank_map:
+                    continue
+                top_term = None
+                top_rank = None
+                for term, rank_val in rank_map.items():
+                    try:
+                        rank_num = int(rank_val)
+                    except (TypeError, ValueError):
+                        continue
+                    if top_rank is None or rank_num < top_rank or (rank_num == top_rank and term < top_term):
+                        top_rank = rank_num
+                        top_term = term
+                if not top_term:
+                    continue
+                count = len(set(hits_map.get(top_term, [])))
+                rows.append([
+                    overall_start,
+                    overall_end,
+                    str(top_term),
+                    str(count),
+                    city_display,
+                    str(lat_f) if lat_f is not None else '',
+                    str(lon_f) if lon_f is not None else '',
+                ])
+        else:
+            rank_scope = ''
+            time_scope = str(collocate_rank_time_key or '').strip()
+            if collocate_rank_term_scope and str(collocate_rank_term_scope).strip().lower().startswith('time') and time_scope:
+                rank_scope = time_scope
+            rank_map = (rank_index.get(c_key) or {}).get(rank_scope) or {}
+            if not rank_map:
+                continue
+            if not collocate_terms_list:
+                term_iter = sorted(rank_map.items(), key=lambda item: item[1])
+            else:
+                term_iter = [(term, rank_map.get(term)) for term in collocate_terms_list if term in rank_map]
+            allowed = None
+            if rank_scope:
+                dataset_entry_tb = dataset_entry.get('time_bins') if isinstance(dataset_entry.get('time_bins'), dict) else {}
+                info = dataset_entry_tb.get(rank_scope)
+                if info:
+                    allowed = set()
+                    for idx in info.get('indexes', []):
+                        try:
+                            allowed.add(int(idx))
+                        except (TypeError, ValueError):
+                            continue
+                start_dt, end_dt = bin_ranges.get(rank_scope, (range_start, range_end))
+            else:
+                start_dt = range_start
+                end_dt = range_end
+
+            for term, rank_val in term_iter:
+                if rank_val is None:
+                    continue
+                try:
+                    rank_num = int(rank_val)
+                except (TypeError, ValueError):
+                    continue
+                hits = set(hits_map.get(term, []))
+                if allowed is not None:
+                    count = len([idx for idx in hits if idx in allowed])
+                else:
+                    count = len(hits)
+                rows.append([
+                    overall_start if start_dt is None else _format_date(start_dt),
+                    overall_end if end_dt is None else _format_date(end_dt),
+                    str(term),
+                    str(rank_num),
+                    str(count),
+                    city_display,
+                    str(lat_f) if lat_f is not None else '',
+                    str(lon_f) if lon_f is not None else '',
+                ])
+
+    if not rows:
         return None
 
-    payload = {
-        'type': 'FeatureCollection',
-        'features': features,
-        'metadata': _json_safe({
-            'summary': summary,
-            'config': config_payload,
-        }),
-    }
+    headers_top = ['Time Start', 'Time End', 'Top Collocate', 'Article Count', 'City', 'Latitude', 'Longitude']
+    headers_rank = ['Start Date', 'End Date', 'Collocate', 'Collocate Rank', 'Article Count', 'City', 'Latitude', 'Longitude']
+    headers = headers_top if collocate_map_variant == 'top_term' else headers_rank
 
-    with open(out_path, 'w', encoding='utf-8') as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    with open(out_path, 'w', encoding='utf-8', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
     return out_path
-
-
-# ----------------------------
-# Helpers: dates and formatting
-# ----------------------------
 
 def _parse_date(raw: Any) -> Optional[datetime]:
     """Parse a date string from properties['date'] into a datetime (UTC naive)."""
@@ -1406,7 +1538,7 @@ def create_map(
     project_dir: Optional[str] = None,
     time_start_override: Optional[str] = None,
     time_end_override: Optional[str] = None,
-    collocate_export_geojson: bool = False,
+    collocate_export_csv: bool = False,
 ) -> Dict[str, Optional[str]]:
     """
     Create a leaflet map next to the GeoJSON.
@@ -1449,7 +1581,7 @@ def create_map(
       - collocate_map_variant: 'rank' (default) for the ranked-term explorer, or 'top_term' to show each location's top term.
       - time_start_override / time_end_override: optional ISO dates to force the slider/time-bin extent
         to respect user-selected parameters when metadata is missing.
-      - collocate_export_geojson: when True, write a GeoJSON summarizing collocate data per location.
+      - collocate_export_csv: when True, write a CSV summarizing collocate data per location.
 
     Returns:
         dict with 'map_path' and optional 'attribute_table'.
@@ -1546,6 +1678,10 @@ def create_map(
     metadata = data.get('metadata') or data.get('properties') or {}
     start_meta = start_override or metadata.get('start_date') or metadata.get('StartDate')
     end_meta = end_override or metadata.get('end_date') or metadata.get('EndDate')
+    start_dt_meta = _parse_date(start_meta) if start_meta else None
+    end_dt_meta = _parse_date(end_meta) if end_meta else None
+    start_dt_meta = _parse_date(start_meta) if start_meta else None
+    end_dt_meta = _parse_date(end_meta) if end_meta else None
 
     if dates_dt:
         min_dt = min(dates_dt)
@@ -1558,14 +1694,11 @@ def create_map(
     use_time_slider = bool(dated_pts) and time_enabled
     time_index: List[datetime] = []
     time_labels: List[str] = []
+    range_start = start_dt_meta or min_dt
+    range_end = end_dt_meta or max_dt
+    if range_start and range_end and range_start > range_end:
+        range_start, range_end = range_end, range_start
     if (use_time_slider or rank_time_bins) and min_dt and max_dt:
-        # Prefer user-specified project metadata dates when available
-        start_dt_meta = _parse_date(start_meta) if start_meta else None
-        end_dt_meta = _parse_date(end_meta) if end_meta else None
-        range_start = start_dt_meta or min_dt
-        range_end = end_dt_meta or max_dt
-        if range_start and range_end and range_start > range_end:
-            range_start, range_end = range_end, range_start
         time_index = _build_time_index(range_start, range_end, time_unit, max(1, int(time_step or 1)))
         time_labels = [dt.strftime('%Y-%m-%dT%H:%M:%SZ') for dt in time_index]
 
@@ -1904,14 +2037,11 @@ def create_map(
     use_time_slider = bool(dated_pts) and time_enabled
     time_index: List[datetime] = []
     time_labels: List[str] = []
+    range_start = start_dt_meta or min_dt
+    range_end = end_dt_meta or max_dt
+    if range_start and range_end and range_start > range_end:
+        range_start, range_end = range_end, range_start
     if (use_time_slider or rank_time_bins) and min_dt and max_dt:
-        # Prefer user-specified metadata dates when present
-        start_dt_meta = _parse_date(start_meta) if start_meta else None
-        end_dt_meta = _parse_date(end_meta) if end_meta else None
-        range_start = start_dt_meta or min_dt
-        range_end = end_dt_meta or max_dt
-        if range_start and range_end and range_start > range_end:
-            range_start, range_end = range_end, range_start
         time_index = _build_time_index(range_start, range_end, time_unit, max(1, int(time_step or 1)))
         time_labels = [dt.strftime('%Y-%m-%dT%H:%M:%SZ') for dt in time_index]
 
@@ -2462,7 +2592,7 @@ def create_map(
         'collocate_colorize': bool(collocate_rank_colorize),
         'initial_collocate_term': initial_collocate_term,
         'collocate_map_variant': collocate_map_variant,
-        'collocate_export_geojson': bool(collocate_export_geojson),
+        'collocate_export_csv': bool(collocate_export_csv),
     }
 
     # Embed collocate rank index when available
@@ -6452,19 +6582,28 @@ ${cluster_block}
     m.get_root().script.add_child(folium.Element(script_html))
 
     m.save(out_html)
-    collocate_geojson_path: Optional[str] = None
-    if collocate_export_geojson and popup_dataset:
-        geo_filename = f"{base_name}_{suffix}_collocates.geojson"
-        export_path = os.path.join(out_dir, geo_filename)
+    collocate_csv_path: Optional[str] = None
+    if collocate_export_csv and popup_dataset:
+        csv_filename = f"{base_name}_{suffix}_collocates.csv"
+        export_path = os.path.join(out_dir, csv_filename)
         try:
-            collocate_geojson_path = _export_collocate_geojson(
+            collocate_csv_path = _export_collocate_csv(
                 export_path,
-                popup_dataset,
-                summary,
-                config_payload,
+                groups=groups,
+                popup_dataset=popup_dataset,
+                summary=summary,
+                collocate_map_variant=collocate_map_variant,
+                rank_index=rank_index,
+                collocate_hits_by_city=collocate_hits_by_city,
+                collocate_terms_list=collocate_terms_list,
+                time_index=time_index,
+                range_start=range_start,
+                range_end=range_end,
+                collocate_rank_term_scope=collocate_rank_term_scope,
+                collocate_rank_time_key=collocate_rank_time_key,
             )
         except Exception:
-            collocate_geojson_path = None
+            collocate_csv_path = None
 
     metadata_paths: Dict[str, str] = {}
     metadata_common = {
@@ -6499,7 +6638,7 @@ ${cluster_block}
             'collocate_rank_focus_label': collocate_rank_focus_label,
             'collocate_rank_colorize': collocate_rank_colorize,
             'collocate_time_slider': collocate_time_slider_enabled,
-            'collocate_export_geojson': collocate_export_geojson,
+            'collocate_export_csv': collocate_export_csv,
         },
         'inputs': {
             'geojson_path': geojson_path,
@@ -6521,12 +6660,12 @@ ${cluster_block}
         if meta_path:
             metadata_paths['attribute_table'] = meta_path
 
-    if collocate_geojson_path:
-        geo_meta = dict(metadata_common)
-        geo_meta.update({'output_type': 'collocate_geojson'})
-        meta_path = write_metadata_file(project_dir, collocate_geojson_path, geo_meta, enabled=metadata_enabled)
+    if collocate_csv_path:
+        csv_meta = dict(metadata_common)
+        csv_meta.update({'output_type': 'collocate_csv'})
+        meta_path = write_metadata_file(project_dir, collocate_csv_path, csv_meta, enabled=metadata_enabled)
         if meta_path:
-            metadata_paths['collocate_geojson'] = meta_path
+            metadata_paths['collocate_csv'] = meta_path
 
     result: Dict[str, Optional[str]] = {"map_path": out_html, 'summary': summary}
     if attr_file:
@@ -6540,10 +6679,10 @@ ${cluster_block}
         'table_mode': table_mode_norm,
         'table_row_limit': row_limit_val or 0,
         'collocate_time_slider': collocate_time_slider_enabled,
-        'collocate_export_geojson': collocate_export_geojson,
+        'collocate_export_csv': collocate_export_csv,
     }
     if metadata_paths:
         result['metadata'] = metadata_paths
-    if collocate_geojson_path:
-        result['collocate_geojson'] = collocate_geojson_path
+    if collocate_csv_path:
+        result['collocate_csv'] = collocate_csv_path
     return result
