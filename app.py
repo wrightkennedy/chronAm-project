@@ -1845,6 +1845,11 @@ class CollocateMapSettingsDialog(QDialog):
 
         form = QFormLayout()
 
+        self.map_type_combo = QComboBox()
+        self.map_type_combo.addItem('Rank Map by Term', 'rank')
+        self.map_type_combo.addItem('Top Ranked Term by Location', 'top_term')
+        form.addRow('Map type:', self.map_type_combo)
+
         self.top_spin = QSpinBox()
         self.top_spin.setRange(1, max_top_n)
         self.top_spin.setValue(max(1, min(default_top_n, max_top_n)))
@@ -1890,8 +1895,8 @@ class CollocateMapSettingsDialog(QDialog):
         layout.addLayout(form)
 
         self.use_selected_terms_check.toggled.connect(self._apply_top_spin_enabled)
-        self._update_selected_terms_summary()
-        self._apply_top_spin_enabled()
+        self.map_type_combo.currentIndexChanged.connect(lambda *_: self._apply_map_type_constraints())
+        self._apply_map_type_constraints()
 
         scope_box = QGroupBox('Term selection scope')
         scope_layout = QVBoxLayout(scope_box)
@@ -1973,6 +1978,10 @@ class CollocateMapSettingsDialog(QDialog):
         _update_location_controls()
 
     def _update_selected_terms_summary(self):
+        variant = str(self.map_type_combo.currentData() or 'rank').lower()
+        if variant == 'top_term':
+            self.selected_terms_label.setText('Top ranked term map selects the leading collocate term for each location automatically.')
+            return
         count = len(self._selected_terms)
         if count:
             preview = ', '.join(self._selected_terms[:3])
@@ -1985,8 +1994,11 @@ class CollocateMapSettingsDialog(QDialog):
             self.selected_terms_label.setText('No selected terms available; Top N terms will be used.')
 
     def _apply_top_spin_enabled(self):
-        use_selected = self.use_selected_terms_check.isChecked() and bool(self._selected_terms)
+        variant = str(self.map_type_combo.currentData() or 'rank').lower()
+        use_selected = self.use_selected_terms_check.isChecked() and bool(self._selected_terms) and variant != 'top_term'
         self.top_spin.setEnabled(not use_selected)
+        if variant == 'top_term':
+            return
         if self._selected_terms:
             base_text = self.selected_terms_label.text().split(' (', 1)[0]
             base_text = base_text.rstrip('.')
@@ -1994,6 +2006,19 @@ class CollocateMapSettingsDialog(QDialog):
                 self.selected_terms_label.setText(f'{base_text} (overrides Top N).')
             else:
                 self.selected_terms_label.setText(f'{base_text}.')
+
+    def _apply_map_type_constraints(self):
+        variant = str(self.map_type_combo.currentData() or 'rank').lower()
+        top_term_mode = variant == 'top_term'
+        if top_term_mode:
+            self.use_selected_terms_check.setChecked(False)
+            self.use_selected_terms_check.setEnabled(False)
+            self.use_selected_terms_check.hide()
+        else:
+            self.use_selected_terms_check.setEnabled(bool(self._selected_terms))
+            self.use_selected_terms_check.show()
+        self._update_selected_terms_summary()
+        self._apply_top_spin_enabled()
 
     def values(self) -> dict:
         term_scope = 'global'
@@ -2026,6 +2051,7 @@ class CollocateMapSettingsDialog(QDialog):
             location_label = f'State: {state_val}' if state_val else 'Selected state'
 
         return {
+            'map_type': self.map_type_combo.currentData(),
             'top_n': self.top_spin.value(),
             'term_scope': term_scope,
             'time_key': time_key,
@@ -2221,6 +2247,11 @@ class MapToolDialog(QDialog):
         self._update_enabled_state()
 
     def _apply_defaults(self, defaults: dict):
+        map_type_def = str(defaults.get('map_type', 'rank')).lower()
+        idx = self.map_type_combo.findData(map_type_def)
+        if idx >= 0:
+            self.map_type_combo.setCurrentIndex(idx)
+
         mode_def = str(defaults.get('mode', 'points')).lower()
         idx = self.mode_combo.findData(mode_def)
         if idx >= 0:
@@ -2265,6 +2296,7 @@ class MapToolDialog(QDialog):
         self.table_row_limit.blockSignals(False)
         self._user_row_limit_override = row_limit_def > 0
         self._on_table_mode_changed()
+        self._apply_map_type_constraints()
 
     def _metric_info(self) -> dict:
         key = self.metric_combo.currentData()
@@ -2357,6 +2389,7 @@ class MapToolDialog(QDialog):
     def _collect_config(self) -> dict:
         info = self._metric_info()
         cfg = {
+            'map_type': self.map_type_combo.currentData(),
             'mode': self.mode_combo.currentData(),
             'time_unit': self.time_unit.currentText(),
             'time_step': self.time_step.value(),
@@ -3095,6 +3128,11 @@ class CollocationDialog(QDialog):
         )
         if self._collocate_map_settings:
             prev = self._collocate_map_settings
+            prev_map_type = str(prev.get('map_type', 'rank')).lower()
+            idx = settings_dialog.map_type_combo.findData(prev_map_type)
+            if idx >= 0:
+                settings_dialog.map_type_combo.setCurrentIndex(idx)
+            settings_dialog._apply_map_type_constraints()
             settings_dialog.colorize_check.setChecked(bool(prev.get('colorize')))
             if prev.get('term_scope') == 'time' and settings_dialog.time_combo.count() > 0:
                 desired = prev.get('time_key')
@@ -3123,12 +3161,13 @@ class CollocationDialog(QDialog):
                 settings_dialog.enable_time_slider.setChecked(True)
             if settings_dialog.use_selected_terms_check.isEnabled():
                 settings_dialog.use_selected_terms_check.setChecked(bool(prev.get('use_selected_terms')))
-                settings_dialog._apply_top_spin_enabled()
+            settings_dialog._apply_map_type_constraints()
 
         if settings_dialog.exec_() != QDialog.Accepted:
             return
 
         map_settings = settings_dialog.values()
+        map_type = str(map_settings.get('map_type', 'rank') or 'rank').lower()
         self._collocate_map_settings = map_settings
 
         enable_time_slider = bool(map_settings.get('enable_time_slider')) and bool(time_bin_pairs)
@@ -3136,7 +3175,7 @@ class CollocationDialog(QDialog):
             map_settings['enable_time_slider'] = False
 
         manual_terms = list(dict.fromkeys(self._rank_selected_terms))
-        use_selected_terms = bool(map_settings.get('use_selected_terms'))
+        use_selected_terms = bool(map_settings.get('use_selected_terms')) if map_type != 'top_term' else False
         default_top_n = int(map_settings.get('top_n', 25))
         if use_selected_terms and manual_terms:
             metrics_path = None
@@ -3173,6 +3212,8 @@ class CollocationDialog(QDialog):
         top_n = len(manual_terms) if use_selected_terms and manual_terms else default_top_n
         map_settings['use_selected_terms'] = use_selected_terms
         self._collocate_map_settings['use_selected_terms'] = use_selected_terms
+        map_settings['map_type'] = map_type
+        self._collocate_map_settings['map_type'] = map_type
         term_scope = map_settings.get('term_scope', 'global')
         time_key = map_settings.get('time_key') or None
         time_label = map_settings.get('time_label') or ''
@@ -3210,6 +3251,7 @@ class CollocationDialog(QDialog):
                 collocate_rank_focus_label=location_label or None,
                 collocate_rank_colorize=bool(map_settings.get('colorize')),
                 collocate_time_slider=enable_time_slider,
+                collocate_map_variant=map_type,
                 metadata_enabled=getattr(parent, 'metadata_enabled', True),
                 project_dir=parent.project_folder if parent else None,
             )
@@ -3224,6 +3266,8 @@ class CollocationDialog(QDialog):
             log_lines = [
                 f'<div>Created map: <a href="chronam-open:{encoded}">{html.escape(map_path)}</a></div>'
             ]
+            map_type_display = 'Top Ranked Term by Location' if map_type == 'top_term' else 'Rank Map by Term'
+            log_lines.append(f'<div>Map type: {html.escape(map_type_display)}</div>')
             if parent and hasattr(parent, 'append_project_log'):
                 parent.append_project_log('Collocate‑Rank Map', log_lines)
             QDesktopServices.openUrl(QUrl.fromLocalFile(map_path))

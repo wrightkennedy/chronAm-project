@@ -1290,6 +1290,7 @@ def create_map(
     collocate_rank_colorize: bool = False,
     collocate_time_slider: bool = False,
     collocate_rank_terms: Optional[List[str]] = None,
+    collocate_map_variant: str = 'rank',
     metadata_enabled: bool = False,
     project_dir: Optional[str] = None,
 ) -> Dict[str, Optional[str]]:
@@ -1329,6 +1330,7 @@ def create_map(
       - collocate_rank_colorize: when True, apply a graduated color ramp based on collocate article counts.
       - collocate_rank_terms: optional explicit list of collocate terms to include (overrides top-N when provided).
       - collocate_time_slider: when True, expose an interactive time slider for collocate views (points mode only).
+      - collocate_map_variant: 'rank' (default) for the ranked-term explorer, or 'top_term' to show each location's top term.
 
     Returns:
         dict with 'map_path' and optional 'attribute_table'.
@@ -1339,6 +1341,12 @@ def create_map(
     if mode_normalized not in permitted_modes:
         mode_normalized = "points"
     mode = mode_normalized
+
+    variant_norm = (collocate_map_variant or 'rank').strip().lower()
+    if variant_norm not in {'rank', 'top_term'}:
+        variant_norm = 'rank'
+    collocate_map_variant = variant_norm
+    top_term_variant = collocate_map_variant == 'top_term'
 
     with open(geojson_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -2076,6 +2084,8 @@ def create_map(
 
     if collocate_rank_mode:
         metric_display_summary = 'Ranked Collocates'
+        if top_term_variant:
+            metric_display_summary = 'Top Collocate Term'
 
     search_results_text = f"{articles_count:,} articles | {len(newspaper_ids):,} newspapers | {len(city_set):,} cities"
     search_results_line = f'<div id="collocateSearchResults" style="margin-top:4px;"><strong>Search Results:</strong> {_esc(search_results_text)}</div>'
@@ -2118,7 +2128,10 @@ def create_map(
         )
 
     if collocate_rank_mode:
-        summary_line_text = initial_collocate_summary_text or 'Collocate term: none selected'
+        if top_term_variant:
+            summary_line_text = 'Top collocate term per location.'
+        else:
+            summary_line_text = initial_collocate_summary_text or 'Collocate term: none selected'
         ranking_scope_text = 'Entire period'
         if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time'):
             key_text = collocate_rank_time_key or ''
@@ -2149,52 +2162,68 @@ def create_map(
         )
 
         slider_placeholder = '<div id="collocateTimeSliderContainer" style="margin-top:6px;"></div>' if collocate_time_slider_enabled and collocate_time_bins_payload else ''
-
-        if collocate_terms_list:
-            select_opts_parts = []
-            for idx, term in enumerate(collocate_terms_list[:200], start=1):
-                select_opts_parts.append(
-                    f'<option value="{_esc(term)}">({_esc(str(idx))}) {_esc(term)}</option>'
-                )
-            select_opts = ''.join(select_opts_parts)
-            scope_desc = ranking_scope_text
-            if scope_desc.lower() == 'entire period':
-                scope_desc = 'entire period'
-            focus_desc = ''
-            focus_mode_norm = (collocate_rank_focus or '').strip().lower()
-            if focus_mode_norm == 'city' and collocate_rank_focus_city:
-                focus_desc = f' for {collocate_rank_focus_city}'
-                if collocate_rank_focus_state:
-                    focus_desc += f', {collocate_rank_focus_state}'
-            elif focus_mode_norm == 'state' and collocate_rank_focus_state:
-                focus_desc = f' for {collocate_rank_focus_state}'
-            scope_text = _esc(scope_desc)
-            focus_text = _esc(focus_desc)
+        if top_term_variant:
             header_lines.append(
-                f'<div>Top {len(collocate_terms_list)} collocates based on {scope_text}{focus_text}</div>'
+                '<div style="margin-top:6px;">Markers display the top-ranked collocate term for each location. Circle size reflects the number of articles containing that term.</div>'
             )
+            if slider_placeholder:
+                header_lines.append(slider_placeholder)
             header_lines.append(
-                '<div style="margin-top:6px;">'
-                '<label style="font-weight:600; margin-right:6px;">Collocate term:</label>'
-                f'<select id="collocateTermSelect" style="min-width:220px;">{select_opts}</select>'
+                '<div id="collocateSummaryLine" '
+                'style="color:#2d3748; margin-top:6px; position:relative; display:inline-block; min-width:320px;">'
+                f'<span data-summary-content="1">{_esc(summary_line_text)}</span>'
+                '<span aria-hidden="true" data-summary-buffer="1" '
+                'style="visibility:hidden; pointer-events:none; white-space:nowrap; display:inline-block;">'
+                'Top collocate term sample: 999,999 articles | Unique terms: 9,999 | Time: 1901-01-01'
+                '</span>'
                 '</div>'
             )
-            if slider_placeholder:
-                header_lines.append(slider_placeholder)
         else:
-            if slider_placeholder:
-                header_lines.append(slider_placeholder)
+            if collocate_terms_list:
+                select_opts_parts = []
+                for idx, term in enumerate(collocate_terms_list[:200], start=1):
+                    select_opts_parts.append(
+                        f'<option value="{_esc(term)}">({_esc(str(idx))}) {_esc(term)}</option>'
+                    )
+                select_opts = ''.join(select_opts_parts)
+                scope_desc = ranking_scope_text
+                if scope_desc.lower() == 'entire period':
+                    scope_desc = 'entire period'
+                focus_desc = ''
+                focus_mode_norm = (collocate_rank_focus or '').strip().lower()
+                if focus_mode_norm == 'city' and collocate_rank_focus_city:
+                    focus_desc = f' for {collocate_rank_focus_city}'
+                    if collocate_rank_focus_state:
+                        focus_desc += f', {collocate_rank_focus_state}'
+                elif focus_mode_norm == 'state' and collocate_rank_focus_state:
+                    focus_desc = f' for {collocate_rank_focus_state}'
+                scope_text = _esc(scope_desc)
+                focus_text = _esc(focus_desc)
+                header_lines.append(
+                    f'<div>Top {len(collocate_terms_list)} collocates based on {scope_text}{focus_text}</div>'
+                )
+                header_lines.append(
+                    '<div style="margin-top:6px;">'
+                    '<label style="font-weight:600; margin-right:6px;">Collocate term:</label>'
+                    f'<select id="collocateTermSelect" style="min-width:220px;">{select_opts}</select>'
+                    '</div>'
+                )
+                if slider_placeholder:
+                    header_lines.append(slider_placeholder)
+            else:
+                if slider_placeholder:
+                    header_lines.append(slider_placeholder)
 
-        header_lines.append(
-            '<div id="collocateSummaryLine" '
-            'style="color:#c53030; margin-top:6px; position:relative; display:inline-block; min-width:320px;">'
-            f'<span data-summary-content="1">{_esc(summary_line_text)}</span>'
-            '<span aria-hidden="true" data-summary-buffer="1" '
-            'style="visibility:hidden; pointer-events:none; white-space:nowrap; display:inline-block;">'
-            'Collocate term sample: 999,999 articles | 9,999 newspapers | 9,999 cities | Time: 1901-01-01'
-            '</span>'
-            '</div>'
-        )
+            header_lines.append(
+                '<div id="collocateSummaryLine" '
+                'style="color:#c53030; margin-top:6px; position:relative; display:inline-block; min-width:320px;">'
+                f'<span data-summary-content="1">{_esc(summary_line_text)}</span>'
+                '<span aria-hidden="true" data-summary-buffer="1" '
+                'style="visibility:hidden; pointer-events:none; white-space:nowrap; display:inline-block;">'
+                'Collocate term sample: 999,999 articles | 9,999 newspapers | 9,999 cities | Time: 1901-01-01'
+                '</span>'
+                '</div>'
+            )
 
     header_html = (
         '<div style="position: fixed; top: 5px; left: 5px; z-index:9999;">'
@@ -2206,7 +2235,7 @@ def create_map(
     )
     m.get_root().html.add_child(folium.Element(header_html))
 
-    if rank_index:
+    if rank_index and not top_term_variant:
         label_style = (
             '<style>'
             '.collocate-rank-label { '
@@ -2272,6 +2301,7 @@ def create_map(
         'collocate_summary': collocate_term_stats if collocate_term_stats else {},
         'collocate_colorize': bool(collocate_rank_colorize),
         'initial_collocate_term': initial_collocate_term,
+        'collocate_map_variant': collocate_map_variant,
     }
 
     # Embed collocate rank index when available
@@ -2498,6 +2528,7 @@ def create_map(
   var collocateTerms = [];
   var rankMax = 0;
   var collocateSummary = {};
+  var collocateMapVariant = 'rank';
   var collocateColorize = false;
   var initialCollocateTerm = '';
   var selectedCollocate = '';
@@ -2517,6 +2548,17 @@ def create_map(
     lon: null,
     preferred: false,
   };
+  var topTermColors = {};
+  var topTermPalette = ['#1b9e77', '#d95f02', '#7570b3', '#e7298a', '#66a61e', '#e6ab02', '#a6761d', '#666666', '#8c564b', '#bcbd22', '#17becf', '#ff9896', '#9467bd', '#fdae61', '#3288bd', '#f46d43', '#74add1', '#d53e4f'];
+  var topTermPaletteIndex = 0;
+  var topTermLegend = null;
+  var topTermLegendList = null;
+  var topTermLegendContainer = null;
+  var topTermLabelToggle = null;
+  var topTermLabelsEnabled = true;
+  var topTermStyleInjected = false;
+  var topTermLegendItems = {};
+  var topTermActiveFilterTerm = '';
 
   (function parseConfig() {
     var tag = document.getElementById('map-config');
@@ -2557,6 +2599,9 @@ def create_map(
     }
     if (config.map_mode) {
       mapMode = String(config.map_mode).trim().toLowerCase();
+    }
+    if (config.collocate_map_variant) {
+      collocateMapVariant = String(config.collocate_map_variant).trim().toLowerCase();
     }
     if (typeof config.click_radius_px === 'number' && Number.isFinite(config.click_radius_px)) {
       clickRadiusPx = Math.max(4, Number(config.click_radius_px));
@@ -2620,11 +2665,283 @@ def create_map(
     }
   })();
 
-  if (!selectedCollocate) {
+  if (!selectedCollocate && !isTopTermMode()) {
     if (initialCollocateTerm) {
       selectedCollocate = initialCollocateTerm;
     } else if (collocateTerms.length) {
       selectedCollocate = String(collocateTerms[0] || '').trim();
+    }
+  }
+
+  function isTopTermMode() {
+    return collocateMapVariant === 'top_term';
+  }
+
+  function ensureTopTermStyle() {
+    if (topTermStyleInjected) {
+      return;
+    }
+    topTermStyleInjected = true;
+    var style = document.createElement('style');
+    style.textContent = `
+.top-term-legend { position: fixed; top: 60px; right: 12px; z-index: 9999; background: rgba(255,255,255,0.94); box-shadow: 0 1px 4px rgba(0,0,0,0.25); border-radius: 6px; padding: 8px 10px; max-width: 240px; font-size: 13px; line-height: 1.4; }
+.top-term-legend h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; color: #2d3748; }
+.top-term-legend .legend-body { max-height: 200px; overflow-y: auto; margin-top: 6px; }
+.top-term-legend .legend-item { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 12px; color: #2d3748; }
+.top-term-legend .legend-item:last-child { margin-bottom: 0; }
+.top-term-legend .swatch { width: 14px; height: 14px; border-radius: 3px; border: 1px solid rgba(0,0,0,0.2); flex: 0 0 auto; }
+.top-term-legend .term-label { flex: 1 1 auto; }
+.top-term-legend .count-label { color: #4a5568; }
+.top-term-legend .legend-controls { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: #2d3748; }
+.top-term-legend input[type="checkbox"] { vertical-align: middle; }
+.top-term-label { background: rgba(255,255,255,0.85); border-radius: 4px; padding: 2px 6px; border: 1px solid rgba(0,0,0,0.15); box-shadow: 0 1px 3px rgba(0,0,0,0.3); color: #1a202c; font-weight: 600; }
+`.trim();
+    document.head.appendChild(style);
+  }
+
+  function colorForTerm(term) {
+    var key = String(term || '').trim();
+    if (!key) {
+      return '#cbd5e0';
+    }
+    if (!Object.prototype.hasOwnProperty.call(topTermColors, key)) {
+      var color = topTermPalette[topTermPaletteIndex % topTermPalette.length];
+      topTermPaletteIndex += 1;
+      topTermColors[key] = color;
+    }
+    return topTermColors[key];
+  }
+
+  function lightenColor(color, ratio) {
+    var base = String(color || '').trim();
+    if (!base) { base = '#cbd5e0'; }
+    var target = '#f7fafc';
+    var parse = function(h) {
+      h = String(h || '').replace('#','');
+      if (h.length === 3) {
+        h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+      }
+      while (h.length < 6) {
+        h += '0';
+      }
+      return {
+        r: parseInt(h.slice(0,2), 16),
+        g: parseInt(h.slice(2,4), 16),
+        b: parseInt(h.slice(4,6), 16)
+      };
+    };
+    var mix = function(a,b,t) { return Math.round(a + (b - a) * t); };
+    var src = parse(base);
+    var dst = parse(target);
+    var t = Math.min(1, Math.max(0, ratio || 0.5));
+    var r = mix(src.r, dst.r, t).toString(16).padStart(2, '0');
+    var g = mix(src.g, dst.g, t).toString(16).padStart(2, '0');
+    var b = mix(src.b, dst.b, t).toString(16).padStart(2, '0');
+    return '#' + r + g + b;
+  }
+
+  function ensureTopTermLegend() {
+    ensureTopTermStyle();
+    if (topTermLegendContainer && document.body.contains(topTermLegendContainer)) {
+      topTermLegendContainer.style.display = '';
+      return;
+    }
+    var container = document.createElement('div');
+    container.className = 'top-term-legend';
+    container.setAttribute('data-top-term-legend', '1');
+
+    var headerRow = document.createElement('div');
+    headerRow.className = 'legend-controls';
+    var title = document.createElement('h3');
+    title.textContent = 'Top Terms';
+    title.style.margin = '0';
+    headerRow.appendChild(title);
+
+    var toggleLabel = document.createElement('label');
+    toggleLabel.style.display = 'flex';
+    toggleLabel.style.alignItems = 'center';
+    toggleLabel.style.gap = '4px';
+    toggleLabel.style.cursor = 'pointer';
+    toggleLabel.style.cursor = 'pointer';
+    var toggle = document.createElement('input');
+    toggle.type = 'checkbox';
+    toggle.checked = topTermLabelsEnabled;
+    toggle.addEventListener('change', function() {
+      topTermLabelsEnabled = !!this.checked;
+      if (activeMap) {
+        refreshCollocateSizes(activeMap);
+        updateCollocateSummaryLineFromDataset(popupCache);
+      }
+    });
+    toggleLabel.appendChild(toggle);
+    toggleLabel.appendChild(document.createTextNode('Show labels'));
+    headerRow.appendChild(toggleLabel);
+
+    var list = document.createElement('div');
+    list.className = 'legend-body';
+
+    container.appendChild(headerRow);
+    container.appendChild(list);
+
+    var parent = document.querySelector('.leaflet-container') || document.body;
+    parent.appendChild(container);
+
+    topTermLegendContainer = container;
+    topTermLegend = container;
+    topTermLegendList = list;
+    topTermLabelToggle = toggle;
+  }
+
+  function removeTopTermLegend() {
+    if (topTermLegendContainer) {
+      topTermLegendContainer.style.display = 'none';
+    }
+  }
+
+  function updateTopTermLegendActiveState() {
+    if (!topTermLegendItems) {
+      return;
+    }
+    var active = (topTermActiveFilterTerm || '').trim();
+    Object.keys(topTermLegendItems).forEach(function(term) {
+      var el = topTermLegendItems[term];
+      if (!el) { return; }
+      var isActive = active && term === active;
+      el.dataset.active = isActive ? '1' : '0';
+      el.style.opacity = (active && !isActive) ? '0.5' : '1';
+    });
+  }
+
+  function setTopTermFilter(term) {
+    var value = String(term || '').trim();
+    if (topTermActiveFilterTerm === value) {
+      topTermActiveFilterTerm = '';
+    } else {
+      topTermActiveFilterTerm = value;
+    }
+    updateTopTermLegendActiveState();
+    if (activeMap) {
+      refreshCollocateSizes(activeMap);
+      updateCollocateSummaryLineFromDataset(popupCache);
+    }
+  }
+
+  function updateTopTermLegend(termCounts) {
+    if (!isTopTermMode()) {
+      removeTopTermLegend();
+      return;
+    }
+    ensureTopTermLegend();
+    if (!topTermLegendList) {
+      return;
+    }
+    while (topTermLegendList.firstChild) {
+      topTermLegendList.removeChild(topTermLegendList.firstChild);
+    }
+    topTermLegendItems = {};
+    var entries = Object.keys(termCounts || {}).map(function(term) {
+      return { term: term, count: termCounts[term] || 0 };
+    });
+    entries.sort(function(a, b) {
+      if (b.count !== a.count) {
+        return b.count - a.count;
+      }
+      return a.term.localeCompare(b.term);
+    });
+    if (!entries.length) {
+      var empty = document.createElement('div');
+      empty.style.color = '#4a5568';
+      empty.style.fontStyle = 'italic';
+      empty.textContent = 'No collocate terms available.';
+      topTermLegendList.appendChild(empty);
+      return;
+    }
+    entries.forEach(function(entry) {
+      var item = document.createElement('div');
+      item.className = 'legend-item';
+      item.setAttribute('data-term', entry.term);
+      var swatch = document.createElement('span');
+      swatch.className = 'swatch';
+      swatch.style.background = colorForTerm(entry.term);
+      var termLabel = document.createElement('span');
+      termLabel.className = 'term-label';
+      termLabel.textContent = entry.term;
+      var countLabel = document.createElement('span');
+      countLabel.className = 'count-label';
+      var countText = entry.count === 1 ? '1 city' : entry.count + ' cities';
+      countLabel.textContent = countText;
+      item.appendChild(swatch);
+      item.appendChild(termLabel);
+      item.appendChild(countLabel);
+      item.addEventListener('click', function() {
+        setTopTermFilter(entry.term);
+      });
+      topTermLegendItems[entry.term] = item;
+      topTermLegendList.appendChild(item);
+    });
+    if (topTermLabelToggle) {
+      topTermLabelToggle.checked = topTermLabelsEnabled;
+    }
+    updateTopTermLegendActiveState();
+  }
+
+  function applyTopTermLabelState(layer, term) {
+    if (!layer || typeof layer.setTooltipContent === 'function') {
+      // handled later via bind/unbind
+    }
+    var labelText = term ? String(term) : '';
+    if (!labelText) {
+      if (typeof layer.unbindTooltip === 'function') {
+        try { layer.unbindTooltip(); } catch (err) {}
+      }
+      return;
+    }
+    var highlighted = !(layer && layer.options && layer.options.topTermHighlighted === false);
+    var baseColor = colorForTerm(term);
+    var bgColor = highlighted ? baseColor : lightenColor(baseColor, 0.7);
+    var textColor = highlighted ? '#1a202c' : '#4a5568';
+    if (topTermLabelsEnabled) {
+      if (typeof layer.unbindTooltip === 'function') {
+        try { layer.unbindTooltip(); } catch (err) {}
+      }
+      try {
+        layer.bindTooltip(labelText, {
+          permanent: true,
+          direction: 'center',
+          className: 'top-term-label',
+          opacity: highlighted ? 1 : 0.6,
+        });
+        var tooltip = layer.getTooltip && layer.getTooltip();
+        if (tooltip && typeof tooltip.getElement === 'function') {
+          var el = tooltip.getElement();
+          if (el) {
+            el.style.background = bgColor;
+            el.style.borderColor = 'rgba(0,0,0,0.3)';
+            el.style.color = textColor;
+          }
+        }
+      } catch (bindErr) {}
+    } else {
+      if (typeof layer.unbindTooltip === 'function') {
+        try { layer.unbindTooltip(); } catch (err) {}
+      }
+      try {
+        layer.bindTooltip(labelText, {
+          permanent: false,
+          direction: 'top',
+          opacity: highlighted ? 1 : 0.6,
+          sticky: true,
+        });
+        var tooltip = layer.getTooltip && layer.getTooltip();
+        if (tooltip && typeof tooltip.getElement === 'function') {
+          var el = tooltip.getElement();
+          if (el) {
+            el.style.background = bgColor;
+            el.style.borderColor = 'rgba(0,0,0,0.2)';
+            el.style.color = textColor;
+          }
+        }
+      } catch (hoverErr) {}
     }
   }
 
@@ -2815,12 +3132,165 @@ def create_map(
     var s = String(state||'').trim().toLowerCase();
     return c + '||' + s;
   }
+  function lookupRankForTerm(data, timeKey, term) {
+    if (!collocateRanks || !term) {
+      return null;
+    }
+    var ck = cityKey(data && data.city, data && data.state);
+    if (!ck || !Object.prototype.hasOwnProperty.call(collocateRanks, ck)) {
+      return null;
+    }
+    var byCity = collocateRanks[ck];
+    if (timeKey && byCity && Object.prototype.hasOwnProperty.call(byCity, timeKey) && byCity[timeKey] && Object.prototype.hasOwnProperty.call(byCity[timeKey], term)) {
+      var val = Number(byCity[timeKey][term]);
+      return Number.isFinite(val) ? val : null;
+    }
+    if ((!collocateTimeEnabled || !timeKey) && byCity && Object.prototype.hasOwnProperty.call(byCity, '') && byCity[''] && Object.prototype.hasOwnProperty.call(byCity[''], term)) {
+      var baseVal = Number(byCity[''][term]);
+      return Number.isFinite(baseVal) ? baseVal : null;
+    }
+    return null;
+  }
+  function countArticlesForTerm(data, term, timeKey) {
+    if (!data || !term || !data.collocate_hits || !Object.prototype.hasOwnProperty.call(data.collocate_hits, term)) {
+      return 0;
+    }
+    var hits = data.collocate_hits[term];
+    if (!Array.isArray(hits) || !hits.length) {
+      return 0;
+    }
+    if (timeKey && data.time_bins && data.time_bins[timeKey] && Array.isArray(data.time_bins[timeKey].indexes)) {
+      var allowed = new Set();
+      data.time_bins[timeKey].indexes.forEach(function(idx) {
+        var num = Number(idx);
+        if (Number.isFinite(num)) {
+          allowed.add(num);
+        }
+      });
+      if (!allowed.size) {
+        return 0;
+      }
+      var count = 0;
+      hits.forEach(function(idx) {
+        var num = Number(idx);
+        if (Number.isFinite(num) && allowed.has(num)) {
+          count += 1;
+        }
+      });
+      return count;
+    }
+    return hits.length;
+  }
+  function computeSelectedTermInfo(data, timeKey) {
+    var term = String(selectedCollocate || '').trim();
+    if (!term) {
+      var emptyInfo = { term: '', rank: null, count: 0 };
+      data._currentTopTermInfo = emptyInfo;
+      return emptyInfo;
+    }
+    var rank = lookupRankForTerm(data, timeKey, term);
+    var count = Array.isArray(data.entries) ? data.entries.length : 0;
+    var info = {
+      term: term,
+      rank: Number.isFinite(rank) ? Number(rank) : null,
+      count: count,
+    };
+    data._currentTopTermInfo = info;
+    return info;
+  }
+  function computeTopTermInfo(data, timeKey) {
+    var bestTerm = '';
+    var bestRank = null;
+    var bestCount = 0;
+    if (collocateRanks) {
+      var ck = cityKey(data && data.city, data && data.state);
+      if (ck && Object.prototype.hasOwnProperty.call(collocateRanks, ck)) {
+        var byCity = collocateRanks[ck];
+        if (byCity) {
+          var rankMap = null;
+          if (timeKey && Object.prototype.hasOwnProperty.call(byCity, timeKey)) {
+            rankMap = byCity[timeKey];
+          }
+          if (!rankMap && Object.prototype.hasOwnProperty.call(byCity, '')) {
+            rankMap = byCity[''];
+          }
+          if (rankMap) {
+            Object.keys(rankMap).forEach(function(term) {
+              var rankVal = Number(rankMap[term]);
+              if (!Number.isFinite(rankVal)) {
+                return;
+              }
+              if (!bestTerm || rankVal < bestRank || (rankVal === bestRank && term < bestTerm)) {
+                bestTerm = term;
+                bestRank = rankVal;
+              }
+            });
+          }
+        }
+      }
+    }
+    var count = 0;
+    if (bestTerm) {
+      count = countArticlesForTerm(data, bestTerm, timeKey);
+    }
+    if (!bestTerm || count <= 0) {
+      if (data && data.collocate_hits) {
+        Object.keys(data.collocate_hits).forEach(function(term) {
+          var termCount = countArticlesForTerm(data, term, timeKey);
+          if (termCount <= 0) {
+            return;
+          }
+          if (!bestTerm || termCount > count || (termCount === count && term < bestTerm)) {
+            bestTerm = term;
+            count = termCount;
+          }
+        });
+      }
+      if (bestTerm && !Number.isFinite(bestRank)) {
+        bestRank = lookupRankForTerm(data, timeKey, bestTerm);
+      }
+    }
+    if (!bestTerm) {
+      var emptyInfo = { term: '', rank: null, count: 0 };
+      data._currentTopTermInfo = emptyInfo;
+      return emptyInfo;
+    }
+    var info = {
+      term: bestTerm,
+      rank: Number.isFinite(bestRank) ? Number(bestRank) : null,
+      count: count,
+    };
+    data._currentTopTermInfo = info;
+    return info;
+  }
+  function getTermInfoForGroup(data, timeKey) {
+    if (isTopTermMode()) {
+      return computeTopTermInfo(data, timeKey);
+    }
+    return computeSelectedTermInfo(data, timeKey);
+  }
   function rankToRadius(rank) {
     if (!Number.isFinite(rank) || rank <= 0) return 3;
     var rMin = 3, rMax = 18;
     if (!rankMax || rankMax <= 1) return rMax;
     var t = 1 - ((rank - 1) / (rankMax - 1));
     return Math.max(rMin, Math.min(rMax, rMin + t * (rMax - rMin)));
+  }
+  function countToRadius(count, maxCount) {
+    var minR = 4;
+    var maxR = 22;
+    var safeCount = Number(count);
+    if (!Number.isFinite(safeCount) || safeCount <= 0) {
+      return minR;
+    }
+    var safeMax = Number(maxCount);
+    if (!Number.isFinite(safeMax) || safeMax <= 0) {
+      safeMax = safeCount;
+    }
+    var ratio = safeCount / safeMax;
+    ratio = Math.min(1, Math.max(0, ratio));
+    var eased = Math.sqrt(ratio);
+    return Math.max(minR, Math.min(maxR, minR + eased * (maxR - minR)));
   }
   function refreshCollocateSizes(mapObj) {
     if (!mapObj || typeof mapObj.eachLayer !== 'function') {
@@ -2830,13 +3300,14 @@ def create_map(
       if (!dataset) {
         return;
       }
-      applyCollocateFilterToDataset(dataset);
-      var colorScale = null;
+      applyCollocateFilterToDataset(dataset, timeKey || null);
       var baseColor = '#2b6cb0';
+      var colorScale = null;
       if (collocateColorize) {
         colorScale = createColorScale(dataset);
       }
       var timeKey = currentTimeKey(mapObj);
+      var updates = [];
       mapObj.eachLayer(function(layer) {
         if (!layer || !layer.options || !layer.options.groupId) {
           return;
@@ -2846,19 +3317,34 @@ def create_map(
         if (!data) {
           return;
         }
-        var rank = null;
-        if (collocateRanks && selectedCollocate) {
-          var ck = cityKey(data.city, data.state);
-          var byCity = collocateRanks[ck];
-          if (byCity) {
-            if (timeKey && byCity[timeKey] && Object.prototype.hasOwnProperty.call(byCity[timeKey], selectedCollocate)) {
-              rank = byCity[timeKey][selectedCollocate];
-            } else if ((!collocateTimeEnabled || !timeKey) && byCity[''] && Object.prototype.hasOwnProperty.call(byCity[''], selectedCollocate)) {
-              rank = byCity[''][selectedCollocate];
-            }
+        var info = getTermInfoForGroup(data, timeKey);
+        updates.push({ layer: layer, data: data, info: info || { term: '', rank: null, count: 0 } });
+      });
+      var maxCount = 0;
+      if (isTopTermMode()) {
+        updates.forEach(function(entry) {
+          var count = Number(entry.info.count) || 0;
+          if (count > maxCount) {
+            maxCount = count;
           }
+        });
+        if (!Number.isFinite(maxCount) || maxCount <= 0) {
+          maxCount = 1;
         }
-        var radius = rankToRadius(rank);
+      }
+      var highlightTerm = (topTermActiveFilterTerm || '').trim();
+      var termCounts = {};
+      updates.forEach(function(entry) {
+        var layer = entry.layer;
+        var data = entry.data;
+        var info = entry.info || { term: '', rank: null, count: 0 };
+        var rank = Number.isFinite(info.rank) ? Number(info.rank) : null;
+        var term = info.term || '';
+        var count = Number(info.count) || 0;
+        var radius = isTopTermMode() ? countToRadius(count, maxCount) : rankToRadius(rank);
+        if (!isTopTermMode()) {
+          count = Array.isArray(data.entries) ? data.entries.length : 0;
+        }
         if (typeof layer.setRadius === 'function') {
           layer.setRadius(radius);
         } else if (layer.options) {
@@ -2867,88 +3353,114 @@ def create_map(
             try { layer.redraw(); } catch (e) {}
           }
         }
-        if (layer.options) {
-          layer.options.collocateRank = rank;
-        }
-        var labelText = '';
-        if (Number.isFinite(rank) && rank > 0) {
-          labelText = String(Math.round(rank));
-        }
-        if (typeof layer.bindTooltip === 'function') {
-          var tooltip = (typeof layer.getTooltip === 'function') ? layer.getTooltip() : null;
-          if (!tooltip) {
-            try {
-              layer.bindTooltip(labelText, {
-                permanent: true,
-                direction: 'center',
-                className: 'collocate-rank-label',
-                opacity: 1,
-              });
-              tooltip = (typeof layer.getTooltip === 'function') ? layer.getTooltip() : null;
-            } catch (tooltipErr) {
-              tooltip = null;
-            }
-          }
-          if (typeof layer.setTooltipContent === 'function') {
-            try { layer.setTooltipContent(labelText); } catch (setErr) {}
-          } else if (tooltip && typeof tooltip.setContent === 'function') {
-            tooltip.setContent(labelText);
-          }
-          var tooltipEl = null;
-          if (tooltip && typeof tooltip.getElement === 'function') {
-            tooltipEl = tooltip.getElement();
-          } else {
-            var tmpTooltip = (typeof layer.getTooltip === 'function') ? layer.getTooltip() : null;
-            if (tmpTooltip && typeof tmpTooltip.getElement === 'function') {
-              tooltipEl = tmpTooltip.getElement();
-            }
-          }
-          if (tooltipEl) {
-            tooltipEl.style.display = labelText ? '' : 'none';
-            var fontSize = Math.max(11, Math.round(radius * 1.05));
-            tooltipEl.style.fontSize = fontSize + 'px';
-          }
-        }
-        var collocateCount = Array.isArray(data.entries) ? data.entries.length : 0;
+        layer.options = layer.options || {};
+        layer.options.collocateRank = rank;
+        layer.options.currentCollocateTerm = term;
+        layer.options.currentCollocateCount = count;
+        var collocateCount = count;
         var fillColor = baseColor;
         var strokeColor = baseColor;
-        if (collocateColorize && typeof colorScale === 'function') {
+        if (isTopTermMode()) {
+          fillColor = colorForTerm(term);
+          strokeColor = '#2d3748';
+        } else if (collocateColorize && typeof colorScale === 'function') {
           fillColor = colorScale(collocateCount);
           strokeColor = '#4a5568';
         }
         var visible = collocateCount > 0;
+        var isHighlighted = !highlightTerm || (term && term === highlightTerm);
+        layer.options.topTermHighlighted = isHighlighted;
+        if (isTopTermMode() && term && visible) {
+          termCounts[term] = (termCounts[term] || 0) + 1;
+        }
+        if (isTopTermMode() && highlightTerm && !isHighlighted) {
+          fillColor = lightenColor(fillColor, 0.6);
+          strokeColor = lightenColor(strokeColor, 0.6);
+        }
         var baseOpacity = (typeof layer.options.baseOpacity === 'number') ? layer.options.baseOpacity : (typeof layer.options.opacity === 'number' ? layer.options.opacity : 0.5);
         var baseFill = (typeof layer.options.baseFillOpacity === 'number') ? layer.options.baseFillOpacity : (typeof layer.options.fillOpacity === 'number' ? layer.options.fillOpacity : 0.85);
+        var opacityMultiplier = (isTopTermMode() && highlightTerm && !isHighlighted) ? 0.25 : 1;
+        var layerOpacity = visible ? baseOpacity * opacityMultiplier : 0;
+        var layerFillOpacity = visible ? baseFill * opacityMultiplier : 0;
         if (typeof layer.setStyle === 'function') {
           layer.setStyle({
             color: strokeColor,
             fillColor: fillColor,
             weight: collocateColorize ? 1.0 : (typeof layer.options.weight === 'number' ? layer.options.weight : 1),
-            opacity: visible ? baseOpacity : 0,
-            fillOpacity: visible ? baseFill : 0,
+            opacity: layerOpacity,
+            fillOpacity: layerFillOpacity,
           });
         }
-        if (layer.options) {
-          layer.options.color = strokeColor;
-          layer.options.fillColor = fillColor;
-          layer.options.weight = collocateColorize ? 1.0 : (typeof layer.options.weight === 'number' ? layer.options.weight : 1);
-          layer.options.opacity = visible ? baseOpacity : 0;
-          layer.options.fillOpacity = visible ? baseFill : 0;
-        }
+        layer.options.color = strokeColor;
+        layer.options.fillColor = fillColor;
+        layer.options.weight = collocateColorize ? 1.0 : (typeof layer.options.weight === 'number' ? layer.options.weight : 1);
+        layer.options.opacity = layerOpacity;
+        layer.options.fillOpacity = layerFillOpacity;
         var isGhost = !!layer.options.ghostMarker;
-        layer.options.interactive = isGhost ? false : !!visible;
+        var interactive = !isGhost && visible && (!highlightTerm || isHighlighted);
+        layer.options.interactive = interactive;
         if (layer._path && layer._path.style) {
-          layer._path.style.pointerEvents = (visible && !isGhost) ? 'auto' : 'none';
+          layer._path.style.pointerEvents = interactive ? 'auto' : 'none';
+          layer._path.style.opacity = layerOpacity;
+          layer._path.style.fillOpacity = layerFillOpacity;
         }
-        if (!visible && typeof layer.closePopup === 'function') {
+        if (!interactive && typeof layer.closePopup === 'function') {
           layer.closePopup();
         }
-        if (!visible && currentHighlightId === gid) {
+        if (!interactive && currentHighlightId === layer.options.groupId) {
           clearHighlight();
+        }
+        if (isTopTermMode()) {
+          applyTopTermLabelState(layer, term);
+        } else {
+          var labelText = '';
+          if (Number.isFinite(rank) && rank > 0) {
+            labelText = String(Math.round(rank));
+          }
+          if (typeof layer.bindTooltip === 'function') {
+            var tooltip = (typeof layer.getTooltip === 'function') ? layer.getTooltip() : null;
+            if (!tooltip) {
+              try {
+                layer.bindTooltip(labelText, {
+                  permanent: true,
+                  direction: 'center',
+                  className: 'collocate-rank-label',
+                  opacity: 1,
+                });
+                tooltip = (typeof layer.getTooltip === 'function') ? layer.getTooltip() : null;
+              } catch (tooltipErr) {
+                tooltip = null;
+              }
+            }
+            if (typeof layer.setTooltipContent === 'function') {
+              try { layer.setTooltipContent(labelText); } catch (setErr) {}
+            } else if (tooltip && typeof tooltip.setContent === 'function') {
+              tooltip.setContent(labelText);
+            }
+            var tooltipEl = null;
+            if (tooltip && typeof tooltip.getElement === 'function') {
+              tooltipEl = tooltip.getElement();
+            } else {
+              var tmpTooltip = (typeof layer.getTooltip === 'function') ? layer.getTooltip() : null;
+              if (tmpTooltip && typeof tmpTooltip.getElement === 'function') {
+                tooltipEl = tmpTooltip.getElement();
+              }
+            }
+            if (tooltipEl) {
+              tooltipEl.style.display = labelText ? '' : 'none';
+              var fontSize = Math.max(11, Math.round(radius * 1.05));
+              tooltipEl.style.fontSize = fontSize + 'px';
+            }
+          }
         }
       });
       refreshPopupAfterFilter(mapObj);
       updateCollocateSummaryLineFromDataset(dataset);
+      if (isTopTermMode()) {
+        updateTopTermLegend(termCounts);
+      } else {
+        removeTopTermLegend();
+      }
       updateHighlightFromDataset(dataset);
     });
   }
@@ -2976,7 +3488,7 @@ def create_map(
         var baseCount = Number.isFinite(data.full_article_count) ? Number(data.full_article_count) : (Array.isArray(baseSource) ? baseSource.length : 0);
         setBaseEntries(data, baseSource, baseCount);
       });
-      applyCollocateFilterToDataset(popupCache);
+        applyCollocateFilterToDataset(popupCache, null);
       updateCollocateSummaryLineFromDataset(popupCache);
     }
     callback(popupCache);
@@ -3392,6 +3904,38 @@ def create_map(
         line.appendChild(content);
       }
     }
+    if (isTopTermMode()) {
+      var stats = collectCollocateStats(dataset);
+      var termCounter = {};
+      if (dataset) {
+        Object.keys(dataset).forEach(function(key) {
+          var data = dataset[key];
+          if (!data || !data._currentTopTermInfo) {
+            return;
+          }
+          var info = data._currentTopTermInfo;
+          if (info && info.term) {
+            var t = String(info.term);
+            termCounter[t] = (termCounter[t] || 0) + 1;
+          }
+        });
+      }
+      var uniqueTerms = Object.keys(termCounter).length;
+      var summaryParts = ['Top collocate term per location'];
+      if (collocateTimeEnabled) {
+        var timeLabel = labelForTimeKey(selectedTimeBinKey);
+        if (timeLabel) {
+          summaryParts.push('Time: ' + timeLabel);
+        }
+      }
+      summaryParts.push('Locations: ' + formatInteger(stats.cities || 0));
+      summaryParts.push('Articles: ' + formatInteger(stats.articles || 0));
+      if (uniqueTerms) {
+        summaryParts.push('Unique terms: ' + formatInteger(uniqueTerms));
+      }
+      content.textContent = summaryParts.join(' | ');
+      return;
+    }
     var term = String(selectedCollocate || '').trim();
     if (!term) {
       content.textContent = 'Collocate term: none selected';
@@ -3507,37 +4051,69 @@ def create_map(
     }
   }
 
-  function applyCollocateFilterToData(data) {
+  function applyCollocateFilterToData(data, overrideTerm, timeKey) {
     if (!data) {
       return;
     }
     ensureBaseEntries(data);
     var baseEntries = Array.isArray(data._baseEntries) ? data._baseEntries : [];
     var baseCount = Number.isFinite(data._baseArticleCount) ? Number(data._baseArticleCount) : baseEntries.length;
-    if (!selectedCollocate) {
-      data.entries = baseEntries.slice();
-      data.article_count = baseCount;
+    var term = '';
+    if (typeof overrideTerm === 'string') {
+      term = overrideTerm.trim();
+    } else if (overrideTerm) {
+      term = String(overrideTerm).trim();
+    } else {
+      term = String(selectedCollocate || '').trim();
+    }
+    if (!term) {
+      if (isTopTermMode()) {
+        data.entries = [];
+        data.article_count = 0;
+      } else {
+        data.entries = baseEntries.slice();
+        data.article_count = baseCount;
+      }
       return;
     }
-    if (!data.collocate_hits || !Object.prototype.hasOwnProperty.call(data.collocate_hits, selectedCollocate)) {
+    if (!data.collocate_hits || !Object.prototype.hasOwnProperty.call(data.collocate_hits, term)) {
       data.entries = [];
       data.article_count = 0;
       return;
     }
-    var hitsList = data.collocate_hits[selectedCollocate];
+    var hitsList = data.collocate_hits[term];
     if (!Array.isArray(hitsList) || !hitsList.length) {
       data.entries = [];
       data.article_count = 0;
       return;
     }
-    var allowed = new Set();
+    var allowed = null;
+    if (timeKey && data.time_bins && data.time_bins[timeKey] && Array.isArray(data.time_bins[timeKey].indexes)) {
+      allowed = new Set();
+      data.time_bins[timeKey].indexes.forEach(function(idx) {
+        var num = Number(idx);
+        if (Number.isFinite(num)) {
+          allowed.add(num);
+        }
+      });
+      if (!allowed.size) {
+        data.entries = [];
+        data.article_count = 0;
+        return;
+      }
+    }
+    var allowedHits = new Set();
     hitsList.forEach(function(idx) {
       var num = Number(idx);
-      if (Number.isFinite(num)) {
-        allowed.add(num);
+      if (!Number.isFinite(num)) {
+        return;
       }
+      if (allowed && !allowed.has(num)) {
+        return;
+      }
+      allowedHits.add(num);
     });
-    if (!allowed.size) {
+    if (!allowedHits.size) {
       data.entries = [];
       data.article_count = 0;
       return;
@@ -3548,7 +4124,7 @@ def create_map(
         return;
       }
       var idx = Number(entry.full_index);
-      if (Number.isFinite(idx) && allowed.has(idx)) {
+      if (Number.isFinite(idx) && allowedHits.has(idx)) {
         filtered.push(entry);
       }
     });
@@ -3556,12 +4132,26 @@ def create_map(
     data.article_count = filtered.length;
   }
 
-  function applyCollocateFilterToDataset(dataset) {
+  function applyCollocateFilterToDataset(dataset, timeKey) {
     if (!dataset) {
       return;
     }
     Object.keys(dataset).forEach(function(key) {
-      applyCollocateFilterToData(dataset[key]);
+      var data = dataset[key];
+      if (!data) {
+        return;
+      }
+      if (isTopTermMode()) {
+        var info = computeTopTermInfo(data, timeKey || null);
+        if (!info || !info.term) {
+          data.entries = [];
+          data.article_count = 0;
+          return;
+        }
+        applyCollocateFilterToData(data, info.term, timeKey || null);
+      } else {
+        applyCollocateFilterToData(data, null, timeKey || null);
+      }
     });
   }
 
@@ -4149,12 +4739,18 @@ def create_map(
 
       keys.forEach(function(key) {
         var data = dataset[key];
-        if (!data) {
-          return;
-        }
-        setBaseEntries(data, data.entries, data.article_count);
+      if (!data) {
+        return;
+      }
+      setBaseEntries(data, data.entries, data.article_count);
       });
-      applyCollocateFilterToDataset(dataset);
+      var filterTimeKey = null;
+      if (collocateTimeEnabled) {
+        filterTimeKey = selectedTimeBinKey || null;
+      } else if (currentKeys && currentKeys.length === 1) {
+        filterTimeKey = currentKeys[0];
+      }
+      applyCollocateFilterToDataset(dataset, filterTimeKey);
 
       if (typeof mapObj.eachLayer === 'function') {
         mapObj.eachLayer(function(layer) {
@@ -4189,7 +4785,7 @@ def create_map(
         });
       }
       refreshPopupAfterFilter(mapObj);
-      if (collocateRanks && selectedCollocate) {
+      if (collocateRanks && (selectedCollocate || isTopTermMode())) {
         refreshCollocateSizes(mapObj);
       } else {
         updateHighlightFromDataset(dataset);
@@ -5502,6 +6098,11 @@ function attach(root) {
       applyTimeFilter(mapObj);
       // Initialize collocate selector default and first sizing
       (function initCollocateSelector(){
+        if (isTopTermMode()) {
+          refreshCollocateSizes(activeMap);
+          updateCollocateSummaryLineFromDataset(popupCache);
+          return;
+        }
         if (!collocateRanks || !collocateTerms || !collocateTerms.length) return;
         var sel = document.getElementById('collocateTermSelect');
         if (!sel) return;
