@@ -3,6 +3,7 @@ import json
 import os
 import re
 import uuid
+import copy
 from collections import Counter, defaultdict
 from string import Template as StrTemplate
 
@@ -368,6 +369,72 @@ def _build_collocate_rank_index(
 
     collocate_terms_list = selected_terms_ordered[:selector_cap]
     return collocate_terms_list, rank_index, rank_max, hits_result, aggregate_time_global, time_key_labels
+
+
+# ----------------------------
+# Helpers: serialization/export
+# ----------------------------
+
+def _json_safe(value: Any):
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, set):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _export_collocate_geojson(
+    out_path: str,
+    popup_dataset: Dict[str, Any],
+    summary: Dict[str, Any],
+    config_payload: Dict[str, Any],
+) -> Optional[str]:
+    features: List[Dict[str, Any]] = []
+    for group_id, dataset_entry in popup_dataset.items():
+        if not isinstance(dataset_entry, dict):
+            continue
+        lat = dataset_entry.get('lat')
+        lon = dataset_entry.get('lon')
+        try:
+            lat_f = float(lat)
+            lon_f = float(lon)
+        except (TypeError, ValueError):
+            continue
+        props = copy.deepcopy(dataset_entry)
+        props.pop('lat', None)
+        props.pop('lon', None)
+        props['group_id'] = group_id
+        feature = {
+            'type': 'Feature',
+            'geometry': {
+                'type': 'Point',
+                'coordinates': [lon_f, lat_f],
+            },
+            'properties': _json_safe(props),
+        }
+        features.append(feature)
+
+    if not features:
+        return None
+
+    payload = {
+        'type': 'FeatureCollection',
+        'features': features,
+        'metadata': _json_safe({
+            'summary': summary,
+            'config': config_payload,
+        }),
+    }
+
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return out_path
 
 
 # ----------------------------
@@ -1337,6 +1404,9 @@ def create_map(
     collocate_map_variant: str = 'rank',
     metadata_enabled: bool = False,
     project_dir: Optional[str] = None,
+    time_start_override: Optional[str] = None,
+    time_end_override: Optional[str] = None,
+    collocate_export_geojson: bool = False,
 ) -> Dict[str, Optional[str]]:
     """
     Create a leaflet map next to the GeoJSON.
@@ -1377,6 +1447,9 @@ def create_map(
       - collocate_rank_terms: optional explicit list of collocate terms to include (overrides top-N when provided).
       - collocate_time_slider: when True, expose an interactive time slider for collocate views (points mode only).
       - collocate_map_variant: 'rank' (default) for the ranked-term explorer, or 'top_term' to show each location's top term.
+      - time_start_override / time_end_override: optional ISO dates to force the slider/time-bin extent
+        to respect user-selected parameters when metadata is missing.
+      - collocate_export_geojson: when True, write a GeoJSON summarizing collocate data per location.
 
     Returns:
         dict with 'map_path' and optional 'attribute_table'.
@@ -1408,6 +1481,9 @@ def create_map(
         entry['_popup_row_id'] = _sanitize_element_id(f'feature-row-{idx}')
     groups = _group_points(pts)
     search_term = _detect_search_term(geojson_path, data)
+
+    start_override = (time_start_override or '').strip()
+    end_override = (time_end_override or '').strip()
 
     city_entries_map: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -1468,8 +1544,8 @@ def create_map(
             dates_dt.append(dt)
 
     metadata = data.get('metadata') or data.get('properties') or {}
-    start_meta = metadata.get('start_date') or metadata.get('StartDate')
-    end_meta = metadata.get('end_date') or metadata.get('EndDate')
+    start_meta = start_override or metadata.get('start_date') or metadata.get('StartDate')
+    end_meta = end_override or metadata.get('end_date') or metadata.get('EndDate')
 
     if dates_dt:
         min_dt = min(dates_dt)
@@ -1483,7 +1559,14 @@ def create_map(
     time_index: List[datetime] = []
     time_labels: List[str] = []
     if (use_time_slider or rank_time_bins) and min_dt and max_dt:
-        time_index = _build_time_index(min_dt, max_dt, time_unit, max(1, int(time_step or 1)))
+        # Prefer user-specified project metadata dates when available
+        start_dt_meta = _parse_date(start_meta) if start_meta else None
+        end_dt_meta = _parse_date(end_meta) if end_meta else None
+        range_start = start_dt_meta or min_dt
+        range_end = end_dt_meta or max_dt
+        if range_start and range_end and range_start > range_end:
+            range_start, range_end = range_end, range_start
+        time_index = _build_time_index(range_start, range_end, time_unit, max(1, int(time_step or 1)))
         time_labels = [dt.strftime('%Y-%m-%dT%H:%M:%SZ') for dt in time_index]
 
     collocate_time_slider_enabled = bool(
@@ -1807,8 +1890,8 @@ def create_map(
             dates_dt.append(dt)
 
     metadata = data.get('metadata') or data.get('properties') or {}
-    start_meta = metadata.get('start_date') or metadata.get('StartDate')
-    end_meta = metadata.get('end_date') or metadata.get('EndDate')
+    start_meta = start_override or metadata.get('start_date') or metadata.get('StartDate')
+    end_meta = end_override or metadata.get('end_date') or metadata.get('EndDate')
 
     if dates_dt:
         min_dt = min(dates_dt)
@@ -1822,7 +1905,14 @@ def create_map(
     time_index: List[datetime] = []
     time_labels: List[str] = []
     if (use_time_slider or rank_time_bins) and min_dt and max_dt:
-        time_index = _build_time_index(min_dt, max_dt, time_unit, max(1, int(time_step or 1)))
+        # Prefer user-specified metadata dates when present
+        start_dt_meta = _parse_date(start_meta) if start_meta else None
+        end_dt_meta = _parse_date(end_meta) if end_meta else None
+        range_start = start_dt_meta or min_dt
+        range_end = end_dt_meta or max_dt
+        if range_start and range_end and range_start > range_end:
+            range_start, range_end = range_end, range_start
+        time_index = _build_time_index(range_start, range_end, time_unit, max(1, int(time_step or 1)))
         time_labels = [dt.strftime('%Y-%m-%dT%H:%M:%SZ') for dt in time_index]
 
     start_str = start_meta or (min_dt.strftime('%Y-%m-%d') if min_dt else '')
@@ -2140,19 +2230,40 @@ def create_map(
     search_results_line = f'<div id="collocateSearchResults" style="margin-top:4px;"><strong>Search Results:</strong> {_esc(search_results_text)}</div>'
 
     header_lines: List[str] = []
+
+    title_html = ''
+    # Collocate maps get a custom title; otherwise include basic info lines
+    if collocate_rank_mode:
+        term_text = (summary.get('term') or '').strip()
+        term_segment = f"of '{_esc(term_text)}'" if term_text else ''
+        date_segment = ''
+        if summary.get('date_range'):
+            start, end = summary['date_range']
+            date_text = start if start == end else ' – '.join([s for s in (start, end) if s])
+            if date_text:
+                date_segment = f"between {_esc(date_text)}"
+        title_bits = ['Top Ranked Collocates']
+        if term_segment:
+            title_bits.append(term_segment)
+        if date_segment:
+            title_bits.append(date_segment)
+        title_html = '<div style="font-weight:700; font-size:16px; margin-bottom:4px;">' + ' '.join(title_bits) + '</div>'
+    else:
+        if summary.get('date_range'):
+            start, end = summary['date_range']
+            date_text = start if start == end else ' – '.join([s for s in (start, end) if s])
+            if date_text:
+                header_lines.append(f'<div><strong>Date range:</strong> {_esc(date_text)}</div>')
+        if summary.get('term'):
+            header_lines.append(f'<div><strong>Term:</strong> {_esc(summary["term"])}</div>')
+
+    if title_html:
+        header_lines.insert(0, title_html)
+
     if lightweight:
         header_lines.append('<div><strong>Lightweight mode:</strong> popups and table trimmed for size.</div>')
 
     header_lines.append(f'<div><strong>Data Source:</strong> {_esc(summary["geojson_name"])}</div>')
-
-    if summary.get('date_range'):
-        start, end = summary['date_range']
-        date_text = start if start == end else ' – '.join([s for s in (start, end) if s])
-        if date_text:
-            header_lines.append(f'<div><strong>Date range:</strong> {_esc(date_text)}</div>')
-
-    if summary.get('term'):
-        header_lines.append(f'<div><strong>Term:</strong> {_esc(summary["term"])}</div>')
 
     header_lines.append(search_results_line)
 
@@ -2351,6 +2462,7 @@ def create_map(
         'collocate_colorize': bool(collocate_rank_colorize),
         'initial_collocate_term': initial_collocate_term,
         'collocate_map_variant': collocate_map_variant,
+        'collocate_export_geojson': bool(collocate_export_geojson),
     }
 
     # Embed collocate rank index when available
@@ -2835,6 +2947,37 @@ def create_map(
     var parent = document.querySelector('.leaflet-container') || document.body;
     parent.appendChild(container);
 
+    // Prevent map interactions when using the legend
+    try {
+      addScrollGuards(container);
+      if (typeof L !== 'undefined' && L && L.DomEvent) {
+        if (typeof L.DomEvent.disableClickPropagation === 'function') {
+          L.DomEvent.disableClickPropagation(container);
+        }
+        if (typeof L.DomEvent.disableScrollPropagation === 'function') {
+          L.DomEvent.disableScrollPropagation(container);
+        }
+      } else {
+        container.addEventListener('click', function(ev) {
+          if (typeof ev.stopPropagation === 'function') {
+            ev.stopPropagation();
+          }
+        });
+        container.addEventListener('dblclick', function(ev) {
+          if (typeof ev.stopPropagation === 'function') {
+            ev.stopPropagation();
+          }
+        });
+        container.addEventListener('wheel', function(ev) {
+          if (typeof ev.stopPropagation === 'function') {
+            ev.stopPropagation();
+          }
+        }, { passive: true });
+      }
+    } catch (legendGuardErr) {
+      // best-effort
+    }
+
     topTermLegendContainer = container;
     topTermLegend = container;
     topTermLegendList = list;
@@ -3190,9 +3333,22 @@ def create_map(
       return null;
     }
     var byCity = collocateRanks[ck];
-    if (timeKey && byCity && Object.prototype.hasOwnProperty.call(byCity, timeKey) && byCity[timeKey] && Object.prototype.hasOwnProperty.call(byCity[timeKey], term)) {
-      var val = Number(byCity[timeKey][term]);
-      return Number.isFinite(val) ? val : null;
+    if (timeKey && byCity) {
+      var candidates = resolveTimeKeys(timeKey);
+      if (!Array.isArray(candidates) || !candidates.length) {
+        candidates = [String(timeKey)];
+      }
+      for (var i = 0; i < candidates.length; i++) {
+        var key = candidates[i];
+        if (!key || !Object.prototype.hasOwnProperty.call(byCity, key)) {
+          continue;
+        }
+        var bucket = byCity[key];
+        if (bucket && Object.prototype.hasOwnProperty.call(bucket, term)) {
+          var val = Number(bucket[term]);
+          return Number.isFinite(val) ? val : null;
+        }
+      }
     }
     if ((!collocateTimeEnabled || !timeKey) && byCity && Object.prototype.hasOwnProperty.call(byCity, '') && byCity[''] && Object.prototype.hasOwnProperty.call(byCity[''], term)) {
       var baseVal = Number(byCity[''][term]);
@@ -3208,15 +3364,9 @@ def create_map(
     if (!Array.isArray(hits) || !hits.length) {
       return 0;
     }
-    if (timeKey && data.time_bins && data.time_bins[timeKey] && Array.isArray(data.time_bins[timeKey].indexes)) {
-      var allowed = new Set();
-      data.time_bins[timeKey].indexes.forEach(function(idx) {
-        var num = Number(idx);
-        if (Number.isFinite(num)) {
-          allowed.add(num);
-        }
-      });
-      if (!allowed.size) {
+    if (timeKey) {
+      var allowed = collectTimeIndexes(data, timeKey);
+      if (!allowed || !allowed.size) {
         return 0;
       }
       var count = 0;
@@ -3249,65 +3399,68 @@ def create_map(
   }
   function computeTopTermInfo(data, timeKey) {
     var bestTerm = '';
-    var bestRank = null;
     var bestCount = 0;
-    if (collocateRanks) {
+    var bestRankScore = Number.POSITIVE_INFINITY;
+    var evaluateTerm = function(term) {
+      if (!term) { return; }
+      var count = countArticlesForTerm(data, term, timeKey);
+      if (!Number.isFinite(count) || count <= 0) {
+        return;
+      }
+      var rankVal = lookupRankForTerm(data, timeKey, term);
+      var rankScore = Number.isFinite(rankVal) ? Number(rankVal) : Number.POSITIVE_INFINITY;
+      if (count > bestCount || (count === bestCount && (rankScore < bestRankScore || (rankScore === bestRankScore && term < bestTerm)))) {
+        bestTerm = term;
+        bestCount = count;
+        bestRankScore = rankScore;
+      }
+    };
+
+    if (data && data.collocate_hits) {
+      Object.keys(data.collocate_hits).forEach(evaluateTerm);
+    }
+
+    if (!bestTerm && collocateRanks) {
       var ck = cityKey(data && data.city, data && data.state);
       if (ck && Object.prototype.hasOwnProperty.call(collocateRanks, ck)) {
         var byCity = collocateRanks[ck];
         if (byCity) {
           var rankMap = null;
-          if (timeKey && Object.prototype.hasOwnProperty.call(byCity, timeKey)) {
-            rankMap = byCity[timeKey];
+          var variants = resolveTimeKeys(timeKey);
+          if (Array.isArray(variants) && variants.length) {
+            for (var i = 0; i < variants.length; i++) {
+              var key = variants[i];
+              if (key && Object.prototype.hasOwnProperty.call(byCity, key)) {
+                rankMap = byCity[key];
+                if (rankMap) { break; }
+              }
+            }
           }
           if (!rankMap && Object.prototype.hasOwnProperty.call(byCity, '')) {
             rankMap = byCity[''];
           }
           if (rankMap) {
             Object.keys(rankMap).forEach(function(term) {
-              var rankVal = Number(rankMap[term]);
-              if (!Number.isFinite(rankVal)) {
-                return;
-              }
-              if (!bestTerm || rankVal < bestRank || (rankVal === bestRank && term < bestTerm)) {
-                bestTerm = term;
-                bestRank = rankVal;
-              }
+              evaluateTerm(term);
             });
           }
         }
       }
     }
-    var count = 0;
-    if (bestTerm) {
-      count = countArticlesForTerm(data, bestTerm, timeKey);
-    }
-    if (!bestTerm || count <= 0) {
-      if (data && data.collocate_hits) {
-        Object.keys(data.collocate_hits).forEach(function(term) {
-          var termCount = countArticlesForTerm(data, term, timeKey);
-          if (termCount <= 0) {
-            return;
-          }
-          if (!bestTerm || termCount > count || (termCount === count && term < bestTerm)) {
-            bestTerm = term;
-            count = termCount;
-          }
-        });
-      }
-      if (bestTerm && !Number.isFinite(bestRank)) {
-        bestRank = lookupRankForTerm(data, timeKey, bestTerm);
-      }
-    }
+
     if (!bestTerm) {
       var emptyInfo = { term: '', rank: null, count: 0 };
       data._currentTopTermInfo = emptyInfo;
       return emptyInfo;
     }
+    var finalRank = Number.isFinite(bestRankScore) ? Number(bestRankScore) : lookupRankForTerm(data, timeKey, bestTerm);
+    if (!Number.isFinite(finalRank)) {
+      finalRank = null;
+    }
     var info = {
       term: bestTerm,
-      rank: Number.isFinite(bestRank) ? Number(bestRank) : null,
-      count: count,
+      rank: finalRank,
+      count: bestCount,
     };
     data._currentTopTermInfo = info;
     return info;
@@ -3349,13 +3502,15 @@ def create_map(
       if (!dataset) {
         return;
       }
+      // Determine current time key first, then filter dataset accordingly
+      var timeKey = currentTimeKey(mapObj);
       applyCollocateFilterToDataset(dataset, timeKey || null);
       var baseColor = '#2b6cb0';
       var colorScale = null;
       if (collocateColorize) {
         colorScale = createColorScale(dataset);
       }
-      var timeKey = currentTimeKey(mapObj);
+      // timeKey already resolved above
       var updates = [];
       mapObj.eachLayer(function(layer) {
         if (!layer || !layer.options || !layer.options.groupId) {
@@ -3390,9 +3545,11 @@ def create_map(
         var rank = Number.isFinite(info.rank) ? Number(info.rank) : null;
         var term = info.term || '';
         var count = Number(info.count) || 0;
+        var hasArticles = count > 0;
         var radius = isTopTermMode() ? countToRadius(count, maxCount) : rankToRadius(rank);
         if (!isTopTermMode()) {
           count = Array.isArray(data.entries) ? data.entries.length : 0;
+          hasArticles = count > 0;
         }
         if (typeof layer.setRadius === 'function') {
           layer.setRadius(radius);
@@ -3409,28 +3566,47 @@ def create_map(
         var collocateCount = count;
         var fillColor = baseColor;
         var strokeColor = baseColor;
-        if (isTopTermMode()) {
-          fillColor = colorForTerm(term);
+        var smallMarker = !hasArticles;
+        if (!smallMarker) {
+          if (isTopTermMode()) {
+            fillColor = colorForTerm(term);
+            strokeColor = '#2d3748';
+          } else if (collocateColorize && typeof colorScale === 'function') {
+            fillColor = colorScale(collocateCount);
+            strokeColor = '#4a5568';
+          }
+        } else {
+          radius = Math.max(2.5, Math.min(radius, 3));
+          if (typeof layer.setRadius === 'function') {
+            layer.setRadius(radius);
+          } else {
+            layer.options.radius = radius;
+          }
+          fillColor = '#4a5568';
           strokeColor = '#2d3748';
-        } else if (collocateColorize && typeof colorScale === 'function') {
-          fillColor = colorScale(collocateCount);
-          strokeColor = '#4a5568';
         }
-        var visible = collocateCount > 0;
+        var visible = !smallMarker;
         var isHighlighted = !highlightTerm || (term && term === highlightTerm);
         layer.options.topTermHighlighted = isHighlighted;
-        if (isTopTermMode() && term && visible) {
+        if (!smallMarker && isTopTermMode() && term && visible) {
           termCounts[term] = (termCounts[term] || 0) + 1;
         }
-        if (isTopTermMode() && highlightTerm && !isHighlighted) {
+        if (!smallMarker && isTopTermMode() && highlightTerm && !isHighlighted) {
           fillColor = lightenColor(fillColor, 0.6);
           strokeColor = lightenColor(strokeColor, 0.6);
         }
         var baseOpacity = (typeof layer.options.baseOpacity === 'number') ? layer.options.baseOpacity : (typeof layer.options.opacity === 'number' ? layer.options.opacity : 0.5);
         var baseFill = (typeof layer.options.baseFillOpacity === 'number') ? layer.options.baseFillOpacity : (typeof layer.options.fillOpacity === 'number' ? layer.options.fillOpacity : 0.85);
-        var opacityMultiplier = (isTopTermMode() && highlightTerm && !isHighlighted) ? 0.25 : 1;
-        var layerOpacity = visible ? baseOpacity * opacityMultiplier : 0;
-        var layerFillOpacity = visible ? baseFill * opacityMultiplier : 0;
+        var opacityMultiplier = (!smallMarker && isTopTermMode() && highlightTerm && !isHighlighted) ? 0.25 : 1;
+        var layerOpacity;
+        var layerFillOpacity;
+        if (smallMarker) {
+          layerOpacity = 0.8;
+          layerFillOpacity = 0.6;
+        } else {
+          layerOpacity = baseOpacity * opacityMultiplier;
+          layerFillOpacity = baseFill * opacityMultiplier;
+        }
         if (typeof layer.setStyle === 'function') {
           layer.setStyle({
             color: strokeColor,
@@ -3446,7 +3622,7 @@ def create_map(
         layer.options.opacity = layerOpacity;
         layer.options.fillOpacity = layerFillOpacity;
         var isGhost = !!layer.options.ghostMarker;
-        var interactive = !isGhost && visible && (!highlightTerm || isHighlighted);
+        var interactive = !isGhost && !smallMarker && (!highlightTerm || isHighlighted);
         layer.options.interactive = interactive;
         if (layer._path && layer._path.style) {
           layer._path.style.pointerEvents = interactive ? 'auto' : 'none';
@@ -3459,11 +3635,12 @@ def create_map(
         if (!interactive && currentHighlightId === layer.options.groupId) {
           clearHighlight();
         }
-        if (isTopTermMode()) {
+        if (!smallMarker && isTopTermMode()) {
           applyTopTermLabelState(layer, term);
         } else {
           var labelText = '';
-          if (Number.isFinite(rank) && rank > 0) {
+          // Only show a label when the location has visible entries in this time bin
+          if (!smallMarker && Number.isFinite(rank) && rank > 0) {
             labelText = String(Math.round(rank));
           }
           if (typeof layer.bindTooltip === 'function') {
@@ -3579,6 +3756,28 @@ def create_map(
     if (formatted && keys.indexOf(formatted) === -1) {
       keys.push(formatted);
     }
+    if (Array.isArray(timeLabels) && timeLabels.length) {
+      var isoCandidates = [];
+      if (formatted) {
+        isoCandidates.push(formatted);
+      }
+      if (typeof primary === 'string' && /T/.test(primary)) {
+        isoCandidates.push(primary.replace('.000Z', 'Z'));
+      }
+      isoCandidates.forEach(function(iso) {
+        if (!iso) {
+          return;
+        }
+        timeLabels.forEach(function(label, idx) {
+          if (label === iso) {
+            var keyStr = String(idx + 1);
+            if (keys.indexOf(keyStr) === -1) {
+              keys.push(keyStr);
+            }
+          }
+        });
+      });
+    }
     if (typeof timeValue === 'number' && Array.isArray(timeLabels) && timeLabels.length) {
       var idx = Math.round(timeValue);
       if (Number.isFinite(idx) && idx >= 1 && idx <= timeLabels.length) {
@@ -3613,6 +3812,38 @@ def create_map(
       }
     }
     return keys;
+  }
+
+  function collectTimeIndexes(data, timeKey) {
+    if (!timeKey || !data || !data.time_bins) {
+      return null;
+    }
+    var variants = resolveTimeKeys(timeKey);
+    if (!Array.isArray(variants) || !variants.length) {
+      variants = [String(timeKey)];
+    }
+    var allowed = new Set();
+    var matched = false;
+    variants.forEach(function(key) {
+      if (!key || !Object.prototype.hasOwnProperty.call(data.time_bins, key)) {
+        return;
+      }
+      var bin = data.time_bins[key];
+      if (!bin || !Array.isArray(bin.indexes) || !bin.indexes.length) {
+        return;
+      }
+      matched = true;
+      bin.indexes.forEach(function(idx) {
+        var num = Number(idx);
+        if (Number.isFinite(num)) {
+          allowed.add(num);
+        }
+      });
+    });
+    if (!matched || !allowed.size) {
+      return null;
+    }
+    return allowed;
   }
 
   function labelForTimeKey(key) {
@@ -4137,15 +4368,9 @@ def create_map(
       return;
     }
     var allowed = null;
-    if (timeKey && data.time_bins && data.time_bins[timeKey] && Array.isArray(data.time_bins[timeKey].indexes)) {
-      allowed = new Set();
-      data.time_bins[timeKey].indexes.forEach(function(idx) {
-        var num = Number(idx);
-        if (Number.isFinite(num)) {
-          allowed.add(num);
-        }
-      });
-      if (!allowed.size) {
+    if (timeKey) {
+      allowed = collectTimeIndexes(data, timeKey);
+      if (!allowed || !allowed.size) {
         data.entries = [];
         data.article_count = 0;
         return;
@@ -6227,6 +6452,20 @@ ${cluster_block}
     m.get_root().script.add_child(folium.Element(script_html))
 
     m.save(out_html)
+    collocate_geojson_path: Optional[str] = None
+    if collocate_export_geojson and popup_dataset:
+        geo_filename = f"{base_name}_{suffix}_collocates.geojson"
+        export_path = os.path.join(out_dir, geo_filename)
+        try:
+            collocate_geojson_path = _export_collocate_geojson(
+                export_path,
+                popup_dataset,
+                summary,
+                config_payload,
+            )
+        except Exception:
+            collocate_geojson_path = None
+
     metadata_paths: Dict[str, str] = {}
     metadata_common = {
         'tool': 'create_map',
@@ -6260,6 +6499,7 @@ ${cluster_block}
             'collocate_rank_focus_label': collocate_rank_focus_label,
             'collocate_rank_colorize': collocate_rank_colorize,
             'collocate_time_slider': collocate_time_slider_enabled,
+            'collocate_export_geojson': collocate_export_geojson,
         },
         'inputs': {
             'geojson_path': geojson_path,
@@ -6281,6 +6521,13 @@ ${cluster_block}
         if meta_path:
             metadata_paths['attribute_table'] = meta_path
 
+    if collocate_geojson_path:
+        geo_meta = dict(metadata_common)
+        geo_meta.update({'output_type': 'collocate_geojson'})
+        meta_path = write_metadata_file(project_dir, collocate_geojson_path, geo_meta, enabled=metadata_enabled)
+        if meta_path:
+            metadata_paths['collocate_geojson'] = meta_path
+
     result: Dict[str, Optional[str]] = {"map_path": out_html, 'summary': summary}
     if attr_file:
         result["attribute_table"] = attr_file
@@ -6293,7 +6540,10 @@ ${cluster_block}
         'table_mode': table_mode_norm,
         'table_row_limit': row_limit_val or 0,
         'collocate_time_slider': collocate_time_slider_enabled,
+        'collocate_export_geojson': collocate_export_geojson,
     }
     if metadata_paths:
         result['metadata'] = metadata_paths
+    if collocate_geojson_path:
+        result['collocate_geojson'] = collocate_geojson_path
     return result

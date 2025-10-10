@@ -1987,6 +1987,10 @@ class CollocateMapSettingsDialog(QDialog):
         self.colorize_check.setChecked(True)
         form.addRow(self.colorize_check)
 
+        self.export_geojson_check = QCheckBox('Export collocate GeoJSON summary')
+        self.export_geojson_check.setToolTip('Writes a GeoJSON file with per-location collocate data for inspection.')
+        form.addRow(self.export_geojson_check)
+
         time_row = QWidget()
         time_layout = QHBoxLayout(time_row)
         time_layout.setContentsMargins(0, 0, 0, 0)
@@ -2178,6 +2182,7 @@ class CollocateMapSettingsDialog(QDialog):
             'location_label': location_label,
             'enable_time_slider': self.enable_time_slider.isEnabled() and self.enable_time_slider.isChecked(),
             'use_selected_terms': self.use_selected_terms_check.isChecked(),
+            'export_geojson': self.export_geojson_check.isChecked(),
         }
 
 
@@ -3611,6 +3616,10 @@ class CollocationDialog(QDialog):
         time_unit = bin_unit if not ignore_bin else 'month'
         time_step = int(size_text) if (not ignore_bin and size_text.isdigit()) else 1
 
+        # Remember the requested date window for downstream map configuration
+        start_value = self.start_input.text().strip()
+        end_value = self.end_input.text().strip()
+
         # Collocation options influence tokenization
         opts = self._collect_options()
         drop_stop = bool(opts.get('drop_stopwords', False))
@@ -3686,6 +3695,7 @@ class CollocationDialog(QDialog):
                 settings_dialog.map_type_combo.setCurrentIndex(idx)
             settings_dialog._apply_map_type_constraints()
             settings_dialog.colorize_check.setChecked(bool(prev.get('colorize')))
+            settings_dialog.export_geojson_check.setChecked(bool(prev.get('export_geojson')))
             if prev.get('term_scope') == 'time' and settings_dialog.time_combo.count() > 0:
                 desired = prev.get('time_key')
                 if desired is not None:
@@ -3766,6 +3776,9 @@ class CollocationDialog(QDialog):
         self._collocate_map_settings['use_selected_terms'] = use_selected_terms
         map_settings['map_type'] = map_type
         self._collocate_map_settings['map_type'] = map_type
+        export_geojson = bool(map_settings.get('export_geojson'))
+        map_settings['export_geojson'] = export_geojson
+        self._collocate_map_settings['export_geojson'] = export_geojson
         term_scope = map_settings.get('term_scope', 'global')
         time_key = map_settings.get('time_key') or None
         time_label = map_settings.get('time_label') or ''
@@ -3807,6 +3820,9 @@ class CollocationDialog(QDialog):
                 collocate_map_variant=map_type,
                 metadata_enabled=getattr(parent, 'metadata_enabled', True),
                 project_dir=parent.project_folder if parent else None,
+                time_start_override=start_value or None,
+                time_end_override=end_value or None,
+                collocate_export_geojson=export_geojson,
             )
         except Exception as exc:
             QMessageBox.critical(self, 'Map Error', str(exc))
@@ -3821,6 +3837,12 @@ class CollocationDialog(QDialog):
             ]
             map_type_display = 'Top Ranked Term by Location' if map_type == 'top_term' else 'Rank Map by Term'
             log_lines.append(f'<div>Map type: {html.escape(map_type_display)}</div>')
+            geo_export_path = (result or {}).get('collocate_geojson')
+            if geo_export_path:
+                encoded_geo = urllib.parse.quote(geo_export_path)
+                log_lines.append(
+                    f'<div>Collocate GeoJSON: <a href="chronam-open:{encoded_geo}">{html.escape(geo_export_path)}</a></div>'
+                )
             if parent and hasattr(parent, 'append_project_log'):
                 parent.append_project_log('Collocate‑Rank Map', log_lines)
             QDesktopServices.openUrl(QUrl.fromLocalFile(map_path))
@@ -5365,7 +5387,6 @@ class CollocationDialog(QDialog):
                 'None of the manually selected terms are available for the current filters. The chart will use the Top N terms instead.',
             )
 
-        averages = None
         legend_order: List[str]
         home_label_value = None
 
@@ -5375,38 +5396,41 @@ class CollocationDialog(QDialog):
             top_terms = manual_terms
             legend_order = manual_terms
         elif use_global:
-            freq_series = None
             if 'frequency' in df.columns:
                 try:
                     freq_series = df.groupby('collocate_term')['frequency'].sum(min_count=1)
                 except TypeError:
                     freq_series = df.groupby('collocate_term')['frequency'].sum()
-            if freq_series is not None and not freq_series.empty:
-                mean_ranks = df.groupby('collocate_term')['ordinal_rank'].mean().rename('avg_rank')
-                summary = pd.DataFrame({'total_frequency': freq_series})
-                summary = summary.merge(mean_ranks, left_index=True, right_index=True, how='left')
-                summary['avg_rank'] = summary['avg_rank'].fillna(float('inf'))
-                summary = summary.sort_values(['total_frequency', 'avg_rank'], ascending=[False, True])
-                top_terms = summary.head(top_n).index.tolist()
-                if not top_terms:
-                    QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
-                    return
-                legend_order = top_terms
             else:
-                averages = df.groupby('collocate_term')['ordinal_rank'].mean().dropna()
-                top_terms = averages.sort_values().head(top_n).index.tolist()
-                if not top_terms:
-                    QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
-                    return
-                ordered_series = averages.reindex(top_terms).dropna().sort_values()
-                legend_order = ordered_series.index.tolist() if not ordered_series.empty else list(top_terms)
+                freq_series = None
+            if freq_series is None or freq_series.empty:
+                freq_series = df.groupby('collocate_term').size()
+            if freq_series.empty:
+                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+                return
+            summary = freq_series.reset_index()
+            if summary.shape[1] >= 2:
+                summary.columns = ['collocate_term', 'total_frequency'] + list(summary.columns[2:])
+            else:
+                summary.columns = ['collocate_term', 'total_frequency']
+            summary['term_key'] = summary['collocate_term'].astype(str).str.lower()
+            summary = summary.sort_values(['total_frequency', 'term_key'], ascending=[False, True])
+            top_terms = summary.head(top_n)['collocate_term'].tolist()
+            if not top_terms:
+                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+                return
+            legend_order = top_terms
         else:
             df_home = df[df['time_bin'] == home_label_value].dropna(subset=['ordinal_rank'])
             if df_home.empty:
                 QMessageBox.information(self, 'No Data', 'The selected bin contains no collocates.')
                 return
-            df_home_sorted = df_home.sort_values('ordinal_rank')
-            top_terms = df_home_sorted.head(top_n)['collocate_term'].tolist()
+            if 'frequency' in df_home.columns:
+                freq_home = df_home.groupby('collocate_term')['frequency'].sum()
+            else:
+                freq_home = df_home.groupby('collocate_term').size()
+            freq_home = freq_home.sort_values(ascending=False)
+            top_terms = freq_home.head(top_n).index.tolist()
             if not top_terms:
                 QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
                 return
