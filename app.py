@@ -3342,6 +3342,7 @@ class CollocationDialog(QDialog):
         form.addRow('Bin Size:', self.bin_size)
         self.bin_unit = QComboBox()
         self.bin_unit.addItems(['Days', 'Weeks', 'Months', 'Years'])
+        self.bin_unit.setCurrentIndex(3)
         form.addRow('Time Unit:', self.bin_unit)
         self.ignore_bin = QCheckBox('Ignore Bin Size (no time binning)')
         self.ignore_bin.setChecked(True)

@@ -2391,7 +2391,7 @@ def create_map(
         header_lines.insert(0, title_html)
 
     if lightweight:
-        header_lines.append('<div><strong>Lightweight mode:</strong> popups and table trimmed for size.</div>')
+        header_lines.append('<div style="font-size:12px; font-weight:400;"><em>Lightweight mode: popups and table trimmed for size.</em></div>')
 
     header_lines.append(f'<div><strong>Data Source:</strong> {_esc(summary["geojson_name"])}</div>')
 
@@ -2562,17 +2562,16 @@ def create_map(
             'padding: 2px 8px; '
             '}'
             '.collocate-time-button[data-clock-role="toggle"][data-clock-disabled="1"]::after { '
-            'content: "/"; '
+            'content: ""; '
             'position: absolute; '
-            'inset: 0; '
-            'display: flex; '
-            'align-items: center; '
-            'justify-content: center; '
-            'color: #c53030; '
-            'font-size: 20px; '
-            'font-weight: 700; '
+            'left: 50%; '
+            'top: 50%; '
+            'width: 70%; '
+            'height: 2px; '
+            'background: #c53030; '
+            'border-radius: 999px; '
             'pointer-events: none; '
-            'transform: rotate(-45deg); '
+            'transform: translate(-50%, -50%) rotate(45deg); '
             '}'
             '.collocate-time-button:hover { background: #edf2f7; color: #1a202c; }'
             '.collocate-time-button:disabled { opacity: 0.4; cursor: default; }'
@@ -5442,6 +5441,8 @@ def create_map(
       var labelIndex = Number.isFinite(entry.orderIndex) ? entry.orderIndex : (idx + 1);
       entry.orderIndex = labelIndex;
       entry.wrapper.dataset.pinDisplayIndex = String(labelIndex);
+      var isAlternate = labelIndex % 2 === 0;
+      entry.wrapper.style.background = isAlternate ? '#f1f5f9' : 'rgba(255,255,255,0.98)';
       var badge = entry.wrapper.querySelector('[data-pin-badge="1"]');
       if (!badge) {
         badge = document.createElement('div');
@@ -5457,7 +5458,40 @@ def create_map(
         badge.style.borderRadius = '999px';
         entry.wrapper.appendChild(badge);
       }
+      badge.style.cursor = 'pointer';
+      badge.style.userSelect = 'none';
+      badge.title = 'Move this pinned article to the top';
+      badge.setAttribute('role', 'button');
+      badge.setAttribute('tabindex', '0');
+      badge.setAttribute('data-pin-entry-id', entry.id);
+      if (!badge.dataset.listenerAttached) {
+        var handlePinBadgeClick = function(ev) {
+          if (ev) {
+            if (typeof ev.preventDefault === 'function') {
+              ev.preventDefault();
+            }
+            if (typeof ev.stopPropagation === 'function') {
+              ev.stopPropagation();
+            }
+          }
+          var targetId = this.getAttribute('data-pin-entry-id');
+          bringPinnedEntryToFront(targetId);
+        };
+        badge.addEventListener('click', handlePinBadgeClick);
+        badge.addEventListener('keydown', function(ev) {
+          if (!ev) {
+            return;
+          }
+          if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+            ev.preventDefault();
+            ev.stopPropagation();
+            bringPinnedEntryToFront(this.getAttribute('data-pin-entry-id'));
+          }
+        });
+        badge.dataset.listenerAttached = '1';
+      }
       badge.textContent = '#' + labelIndex;
+      badge.setAttribute('aria-label', 'Move pinned article #' + labelIndex + ' to top');
       frag.appendChild(entry.wrapper);
     });
     body.innerHTML = '';
@@ -5473,6 +5507,27 @@ def create_map(
     if (pinState.focusBtn) {
       pinState.focusBtn.disabled = !hasEntries;
     }
+  }
+
+  function bringPinnedEntryToFront(entryId) {
+    if (!entryId) {
+      return;
+    }
+    var idx = -1;
+    for (var i = 0; i < pinState.entries.length; i++) {
+      if (pinState.entries[i] && pinState.entries[i].id === entryId) {
+        idx = i;
+        break;
+      }
+    }
+    if (idx <= 0) {
+      return;
+    }
+    var before = pinState.entries.slice(0, idx);
+    var after = pinState.entries.slice(idx);
+    pinState.entries = after.concat(before);
+    renderPinnedList();
+    updatePinPanelVisibility();
   }
 
   function rotatePinnedEntries(direction) {
