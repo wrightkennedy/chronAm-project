@@ -8,7 +8,7 @@ import threading
 import time
 import urllib.parse
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 from PyQt5.QtCore import (
@@ -36,6 +36,7 @@ from PyQt5.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -306,8 +307,9 @@ class MainWindow(QMainWindow):
         self.search_log_history = []
         self.project_log_entries = []
         self.project_file = None
-        self.collocation_state = {'dropped_terms': []}
+        self.collocation_state = {'dropped_terms': [], 'term_groups': []}
         self.collocation_drop_terms = []
+        self.collocation_term_groups: List[dict] = []
         self.map_settings = _default_map_settings()
         self.metadata_enabled = True
         self.init_ui()
@@ -610,8 +612,9 @@ class MainWindow(QMainWindow):
         self.locations_csv_path = None
         self.search_log_history.clear()
         self.project_log_entries.clear()
-        self.collocation_state = {'dropped_terms': []}
+        self.collocation_state = {'dropped_terms': [], 'term_groups': []}
         self.collocation_drop_terms = []
+        self.collocation_term_groups = []
         self.map_settings = _default_map_settings()
         self.metadata_enabled = True
         if hasattr(self, 'metadata_checkbox'):
@@ -671,6 +674,47 @@ class MainWindow(QMainWindow):
             self.collocation_drop_terms = []
         if isinstance(self.collocation_state, dict):
             self.collocation_state['dropped_terms'] = list(self.collocation_drop_terms)
+
+        groups_value = data.get('collocation_term_groups')
+        if groups_value is None and isinstance(self.collocation_state, dict):
+            groups_value = self.collocation_state.get('term_groups')
+        self.collocation_term_groups = []
+        if isinstance(groups_value, list):
+            for entry in groups_value:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get('name', '')).strip()
+                if not name:
+                    continue
+                terms_raw = entry.get('terms') or []
+                terms: List[str] = []
+                seen_terms: Set[str] = set()
+                for term in terms_raw:
+                    term_str = str(term).strip()
+                    if not term_str:
+                        continue
+                    lower = term_str.lower()
+                    if lower in seen_terms:
+                        continue
+                    seen_terms.add(lower)
+                    terms.append(term_str)
+                if not terms:
+                    continue
+                group_record: Dict[str, Any] = {'name': name, 'terms': terms}
+                freq_val = entry.get('total_frequency')
+                try:
+                    if freq_val is not None:
+                        group_record['total_frequency'] = float(freq_val)
+                except (TypeError, ValueError):
+                    pass
+                missing_terms = entry.get('missing_terms')
+                if isinstance(missing_terms, list):
+                    cleaned_missing = [str(term).strip() for term in missing_terms if str(term).strip()]
+                    if cleaned_missing:
+                        group_record['missing_terms'] = cleaned_missing
+                self.collocation_term_groups.append(group_record)
+        if isinstance(self.collocation_state, dict):
+            self.collocation_state['term_groups'] = [dict(group) for group in self.collocation_term_groups]
 
         self.metadata_enabled = bool(data.get('metadata_enabled', True))
         if hasattr(self, 'metadata_checkbox'):
@@ -736,6 +780,7 @@ class MainWindow(QMainWindow):
             'map_settings': dict(self.map_settings),
             'collocation_state': dict(self.collocation_state),
             'collocation_drop_terms': list(self.collocation_drop_terms),
+            'collocation_term_groups': [dict(group) for group in self.collocation_term_groups],
             'metadata_enabled': bool(self.metadata_enabled),
         }
 
@@ -1764,6 +1809,8 @@ class CollocationRankSettingsDialog(QDialog):
                 status_text = 'Existing by-time CSV located.'
         elif status_kind == 'drop_terms':
             status_text = 'Drop terms active; a new by-time CSV will be generated when you click OK.'
+        elif status_kind == 'missing':
+            status_text = 'By-time CSV not found yet. It will be generated when you click OK.'
         elif csv_status:
             status_text = html.escape(str(csv_status))
 
@@ -2510,6 +2557,7 @@ class MapToolDialog(QDialog):
                 lightweight=cfg.get('lightweight'),
                 table_mode=cfg.get('table_mode'),
                 table_row_limit=cfg.get('table_row_limit'),
+                collocate_term_groups=getattr(parent, 'collocation_term_groups', []),
                 metadata_enabled=getattr(parent, 'metadata_enabled', True) if parent else True,
                 project_dir=parent.project_folder if parent else None,
             )
@@ -2632,11 +2680,16 @@ class TermSelectionDialog(QDialog):
         self.selected_terms: List[str] = list(selected_terms)
         self._initializing = True
         self._action_verb = action_verb
+        self._term_frequency: Dict[str, Optional[float]] = {}
+        self._item_by_term: Dict[str, QListWidgetItem] = {}
+        self._item_original_text: Dict[str, str] = {}
 
         layout = QVBoxLayout(self)
+        self._main_layout = layout
         info = QLabel(info_text)
         info.setWordWrap(True)
         layout.addWidget(info)
+        self.info_label = info
 
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText('Search terms...')
@@ -2653,6 +2706,7 @@ class TermSelectionDialog(QDialog):
         layout.addLayout(length_row)
 
         controls = QHBoxLayout()
+        self.controls_layout = controls
         self.show_selected_btn = QPushButton('Show Selected Terms')
         self.show_selected_btn.setCheckable(True)
         controls.addWidget(self.show_selected_btn)
@@ -2674,6 +2728,11 @@ class TermSelectionDialog(QDialog):
             existing.add(term)
             rank = info_row.get('rank')
             frequency = info_row.get('frequency')
+            try:
+                freq_numeric = float(frequency)
+            except (TypeError, ValueError):
+                freq_numeric = None
+            self._term_frequency[term] = freq_numeric
             parts = []
             if isinstance(rank, int):
                 parts.append(f"#{rank}")
@@ -2689,9 +2748,12 @@ class TermSelectionDialog(QDialog):
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked if term in self.selected_terms else Qt.Unchecked)
             self.list_widget.addItem(item)
+            self._item_by_term[term] = item
+            self._item_original_text[term] = item_text
         self.list_widget.blockSignals(False)
 
         button_row = QHBoxLayout()
+        self._button_row_layout = button_row
         button_row.addStretch(1)
         self.action_btn = QPushButton(f'{self._action_verb} 0 Term(s)')
         self.action_btn.setDefault(True)
@@ -2817,6 +2879,283 @@ class TermPlotDialog(TermSelectionDialog):
             action_verb='Select',
         )
 
+
+class TermGroupDialog(TermSelectionDialog):
+    def __init__(
+        self,
+        parent: Optional[QWidget],
+        terms: List[dict],
+        existing_groups: Iterable[dict],
+    ):
+        self.groups: List[dict] = []
+        self.created_groups: List[dict] = []
+        self._group_term_lookup: Dict[str, str] = {}
+        self._group_name_set: Set[str] = set()
+        super().__init__(
+            parent,
+            terms,
+            [],
+            window_title='Group Terms',
+            info_text='Select collocate terms to group together, then assign a display name for the group.',
+            action_verb='Create',
+        )
+
+        self.group_btn = QPushButton('Group Terms')
+        self.group_btn.clicked.connect(self._create_group_from_selection)
+        self.controls_layout.insertWidget(0, self.group_btn)
+
+        groups_box = QGroupBox('Current Groups')
+        groups_layout = QVBoxLayout(groups_box)
+        groups_layout.setContentsMargins(8, 8, 8, 8)
+        self.groups_list = QListWidget()
+        self.groups_list.setSelectionMode(QListWidget.SingleSelection)
+        groups_layout.addWidget(self.groups_list)
+
+        group_buttons = QHBoxLayout()
+        self.rename_group_btn = QPushButton('Rename')
+        self.remove_group_btn = QPushButton('Remove')
+        group_buttons.addWidget(self.rename_group_btn)
+        group_buttons.addWidget(self.remove_group_btn)
+        group_buttons.addStretch(1)
+        groups_layout.addLayout(group_buttons)
+
+        insert_index = max(0, self._main_layout.count() - 1)
+        self._main_layout.insertWidget(insert_index, groups_box)
+
+        self.groups_list.itemSelectionChanged.connect(self._update_group_controls)
+        self.groups_list.itemDoubleClicked.connect(lambda _item: self._rename_selected_group())
+        self.rename_group_btn.clicked.connect(self._rename_selected_group)
+        self.remove_group_btn.clicked.connect(self._remove_selected_group)
+
+        self._load_existing_groups(existing_groups)
+        self._update_group_controls()
+        self._update_group_button_enabled()
+        self._update_action_button_text()
+
+    def _load_existing_groups(self, existing_groups: Iterable[dict]):
+        for entry in existing_groups or []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get('name', '')).strip()
+            if not name:
+                continue
+            terms_raw = entry.get('terms') or []
+            terms: List[str] = []
+            seen: Set[str] = set()
+            for term in terms_raw:
+                term_str = str(term).strip()
+                if not term_str:
+                    continue
+                lower = term_str.lower()
+                if lower in seen:
+                    continue
+                seen.add(lower)
+                terms.append(term_str)
+            total_freq = entry.get('total_frequency')
+            freq_candidates = [self._term_frequency.get(term) for term in terms if self._term_frequency.get(term) is not None]
+            if freq_candidates:
+                total_freq = float(sum(freq_candidates))
+            missing_terms = [term for term in terms if term not in self._item_by_term]
+            group_data = {
+                'name': name,
+                'terms': terms,
+            }
+            if total_freq is not None:
+                group_data['total_frequency'] = total_freq
+            if missing_terms:
+                group_data['missing_terms'] = list(missing_terms)
+            self.groups.append(group_data)
+            self._group_name_set.add(name.lower())
+            for term in terms:
+                self._group_term_lookup[term.lower()] = name
+                if term in self._item_by_term:
+                    self._set_item_group_state(term, name)
+        self._refresh_group_list()
+
+    def _selected_terms_available(self) -> bool:
+        for term in self._gather_selected():
+            if term.lower() not in self._group_term_lookup:
+                return True
+        return False
+
+    def _create_group_from_selection(self):
+        selected_terms = [term for term in self._gather_selected() if term.lower() not in self._group_term_lookup]
+        if not selected_terms:
+            QMessageBox.information(self, 'Select Terms', 'Select one or more ungrouped terms to create a new group.')
+            return
+        default_name = selected_terms[0]
+        name, ok = QInputDialog.getText(self, 'Group Name', 'Enter display name for this group:', QLineEdit.Normal, default_name)
+        if not ok:
+            return
+        display_name = str(name).strip()
+        if not display_name:
+            QMessageBox.warning(self, 'Name Required', 'Enter a non-empty display name for the group.')
+            return
+        if display_name.lower() in self._group_name_set:
+            QMessageBox.warning(self, 'Duplicate Name', 'A group with this name already exists. Choose a different name.')
+            return
+        terms_sorted = list(dict.fromkeys(selected_terms))
+        freq_values = [self._term_frequency.get(term) for term in terms_sorted if self._term_frequency.get(term) is not None]
+        total_freq = float(sum(freq_values)) if freq_values else None
+        group_data: Dict[str, Any] = {
+            'name': display_name,
+            'terms': terms_sorted,
+        }
+        if total_freq is not None:
+            group_data['total_frequency'] = total_freq
+        self.groups.append(group_data)
+        self._group_name_set.add(display_name.lower())
+        for term in terms_sorted:
+            self._group_term_lookup[term.lower()] = display_name
+            self._set_item_group_state(term, display_name)
+        self._refresh_group_list()
+        self._update_group_button_enabled()
+        self._update_action_button_text()
+
+    def _rename_selected_group(self):
+        item = self.groups_list.currentItem()
+        if item is None:
+            return
+        name = item.data(Qt.UserRole) or ''
+        group = next((grp for grp in self.groups if grp.get('name') == name), None)
+        if group is None:
+            return
+        new_name, ok = QInputDialog.getText(self, 'Rename Group', 'Enter a new display name for this group:', QLineEdit.Normal, name)
+        if not ok:
+            return
+        new_display = str(new_name).strip()
+        if not new_display:
+            QMessageBox.warning(self, 'Name Required', 'Enter a non-empty display name for the group.')
+            return
+        if new_display.lower() != name.lower() and new_display.lower() in self._group_name_set:
+            QMessageBox.warning(self, 'Duplicate Name', 'A group with this name already exists. Choose a different name.')
+            return
+        self._group_name_set.discard(name.lower())
+        self._group_name_set.add(new_display.lower())
+        group['name'] = new_display
+        for term in group.get('terms', []):
+            if term.lower() in self._group_term_lookup:
+                self._group_term_lookup[term.lower()] = new_display
+            self._set_item_group_state(term, new_display)
+        self._refresh_group_list()
+        self._update_action_button_text()
+
+    def _remove_selected_group(self):
+        item = self.groups_list.currentItem()
+        if item is None:
+            return
+        name = item.data(Qt.UserRole) or ''
+        index = next((idx for idx, grp in enumerate(self.groups) if grp.get('name') == name), None)
+        if index is None:
+            return
+        group = self.groups.pop(index)
+        self._group_name_set.discard(name.lower())
+        for term in group.get('terms', []):
+            self._group_term_lookup.pop(term.lower(), None)
+            self._set_item_group_state(term, None)
+        self._refresh_group_list()
+        self._update_group_button_enabled()
+        self._update_action_button_text()
+
+    def _set_item_group_state(self, term: str, group_name: Optional[str]):
+        item = self._item_by_term.get(term)
+        if item is None:
+            return
+        self.list_widget.blockSignals(True)
+        if group_name:
+            base_text = self._item_original_text.get(term, term)
+            item.setText(f"{base_text} [Grouped → {group_name}]")
+            item.setCheckState(Qt.Unchecked)
+            item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+        else:
+            base_text = self._item_original_text.get(term, term)
+            item.setText(base_text)
+            flags = item.flags()
+            item.setFlags(flags | Qt.ItemIsEnabled)
+            item.setCheckState(Qt.Unchecked)
+        self.list_widget.blockSignals(False)
+
+    def _refresh_group_list(self):
+        self.groups_list.blockSignals(True)
+        self.groups_list.clear()
+        for group in self.groups:
+            label = self._format_group_description(group)
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, group.get('name'))
+            self.groups_list.addItem(item)
+        self.groups_list.blockSignals(False)
+        self._update_group_controls()
+
+    def _format_group_description(self, group: dict) -> str:
+        name = group.get('name', '') or ''
+        terms = group.get('terms', []) or []
+        missing = {str(term).strip().lower() for term in group.get('missing_terms', []) or []}
+        decorated_terms = []
+        for term in terms:
+            term_str = str(term)
+            if term_str.lower() in missing:
+                decorated_terms.append(f"{term_str} (not in list)")
+            else:
+                decorated_terms.append(term_str)
+        terms_text = '; '.join(decorated_terms) if decorated_terms else '(none)'
+        freq = group.get('total_frequency')
+        freq_text = ''
+        if isinstance(freq, (float, int)):
+            value = float(freq)
+            if abs(value - round(value)) < 1e-6:
+                freq_text = f" (Total: {int(round(value)):,})"
+            else:
+                freq_text = f" (Total: {value:.2f})"
+        return f"{name}: {terms_text}{freq_text}"
+
+    def _update_group_controls(self):
+        has_selection = self.groups_list.currentRow() >= 0
+        self.rename_group_btn.setEnabled(has_selection)
+        self.remove_group_btn.setEnabled(has_selection)
+
+    def _update_group_button_enabled(self):
+        self.group_btn.setEnabled(self._selected_terms_available())
+
+    def _handle_item_changed(self, item):
+        super()._handle_item_changed(item)
+        self._update_group_button_enabled()
+
+    def _clear_checks(self):
+        super()._clear_checks()
+        self._update_group_button_enabled()
+
+    def _handle_length_selection(self, value: int):
+        super()._handle_length_selection(value)
+        self._clear_grouped_checks()
+        self._update_group_button_enabled()
+
+    def _clear_grouped_checks(self):
+        self.list_widget.blockSignals(True)
+        for term, item in self._item_by_term.items():
+            if term.lower() in self._group_term_lookup:
+                item.setCheckState(Qt.Unchecked)
+        self.list_widget.blockSignals(False)
+
+    def _update_action_button_text(self):
+        group_count = len(self.groups)
+        total_terms = sum(len(group.get('terms', []) or []) for group in self.groups)
+        self.action_btn.setText(f'Create {group_count} Group(s) from {total_terms} Term(s)')
+        self.action_btn.setEnabled(group_count > 0)
+
+    def _accept_selection(self):
+        def serialize(group: dict) -> dict:
+            data = {
+                'name': group.get('name'),
+                'terms': list(group.get('terms', []) or []),
+            }
+            if group.get('total_frequency') is not None:
+                data['total_frequency'] = float(group['total_frequency'])
+            if group.get('missing_terms'):
+                data['missing_terms'] = list(group.get('missing_terms'))
+            return data
+
+        self.created_groups = [serialize(group) for group in self.groups]
+        self.accept()
 class CollocationDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2829,8 +3168,10 @@ class CollocationDialog(QDialog):
         self._rank_selected_terms: List[str] = []
         self._drop_section_button: Optional[QToolButton] = None
         self._selected_section_button: Optional[QToolButton] = None
+        self._group_section_button: Optional[QToolButton] = None
         self._drop_terms_prev_count = 0
         self._selected_terms_prev_count = 0
+        self._group_terms_prev_count = 0
         self._rank_log_scale: bool = True
 
         # --- Source selection & status line ---
@@ -2983,6 +3324,40 @@ class CollocationDialog(QDialog):
         drop_section.setMaximumWidth(260)
         self._drop_section_button = drop_toggle
 
+        group_column = QVBoxLayout()
+        group_column.setContentsMargins(0, 0, 0, 0)
+        group_column.setSpacing(6)
+        self.group_terms_btn = QPushButton('Group Terms')
+        self.group_terms_btn.clicked.connect(self.open_group_terms_dialog)
+        self.group_terms_btn.setEnabled(False)
+        group_column.addWidget(self.group_terms_btn)
+
+        group_summary_row = QHBoxLayout()
+        group_summary_row.setContentsMargins(0, 0, 0, 0)
+        self.group_summary_label = QLabel()
+        self.group_summary_label.setWordWrap(True)
+        self.group_summary_label.setStyleSheet('color: #555555; font-size: 11px;')
+        group_summary_row.addWidget(self.group_summary_label, 1)
+        self.clear_groups_btn = QPushButton('Clear')
+        self.clear_groups_btn.setFixedHeight(22)
+        self.clear_groups_btn.setMaximumWidth(70)
+        self.clear_groups_btn.clicked.connect(self.clear_group_terms)
+        group_summary_row.addWidget(self.clear_groups_btn, 0)
+        group_column.addLayout(group_summary_row)
+
+        self.group_terms_view = QTextBrowser()
+        self.group_terms_view.setReadOnly(True)
+        self.group_terms_view.setMinimumHeight(120)
+        self.group_terms_view.setStyleSheet('font-size: 11px;')
+        group_column.addWidget(self.group_terms_view)
+        group_column.addStretch(1)
+
+        group_content = QWidget()
+        group_content.setLayout(group_column)
+        group_section, group_toggle = self._create_collapsible_section('Group Terms', group_content, expanded=False)
+        group_section.setMaximumWidth(260)
+        self._group_section_button = group_toggle
+
         select_column = QVBoxLayout()
         select_column.setContentsMargins(0, 0, 0, 0)
         select_column.setSpacing(6)
@@ -3021,6 +3396,7 @@ class CollocationDialog(QDialog):
         right_column.setContentsMargins(0, 0, 0, 0)
         right_column.setSpacing(12)
         right_column.addWidget(drop_section)
+        right_column.addWidget(group_section)
         right_column.addWidget(selected_section)
 
         options_group = QGroupBox('Collocation Options')
@@ -3071,6 +3447,7 @@ class CollocationDialog(QDialog):
         self._restore_state_or_defaults()
         self._loading_defaults = False
         self._update_drop_summary()
+        self._update_group_summary()
         self._update_selected_terms_summary()
         self._update_context_keyword_label()
         self._set_clear_notice('')
@@ -3324,6 +3701,7 @@ class CollocationDialog(QDialog):
                 collocate_rank_mode=True,
                 collocate_drop_stopwords=drop_stop,
                 collocate_drop_terms=self._get_parent_drop_terms(),
+                collocate_term_groups=self._get_parent_term_groups(),
                 collocate_rank_top_n=top_n,
                 collocate_rank_term_scope=term_scope,
                 collocate_rank_time_key=time_key,
@@ -3512,6 +3890,12 @@ class CollocationDialog(QDialog):
                 parent.collocation_drop_terms = []
         self._update_drop_summary()
 
+        groups_state = state.get('term_groups')
+        if groups_state is not None:
+            self._set_term_groups(groups_state, log_change=False)
+        else:
+            self._update_group_summary()
+
         manual_terms_state = state.get('rank_selected_terms')
         if isinstance(manual_terms_state, list):
             cleaned: List[str] = []
@@ -3682,6 +4066,7 @@ class CollocationDialog(QDialog):
                 ignore_bin=self.ignore_bin.isChecked(),
                 write_by_time=True,
                 drop_terms=drop_terms,
+                term_groups=self._get_parent_term_groups(),
                 window_left=window_left,
                 window_right=window_right,
                 metadata_enabled=metadata_enabled,
@@ -3701,6 +4086,59 @@ class CollocationDialog(QDialog):
             return expected, None
         return None, 'By-time data could not be created. Please run the collocation analysis first.'
 
+    def _derive_time_bins_from_inputs(self) -> List[str]:
+        start_text = self.start_input.text().strip()
+        end_text = self.end_input.text().strip()
+        bin_unit = self._current_time_bin_unit()
+
+        if not start_text or not end_text or not bin_unit:
+            return []
+
+        try:
+            start_dt = pd.to_datetime(start_text, errors='raise')
+            end_dt = pd.to_datetime(end_text, errors='raise')
+        except Exception:
+            return []
+
+        if pd.isna(start_dt) or pd.isna(end_dt):
+            return []
+
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+
+        parts = bin_unit.strip().split()
+        if len(parts) != 2:
+            return []
+        try:
+            size = int(parts[0])
+        except ValueError:
+            return []
+        unit = parts[1].lower()
+        if size <= 0:
+            return []
+
+        current = start_dt
+        end_inclusive = end_dt
+        bins: List[str] = []
+        max_bins = 600
+
+        while current <= end_inclusive and len(bins) < max_bins:
+            bins.append(current.date().isoformat())
+            if unit.startswith('day'):
+                current = current + pd.Timedelta(days=size)
+            elif unit.startswith('week'):
+                current = current + pd.Timedelta(weeks=size)
+            elif unit.startswith('month'):
+                current = current + pd.DateOffset(months=size)
+            elif unit.startswith('year'):
+                current = current + pd.DateOffset(years=size)
+            else:
+                return []
+
+        if not bins:
+            bins.append(start_dt.date().isoformat())
+        return bins
+
     def _update_context_keyword_label(self):
         if not hasattr(self, 'keyword_label'):
             return
@@ -3717,6 +4155,104 @@ class CollocationDialog(QDialog):
         if parent is None:
             return []
         return list(getattr(parent, 'collocation_drop_terms', []))
+
+    def _get_parent_term_groups(self) -> List[dict]:
+        parent = self.parent()
+        if parent is None:
+            return []
+        groups = getattr(parent, 'collocation_term_groups', [])
+        cleaned: List[dict] = []
+        for entry in groups or []:
+            if isinstance(entry, dict):
+                cleaned.append(dict(entry))
+        return cleaned
+
+    def _normalize_term_groups_for_storage(self, groups: Iterable[dict]) -> List[dict]:
+        normalized: List[dict] = []
+        for entry in groups or []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get('name', '')).strip()
+            if not name:
+                continue
+            terms_raw = entry.get('terms') or []
+            terms: List[str] = []
+            seen_terms: Set[str] = set()
+            for term in terms_raw:
+                term_str = str(term).strip()
+                if not term_str:
+                    continue
+                lower = term_str.lower()
+                if lower in seen_terms:
+                    continue
+                seen_terms.add(lower)
+                terms.append(term_str)
+            if not terms:
+                continue
+            data: Dict[str, Any] = {'name': name, 'terms': terms}
+            total_freq = entry.get('total_frequency')
+            try:
+                if total_freq is not None:
+                    data['total_frequency'] = float(total_freq)
+            except (TypeError, ValueError):
+                pass
+            missing_terms = entry.get('missing_terms')
+            if isinstance(missing_terms, list):
+                cleaned_missing = [str(term).strip() for term in missing_terms if str(term).strip()]
+                if cleaned_missing:
+                    data['missing_terms'] = cleaned_missing
+            normalized.append(data)
+        return normalized
+
+    def _set_term_groups(self, groups: Iterable[dict], *, log_change: bool, show_notice: bool = False):
+        parent = self.parent()
+        if parent is None:
+            return
+        normalized = self._normalize_term_groups_for_storage(groups)
+        previous = list(getattr(parent, 'collocation_term_groups', []))
+        parent.collocation_term_groups = normalized
+        state = dict(getattr(parent, 'collocation_state', {}) or {})
+        state['term_groups'] = [dict(group) for group in normalized]
+        parent.collocation_state = state
+        self._update_group_summary()
+        self._save_state()
+        if log_change and normalized != previous:
+            self._log_term_groups_change(previous, normalized)
+        if show_notice:
+            self._set_clear_notice('Run the collocation analysis again to apply changes.')
+
+    def _log_term_groups_change(self, previous: List[dict], current: List[dict]):
+        parent = self.parent()
+        if parent is None:
+            return
+        if not current:
+            parent.append_project_log('Collocation Analysis', ['<div>Term groups cleared.</div>'])
+            return
+        items = []
+        for group in current:
+            name = html.escape(str(group.get('name', '')))
+            terms = group.get('terms', []) or []
+            missing = {str(term).strip().lower() for term in group.get('missing_terms', []) or []}
+            term_parts = []
+            for term in terms:
+                rendered = html.escape(str(term))
+                if str(term).strip().lower() in missing:
+                    rendered = f"{rendered} (not in list)"
+                term_parts.append(rendered)
+            freq = group.get('total_frequency')
+            freq_text = ''
+            if isinstance(freq, (float, int)):
+                value = float(freq)
+                if abs(value - round(value)) < 1e-6:
+                    freq_text = f" (Total: {int(round(value)):,})"
+                else:
+                    freq_text = f" (Total: {value:.2f})"
+            items.append(f'<li><strong>{name}</strong>: {"; ".join(term_parts)}{freq_text}</li>')
+        lines = [
+            f'<div>Updated term groups ({len(current)})</div>',
+            f'<div style="max-height:220px; overflow-y:auto;"><ul>{"".join(items)}</ul></div>',
+        ]
+        parent.append_project_log('Collocation Analysis', lines)
 
     def _update_drop_summary(self):
         terms = self._get_parent_drop_terms()
@@ -3757,6 +4293,49 @@ class CollocationDialog(QDialog):
         elif self._selected_terms_prev_count == 0 and self._selected_section_button is not None and not self._selected_section_button.isChecked():
             self._selected_section_button.setChecked(True)
         self._selected_terms_prev_count = count
+
+    def _update_group_summary(self):
+        groups = self._get_parent_term_groups()
+        count = len(groups)
+        term_total = sum(len(group.get('terms', []) or []) for group in groups)
+        if count:
+            self.group_summary_label.setText(f'Term groups: {count} (covering {term_total} term(s))')
+            self.clear_groups_btn.setEnabled(True)
+        else:
+            self.group_summary_label.setText('No term groups defined.')
+            self.clear_groups_btn.setEnabled(False)
+        if groups:
+            lines = []
+            for group in groups:
+                name = html.escape(str(group.get('name', '')))
+                terms = group.get('terms', []) or []
+                missing = {str(term).strip().lower() for term in group.get('missing_terms', []) or []}
+                term_parts = []
+                for term in terms:
+                    rendered = html.escape(str(term))
+                    if str(term).strip().lower() in missing:
+                        rendered = f"{rendered} <span style=\"color:#b45309;\">(not in list)</span>"
+                    term_parts.append(rendered)
+                terms_html = '; '.join(term_parts) if term_parts else '(none)'
+                freq = group.get('total_frequency')
+                freq_text = ''
+                if isinstance(freq, (float, int)):
+                    value = float(freq)
+                    if abs(value - round(value)) < 1e-6:
+                        freq_text = f" (Total: {int(round(value)):,})"
+                    else:
+                        freq_text = f" (Total: {value:.2f})"
+                lines.append(f'<div><strong>{name}</strong>: {terms_html}{freq_text}</div>')
+            body = ''.join(lines)
+        else:
+            body = '<span style="color:#777777;">(none)</span>'
+        self.group_terms_view.setHtml(body)
+        if count == 0:
+            if self._group_section_button is not None and self._group_section_button.isChecked():
+                self._group_section_button.setChecked(False)
+        elif self._group_terms_prev_count == 0 and self._group_section_button is not None and not self._group_section_button.isChecked():
+            self._group_section_button.setChecked(True)
+        self._group_terms_prev_count = count
 
     def _set_dropped_terms(self, terms: List[str], *, log_change: bool, show_notice: bool = False):
         parent = self.parent()
@@ -3818,12 +4397,18 @@ class CollocationDialog(QDialog):
         self._update_selected_terms_summary()
         self._save_state()
 
+    def clear_group_terms(self):
+        if not self._get_parent_term_groups():
+            return
+        self._set_term_groups([], log_change=True, show_notice=True)
+
     def _update_select_terms_enabled(self):
         metrics_path = None
         if isinstance(self._last_output_paths, dict):
             metrics_path = self._last_output_paths.get('metrics')
         enabled = bool(metrics_path and os.path.exists(metrics_path))
         self.select_terms_btn.setEnabled(enabled)
+        self.group_terms_btn.setEnabled(enabled)
 
     def _fetch_metric_term_infos(self, metrics_path: str) -> List[dict]:
         try:
@@ -3904,6 +4489,58 @@ class CollocationDialog(QDialog):
         dialog = TermDropDialog(self, top_terms, selected_set)
         if dialog.exec_() == QDialog.Accepted:
             self._set_dropped_terms(dialog.selected_terms, log_change=True)
+
+    def open_group_terms_dialog(self):
+        if not self.group_terms_btn.isEnabled():
+            return
+        term = self.term_input.text().strip()
+        if not term:
+            QMessageBox.warning(self, 'Search Term Required', 'Enter a search term before grouping terms.')
+            return
+        city_text = self.city_combo.currentText()
+        state_text = self.state_combo.currentText()
+        city = None if not city_text or city_text == 'All Cities' else city_text.strip()
+        state = None if not state_text or state_text == 'All States' else state_text.strip()
+        paths = self._build_output_paths(
+            term,
+            self.start_input.text().strip(),
+            self.end_input.text().strip(),
+            city,
+            state,
+            self._options_with_context(),
+        )
+        metrics_path = paths.get('metrics')
+        if not metrics_path or not os.path.exists(metrics_path):
+            QMessageBox.warning(self, 'Metrics Not Found', 'Run the collocation analysis before grouping terms.')
+            return
+        try:
+            term_infos = self._fetch_metric_term_infos(metrics_path)
+        except RuntimeError as exc:
+            QMessageBox.critical(self, 'Read Error', str(exc))
+            return
+        except ValueError:
+            QMessageBox.information(self, 'No Collocates', 'No collocated terms are available to group.')
+            return
+
+        existing_groups = self._get_parent_term_groups()
+        top_terms = term_infos[:150]
+        known_terms = {info['term'] for info in top_terms}
+        info_map = {info['term']: info for info in term_infos}
+
+        for group in existing_groups:
+            for term_name in group.get('terms', []) or []:
+                if term_name in known_terms:
+                    continue
+                info = info_map.get(term_name)
+                if info:
+                    top_terms.append(info)
+                else:
+                    top_terms.append({'term': term_name, 'frequency': None, 'rank': None})
+                known_terms.add(term_name)
+
+        dialog = TermGroupDialog(self, top_terms, existing_groups)
+        if dialog.exec_() == QDialog.Accepted:
+            self._set_term_groups(dialog.created_groups, log_change=True, show_notice=True)
 
     def open_select_terms_dialog(self):
         if not self.select_terms_btn.isEnabled():
@@ -3995,6 +4632,7 @@ class CollocationDialog(QDialog):
             ignore_bin=self.ignore_bin.isChecked(),
             options=trimmed_options,
             drop_terms=self._get_parent_drop_terms(),
+            term_groups=self._get_parent_term_groups(),
         )
 
     def _register_preview(self, preview: QDialog):
@@ -4088,6 +4726,7 @@ class CollocationDialog(QDialog):
             'ignore_bin': self.ignore_bin.isChecked(),
             'options': self._collect_options(),
             'dropped_terms': self._get_parent_drop_terms(),
+            'term_groups': self._get_parent_term_groups(),
             'context_left': self.context_left_spin.value(),
             'context_right': self.context_right_spin.value(),
             'rank_selected_terms': list(self._rank_selected_terms),
@@ -4223,6 +4862,7 @@ class CollocationDialog(QDialog):
                     ignore_bin=ignore_bin,
                     write_by_time=write_by_time,
                     drop_terms=parent.collocation_drop_terms,
+                    term_groups=getattr(parent, 'collocation_term_groups', []),
                     window_left=window_left,
                     window_right=window_right,
                     metadata_enabled=metadata_enabled,
@@ -4248,6 +4888,7 @@ class CollocationDialog(QDialog):
                     ignore_bin=ignore_bin,
                     write_by_time=write_by_time,
                     drop_terms=parent.collocation_drop_terms,
+                    term_groups=getattr(parent, 'collocation_term_groups', []),
                     window_left=window_left,
                     window_right=window_right,
                     metadata_enabled=metadata_enabled,
@@ -4390,6 +5031,9 @@ class CollocationDialog(QDialog):
         drop_count = len(getattr(parent, 'collocation_drop_terms', []))
         if drop_count:
             summary_parts.append(f"Dropped terms: {drop_count}")
+        group_count = len(getattr(parent, 'collocation_term_groups', []))
+        if group_count:
+            summary_parts.append(f"Term groups: {group_count}")
         lines = [f"<div>{html.escape('; '.join(summary_parts))}</div>"]
 
         def link_line(label: str, path: Optional[str]):
@@ -4416,6 +5060,33 @@ class CollocationDialog(QDialog):
                 lines.append(
                     f'<div><strong>Dropped terms list:</strong></div>'
                     f'<div style="max-height:220px; overflow-y:auto;"><ul>{items}</ul></div>'
+                )
+        if group_count:
+            groups = getattr(parent, 'collocation_term_groups', []) or []
+            if groups:
+                group_items = []
+                for group in groups:
+                    name = html.escape(str(group.get('name', '')))
+                    terms = group.get('terms', []) or []
+                    missing = {str(term).strip().lower() for term in group.get('missing_terms', []) or []}
+                    term_parts = []
+                    for term in terms:
+                        rendered = html.escape(str(term))
+                        if str(term).strip().lower() in missing:
+                            rendered = f"{rendered} (not in list)"
+                        term_parts.append(rendered)
+                    freq = group.get('total_frequency')
+                    freq_text = ''
+                    if isinstance(freq, (float, int)):
+                        value = float(freq)
+                        if abs(value - round(value)) < 1e-6:
+                            freq_text = f" (Total: {int(round(value)):,})"
+                        else:
+                            freq_text = f" (Total: {value:.2f})"
+                    group_items.append(f'<li><strong>{name}</strong>: {"; ".join(term_parts)}{freq_text}</li>')
+                lines.append(
+                    '<div><strong>Term groups:</strong></div>'
+                    f'<div style="max-height:220px; overflow-y:auto;"><ul>{"".join(group_items)}</ul></div>'
                 )
 
         parent.append_project_log('Collocation Analysis', lines)
@@ -4462,67 +5133,54 @@ class CollocationDialog(QDialog):
         prefer_geo = self.mode_geo.isChecked()
 
         csv_exists = bool(file_path and os.path.exists(file_path))
+        df: Optional[pd.DataFrame] = None
+        bins_ordered: List[Any] = []
+        unique_terms: List[str] = []
+
+        if csv_exists:
+            try:
+                df = pd.read_csv(file_path)
+            except Exception:
+                df = None
+                csv_exists = False
+
+        if df is not None:
+            required_cols = {'time_bin', 'collocate_term', 'ordinal_rank'}
+            if not required_cols.issubset(df.columns):
+                df = None
+                csv_exists = False
+            else:
+                if drop_terms_set:
+                    df = df[~df['collocate_term'].isin(drop_terms_set)].reset_index(drop=True)
+                if not df.empty:
+                    try:
+                        bins_ordered = sorted(
+                            df['time_bin'].unique(),
+                            key=lambda x: pd.to_datetime(str(x), errors='coerce'),
+                        )
+                    except Exception:
+                        bins_ordered = sorted(df['time_bin'].unique())
+                    unique_terms = df['collocate_term'].dropna().unique().tolist()
+                else:
+                    df = None
+                    csv_exists = False
+
         if drop_terms_set:
             csv_status = 'drop_terms'
+        elif csv_exists:
+            csv_status = 'existing'
         else:
-            csv_status = 'existing' if csv_exists else None
+            csv_status = 'missing'
 
-        if not csv_exists:
-            if parent is None:
-                QMessageBox.warning(self, 'Unavailable', 'Parent window not available.')
-                return
-            if not time_bin_unit:
-                QMessageBox.warning(self, 'Time Bin Required', 'Provide a Bin Size and Time Unit before building rank changes.')
-                return
-            built_path, error = self._generate_by_time_csv(
-                city=city,
-                state=state,
-                start_value=start_value or None,
-                end_value=end_value or None,
-                term=term,
-                time_bin_unit=time_bin_unit,
-                drop_terms=drop_terms,
-                options_runtime=opts_bool,
-                options_hash=options_with_context,
-                window_left=window_left,
-                window_right=window_right,
-                metadata_enabled=metadata_enabled,
-                prefer_geo=prefer_geo,
-            )
-            if not built_path:
-                QMessageBox.critical(self, 'Error', error or 'Unable to build by-time data.')
-                return
-            file_path = built_path
-            csv_status = 'created'
-            csv_exists = True
-
-        try:
-            df = pd.read_csv(file_path)
-        except Exception as e:
-            QMessageBox.critical(self, 'Error', f'Could not read by-time data: {e}')
-            return
-        if drop_terms_set:
-            df = df[~df['collocate_term'].isin(drop_terms_set)].reset_index(drop=True)
-        if df.empty or 'time_bin' not in df.columns or 'collocate_term' not in df.columns or 'ordinal_rank' not in df.columns:
-            QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available for the selected parameters.')
-            return
-        try:
-            bins_ordered = sorted(df['time_bin'].unique(), key=lambda x: pd.to_datetime(str(x), errors='coerce'))
-        except Exception:
-            bins_ordered = sorted(df['time_bin'].unique())
-        if not bins_ordered:
-            QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available.')
-            return
-        unique_terms = df['collocate_term'].dropna().unique().tolist()
-        if not unique_terms:
-            QMessageBox.information(self, 'No Rank Data', 'No collocate terms available to plot.')
-            return
         selected_manual = list(dict.fromkeys(self._rank_selected_terms))
-        default_top = min(10, len(unique_terms)) or 1
+        max_terms_dialog = len(unique_terms) if unique_terms else 150
+        default_top = min(10, max_terms_dialog) if max_terms_dialog else 1
+        if not bins_ordered:
+            bins_ordered = self._derive_time_bins_from_inputs()
         settings_dialog = CollocationRankSettingsDialog(
             self,
             bins_ordered,
-            len(unique_terms),
+            max(1, max_terms_dialog),
             default_top,
             selected_terms=selected_manual,
             csv_status=csv_status,
@@ -4538,7 +5196,7 @@ class CollocationDialog(QDialog):
         log_scale = bool(settings.get('log_scale', True))
         self._rank_log_scale = log_scale
         self._save_state()
-        regen_on_accept = bool(drop_terms_set) or not csv_exists
+        regen_on_accept = bool(drop_terms_set) or not csv_exists or df is None
         if regen_on_accept:
             built_path, error = self._generate_by_time_csv(
                 city=city,
@@ -4574,8 +5232,10 @@ class CollocationDialog(QDialog):
             except Exception:
                 bins_ordered = sorted(df['time_bin'].unique())
             if not bins_ordered:
-                QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available.')
-                return
+                bins_ordered = self._derive_time_bins_from_inputs()
+                if not bins_ordered:
+                    QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available.')
+                    return
             unique_terms = df['collocate_term'].dropna().unique().tolist()
             if not unique_terms:
                 QMessageBox.information(self, 'No Rank Data', 'No collocate terms available to plot.')
@@ -4618,13 +5278,31 @@ class CollocationDialog(QDialog):
             top_terms = manual_terms
             legend_order = manual_terms
         elif use_global:
-            averages = df.groupby('collocate_term')['ordinal_rank'].mean().dropna()
-            top_terms = averages.sort_values().head(top_n).index.tolist()
-            if not top_terms:
-                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
-                return
-            ordered_series = averages.reindex(top_terms).dropna().sort_values()
-            legend_order = ordered_series.index.tolist() if not ordered_series.empty else list(top_terms)
+            freq_series = None
+            if 'frequency' in df.columns:
+                try:
+                    freq_series = df.groupby('collocate_term')['frequency'].sum(min_count=1)
+                except TypeError:
+                    freq_series = df.groupby('collocate_term')['frequency'].sum()
+            if freq_series is not None and not freq_series.empty:
+                mean_ranks = df.groupby('collocate_term')['ordinal_rank'].mean().rename('avg_rank')
+                summary = pd.DataFrame({'total_frequency': freq_series})
+                summary = summary.merge(mean_ranks, left_index=True, right_index=True, how='left')
+                summary['avg_rank'] = summary['avg_rank'].fillna(float('inf'))
+                summary = summary.sort_values(['total_frequency', 'avg_rank'], ascending=[False, True])
+                top_terms = summary.head(top_n).index.tolist()
+                if not top_terms:
+                    QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+                    return
+                legend_order = top_terms
+            else:
+                averages = df.groupby('collocate_term')['ordinal_rank'].mean().dropna()
+                top_terms = averages.sort_values().head(top_n).index.tolist()
+                if not top_terms:
+                    QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+                    return
+                ordered_series = averages.reindex(top_terms).dropna().sort_values()
+                legend_order = ordered_series.index.tolist() if not ordered_series.empty else list(top_terms)
         else:
             df_home = df[df['time_bin'] == home_label_value].dropna(subset=['ordinal_rank'])
             if df_home.empty:

@@ -16,9 +16,10 @@ Key features implemented here:
 import os
 import json
 import hashlib
+import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
 
 import pandas as pd
 import numpy as np
@@ -414,6 +415,221 @@ def _drop_suffix(drop_terms: Optional[List[str]]) -> str:
     return "_drop" if cleaned else "_nodrop"
 
 
+def _normalize_term_groups(term_groups: Optional[List[dict]]) -> List[dict]:
+    if not term_groups:
+        return []
+    normalized: List[dict] = []
+    for entry in term_groups:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get('name', '')).strip()
+        raw_terms = entry.get('terms') or []
+        terms: List[str] = []
+        seen_terms: Set[str] = set()
+        for term in raw_terms:
+            term_str = str(term).strip()
+            if not term_str:
+                continue
+            lowered = term_str.lower()
+            if lowered in seen_terms:
+                continue
+            seen_terms.add(lowered)
+            terms.append(term_str)
+        if not name or not terms:
+            continue
+        normalized.append({
+            'name': name,
+            'terms': terms,
+            'terms_lower': [t.lower() for t in terms],
+        })
+    return normalized
+
+
+def _group_signature(groups: List[dict]) -> str:
+    if not groups:
+        return ''
+    payload = [
+        {
+            'name': group['name'],
+            'terms': sorted(group.get('terms_lower', [])),
+        }
+        for group in groups
+        if group.get('terms_lower')
+    ]
+    if not payload:
+        return ''
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()[:6]
+    return f"_group_{digest}"
+
+
+def _suffix_with_groups(drop_terms: Optional[List[str]], groups: List[dict]) -> str:
+    suffix = _drop_suffix(drop_terms)
+    signature = _group_signature(groups)
+    return f"{suffix}{signature}" if signature else suffix
+
+
+def _as_int_if_close(value: Optional[float]) -> Optional[Any]:
+    if value is None:
+        return None
+    if isinstance(value, (int,)):
+        return value
+    try:
+        float_val = float(value)
+    except (TypeError, ValueError):
+        return value
+    if math.isfinite(float_val) and abs(float_val - round(float_val)) < 1e-9:
+        return int(round(float_val))
+    return float_val
+
+
+def _aggregate_metric_subset(subset: pd.DataFrame, group_name: str, columns: List[str]) -> Dict[str, Any]:
+    aggregated: Dict[str, Any] = {}
+    freq_total = None
+    if 'frequency' in subset.columns:
+        freq_total = pd.to_numeric(subset['frequency'], errors='coerce').fillna(0).sum()
+    article_total = None
+    if 'article_count' in subset.columns:
+        article_total = pd.to_numeric(subset['article_count'], errors='coerce').fillna(0).sum()
+    co_rate = None
+    if 'cooccurrence_rate' in subset.columns and article_total not in (None, 0):
+        denom_candidates = []
+        for _, row in subset[['article_count', 'cooccurrence_rate']].dropna().iterrows():
+            rate = row.get('cooccurrence_rate')
+            count_val = row.get('article_count')
+            if not rate:
+                continue
+            try:
+                denom = float(count_val) / float(rate)
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+            if math.isfinite(denom):
+                denom_candidates.append(denom)
+        total_articles = float(sum(denom_candidates) / len(denom_candidates)) if denom_candidates else None
+        if total_articles:
+            co_rate = article_total / total_articles if total_articles else None
+    weighted_position = None
+    if 'mean_relative_position' in subset.columns and 'frequency' in subset.columns:
+        valid = subset[['mean_relative_position', 'frequency']].dropna()
+        if not valid.empty:
+            weights = pd.to_numeric(valid['frequency'], errors='coerce').fillna(0)
+            weight_sum = float(weights.sum())
+            if weight_sum > 0:
+                weighted_vals = pd.to_numeric(valid['mean_relative_position'], errors='coerce').fillna(0)
+                weighted_position = float((weighted_vals * weights).sum() / weight_sum)
+    for col in columns:
+        if col == 'collocate_term':
+            aggregated[col] = group_name
+        elif col == 'frequency' and freq_total is not None:
+            aggregated[col] = _as_int_if_close(freq_total)
+        elif col == 'article_count' and article_total is not None:
+            aggregated[col] = _as_int_if_close(article_total)
+        elif col == 'page_count' and col in subset.columns:
+            total_pages = pd.to_numeric(subset['page_count'], errors='coerce').fillna(0).sum()
+            aggregated[col] = _as_int_if_close(total_pages)
+        elif col == 'cooccurrence_rate' and co_rate is not None:
+            aggregated[col] = float(co_rate)
+        elif col == 'mean_relative_position' and weighted_position is not None:
+            aggregated[col] = weighted_position
+        elif col == 'first_date' and col in subset.columns:
+            aggregated[col] = subset['first_date'].dropna().min()
+        elif col == 'last_date' and col in subset.columns:
+            aggregated[col] = subset['last_date'].dropna().max()
+        elif col in subset.columns and pd.api.types.is_numeric_dtype(subset[col]):
+            total_val = pd.to_numeric(subset[col], errors='coerce').fillna(0).sum()
+            aggregated[col] = _as_int_if_close(total_val)
+        elif col in subset.columns:
+            non_null = subset[col].dropna()
+            aggregated[col] = non_null.iloc[0] if not non_null.empty else None
+        else:
+            aggregated[col] = None
+    return aggregated
+
+
+def _apply_term_groups_to_metrics(metrics: pd.DataFrame, groups: List[dict]) -> pd.DataFrame:
+    if metrics.empty or not groups:
+        return metrics
+    working = metrics.copy()
+    norm_col = '__group_norm__'
+    working[norm_col] = working['collocate_term'].astype(str).str.lower()
+    columns = [col for col in working.columns if col != norm_col]
+    rows_to_drop: Set[int] = set()
+    new_rows: List[Dict[str, Any]] = []
+    assigned_terms: Set[str] = set()
+    for group in groups:
+        terms_lower = [t for t in group.get('terms_lower', []) if t not in assigned_terms]
+        if not terms_lower:
+            continue
+        subset_mask = working[norm_col].isin(terms_lower)
+        subset = working[subset_mask]
+        if subset.empty:
+            continue
+        assigned_terms.update(terms_lower)
+        rows_to_drop.update(subset.index.tolist())
+        subset_no_norm = subset.drop(columns=[norm_col], errors='ignore')
+        new_rows.append(_aggregate_metric_subset(subset_no_norm, group['name'], columns))
+    if rows_to_drop:
+        working = working.drop(index=list(rows_to_drop))
+    working = working.drop(columns=[norm_col], errors='ignore')
+    if new_rows:
+        working = pd.concat([working, pd.DataFrame(new_rows)], ignore_index=True, sort=False)
+    if 'frequency' in working.columns:
+        working = working.sort_values(['frequency', 'collocate_term'], ascending=[False, True]).reset_index(drop=True)
+    else:
+        working = working.sort_values(['collocate_term']).reset_index(drop=True)
+    return working
+
+
+def _recalculate_ordinal_ranks(by_time: pd.DataFrame) -> pd.DataFrame:
+    if by_time.empty:
+        if 'ordinal_rank' not in by_time.columns:
+            by_time = by_time.copy()
+            by_time['ordinal_rank'] = pd.Series(dtype=int)
+        return by_time
+    working = by_time.copy()
+    working = working.drop(columns=['ordinal_rank'], errors='ignore')
+    frames: List[pd.DataFrame] = []
+    for time_bin, segment in working.groupby('time_bin', sort=False):
+        ordered = segment.sort_values(['frequency', 'collocate_term'], ascending=[False, True]).reset_index(drop=True)
+        ordered['ordinal_rank'] = range(1, len(ordered) + 1)
+        frames.append(ordered)
+    return pd.concat(frames, ignore_index=True) if frames else working
+
+
+def _apply_term_groups_to_by_time(by_time: pd.DataFrame, groups: List[dict]) -> pd.DataFrame:
+    if by_time.empty or not groups:
+        return by_time
+    working = by_time.copy()
+    norm_col = '__group_norm__'
+    working[norm_col] = working['collocate_term'].astype(str).str.lower()
+    rows_to_drop: Set[int] = set()
+    additions: List[Dict[str, Any]] = []
+    assigned_terms: Set[str] = set()
+    for group in groups:
+        terms_lower = [t for t in group.get('terms_lower', []) if t not in assigned_terms]
+        if not terms_lower:
+            continue
+        subset = working[working[norm_col].isin(terms_lower)]
+        if subset.empty:
+            continue
+        assigned_terms.update(terms_lower)
+        rows_to_drop.update(subset.index.tolist())
+        grouped = subset.groupby('time_bin', as_index=False)['frequency'].sum()
+        for _, row in grouped.iterrows():
+            additions.append({
+                'time_bin': row['time_bin'],
+                'collocate_term': group['name'],
+                'frequency': row['frequency'],
+            })
+    if rows_to_drop:
+        working = working.drop(index=list(rows_to_drop))
+    working = working.drop(columns=[norm_col], errors='ignore')
+    if additions:
+        working = pd.concat([working, pd.DataFrame(additions)], ignore_index=True, sort=False)
+    if 'ordinal_rank' in working.columns or additions:
+        working = _recalculate_ordinal_ranks(working)
+    return working
+
+
 def _build_output_paths(
     processed_dir: str,
     term: str,
@@ -452,10 +668,12 @@ def build_collocation_output_paths(
     ignore_bin: bool,
     options: Dict[str, Any],
     drop_terms: Optional[List[str]] = None,
+    term_groups: Optional[List[dict]] = None,
     metadata_enabled: bool = True,
 ) -> Dict[str, Optional[str]]:
     processed = init_project(project_dir)["processed"]
-    suffix = _drop_suffix(drop_terms)
+    normalized_groups = _normalize_term_groups(term_groups)
+    suffix = _suffix_with_groups(drop_terms, normalized_groups)
     return _build_output_paths(processed, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, options, suffix)
 
 
@@ -480,6 +698,7 @@ def run_collocation(
     ignore_bin: bool = False,
     write_by_time: bool = True,
     drop_terms: Optional[List[str]] = None,
+    term_groups: Optional[List[dict]] = None,
     metadata_enabled: bool = True,
     write_metrics: bool = True,
 ) -> Dict[str, Optional[str]]:
@@ -541,7 +760,8 @@ def run_collocation(
 
     drop_terms = drop_terms or []
     drop_set = {str(t).strip() for t in drop_terms if str(t).strip()}
-    suffix = _drop_suffix(list(drop_set))
+    normalized_groups = _normalize_term_groups(term_groups)
+    suffix = _suffix_with_groups(drop_terms, normalized_groups)
 
     metadata_paths: Dict[str, str] = {}
     metadata_common = {
@@ -556,6 +776,10 @@ def run_collocation(
             'ignore_bin': bool(ignore_bin),
             'options': opt_dict,
             'drop_terms': sorted(drop_set),
+            'term_groups': [
+                {'name': group['name'], 'terms': list(group['terms'])}
+                for group in normalized_groups
+            ],
             'write_occurrences_geojson': bool(write_occurrences_geojson),
         },
         'inputs': {
@@ -619,6 +843,8 @@ def run_collocation(
     if drop_set:
         metrics = metrics[~metrics['collocate_term'].isin(drop_set)].reset_index(drop=True)
 
+    metrics = _apply_term_groups_to_metrics(metrics, normalized_groups)
+
     # Write metrics CSV
     output_paths = _build_output_paths(proc, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, opt_dict, suffix)
     metrics_dir = os.path.dirname(output_paths.get("metrics") or proc)
@@ -648,6 +874,7 @@ def run_collocation(
         by_time = _build_by_time(df, term, opts, start_date, end_date, size, unit)
         if drop_set:
             by_time = by_time[~by_time['collocate_term'].isin(drop_set)].reset_index(drop=True)
+        by_time = _apply_term_groups_to_by_time(by_time, normalized_groups)
         by_time.to_csv(output_paths["by_time"], index=False)
         by_time_meta = dict(metadata_common)
         by_time_meta.update({

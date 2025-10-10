@@ -51,6 +51,32 @@ def _sorted_counter_terms(counter: Counter) -> List[Tuple[str, int]]:
     return sorted(counter.items(), key=lambda item: (-item[1], item[0]))
 
 
+def _prepare_term_group_lookup(term_groups: Optional[List[dict]]) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    if not term_groups:
+        return lookup
+    for entry in term_groups:
+        if not isinstance(entry, dict):
+            continue
+        display = str(entry.get('name', '')).strip()
+        if not display:
+            continue
+        display_lower = display.lower()
+        lookup.setdefault(display_lower, display)
+        terms = entry.get('terms') or []
+        seen: Set[str] = set()
+        for term in terms:
+            term_str = str(term).strip()
+            if not term_str:
+                continue
+            term_lower = term_str.lower()
+            if term_lower in seen:
+                continue
+            seen.add(term_lower)
+            lookup[term_lower] = display
+    return lookup
+
+
 def _build_collocate_rank_index(
     groups: List[Dict[str, Any]],
     popup_dataset: Dict[str, Any],
@@ -59,6 +85,7 @@ def _build_collocate_rank_index(
     drop_stopwords: bool,
     window: int,
     drop_terms: Optional[List[str]],
+    term_groups: Optional[List[dict]] = None,
     top_n: int = COLLOCATE_RANK_LIMIT,
     term_scope: str = 'global',
     time_key: Optional[str] = None,
@@ -94,6 +121,15 @@ def _build_collocate_rank_index(
         if isinstance(term, str) and str(term).strip()
     }
 
+    group_lookup = _prepare_term_group_lookup(term_groups)
+
+    def _resolve_term(value: Any) -> str:
+        raw = str(value or '').strip()
+        if not raw:
+            return ''
+        mapped = group_lookup.get(raw.lower())
+        return mapped if mapped else raw
+
     manual_terms_norm: List[str] = []
     manual_terms_seen: Set[str] = set()
     if manual_terms:
@@ -103,10 +139,11 @@ def _build_collocate_rank_index(
             raw = term.strip()
             if not raw:
                 continue
-            norm = raw.lower()
-            if norm and norm not in manual_terms_seen:
-                manual_terms_seen.add(norm)
-                manual_terms_norm.append(norm)
+            canonical = _resolve_term(raw)
+            canonical_lower = canonical.lower()
+            if canonical_lower and canonical_lower not in manual_terms_seen:
+                manual_terms_seen.add(canonical_lower)
+                manual_terms_norm.append(canonical)
 
     try:
         requested_top = int(top_n)
@@ -192,13 +229,19 @@ def _build_collocate_rank_index(
                 right = min(len(tokens), start + term_length + window_size)
                 neighbors = tokens[left:start] + tokens[start + term_length:right]
                 for tok in neighbors:
-                    if not tok or tok.isdigit() or tok in drop_set:
+                    if not tok or tok.isdigit():
                         continue
-                    group_counter[tok] += 1
-                    global_counts[tok] += 1
-                    term_hits[tok].add(idx)
+                    tok_norm = tok.lower()
+                    if tok_norm in drop_set:
+                        continue
+                    canonical = _resolve_term(tok)
+                    if not canonical:
+                        continue
+                    group_counter[canonical] += 1
+                    global_counts[canonical] += 1
+                    term_hits[canonical].add(idx)
                     for time_key in index_time_keys.get(idx, ()):  # time-specific accumulation
-                        time_counters[time_key][tok] += 1
+                        time_counters[time_key][canonical] += 1
 
         if not group_counter:
             continue
@@ -1279,6 +1322,7 @@ def create_map(
     collocate_drop_stopwords: bool = False,
     collocate_window: int = 5,
     collocate_drop_terms: Optional[List[str]] = None,
+    collocate_term_groups: Optional[List[dict]] = None,
     collocate_rank_top_n: int = COLLOCATE_RANK_LIMIT,
     collocate_rank_term_scope: str = 'global',
     collocate_rank_time_key: Optional[str] = None,
@@ -1322,6 +1366,8 @@ def create_map(
       - table_row_limit: optional max rows in attribute table (None/<=0 for all rows).
       - collocate_rank_mode / collocate_drop_stopwords / collocate_window / collocate_drop_terms: configure
         lightweight collocate rank visualisation on point maps.
+      - collocate_term_groups: optional grouping definitions applied to collocate terms (list of
+        dictionaries with "name" and "terms" entries).
       - collocate_rank_top_n: limit collocate list and rank output to the top-N terms (default 150).
       - collocate_rank_term_scope: 'global' to rank across entire period, 'time' to use a specific time bin.
       - collocate_rank_time_key: time-bin key (1-based index) when collocate_rank_term_scope='time'.
@@ -1615,6 +1661,7 @@ def create_map(
             drop_stopwords=collocate_drop_stopwords,
             window=collocate_window,
             drop_terms=collocate_drop_terms,
+            term_groups=collocate_term_groups,
             top_n=collocate_rank_top_n,
             term_scope=collocate_rank_term_scope,
             time_key=collocate_rank_time_key,
@@ -1822,6 +1869,8 @@ def create_map(
         'lightweight': bool(lightweight),
         'table_mode': table_mode_norm,
         'table_row_limit': row_limit_val or 0,
+        'collocate_drop_terms': list(collocate_drop_terms or []),
+        'collocate_term_groups': list(collocate_term_groups or []),
     }
 
     timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
