@@ -79,9 +79,13 @@ def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
                      legend_order: Optional[List[str]] = None,
                      show_term_labels: bool = False,
                      enable_hover: bool = True,
-                     settings_text: Optional[str] = None):
+                     settings_text: Optional[str] = None,
+                     use_log_scale: bool = False):
     """
     Build a bump chart of rank (1=top) vs time_bin for a subset of terms.
+
+    When use_log_scale is True the y-axis uses a logarithmic scale (still inverted so
+    rank 1 appears at the top of the chart).
 
     If top_n and home_bin_index are provided, the set of terms displayed is taken
     from the top-N terms in the specified bin index (1-based).
@@ -135,6 +139,8 @@ def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
 
     ax.set_xticks(positions)
     ax.set_xticklabels([str(b) for b in bins_ordered], rotation=45 if len(bins_ordered) > 6 else 0)
+    if use_log_scale:
+        ax.set_yscale('log')
     ax.invert_yaxis()
     ax.set_xlabel("Time Bin")
     ax.set_ylabel("Ordinal Rank (1 = top)")

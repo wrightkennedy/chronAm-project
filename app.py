@@ -45,6 +45,7 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QSizePolicy,
     QStyle,
     QToolButton,
     QSpinBox,
@@ -1736,10 +1737,48 @@ class CollocationRankSettingsDialog(QDialog):
         default_top_n: int = 10,
         *,
         selected_terms: Optional[Iterable[str]] = None,
+        csv_status: Optional[str] = None,
+        csv_path: Optional[str] = None,
+        drop_terms: Optional[Iterable[str]] = None,
+        log_scale: bool = True,
     ):
         super().__init__(parent)
-        self.setWindowTitle('Rank Chart Settings')
+        self.setWindowTitle('Bump Chart Settings')
         layout = QVBoxLayout(self)
+
+        self._csv_path = csv_path
+        self._drop_terms = [str(t).strip() for t in (drop_terms or []) if str(t).strip()]
+        self._initial_log_scale = bool(log_scale)
+        status_text = ''
+        status_kind = (csv_status or '').strip().lower()
+        if status_kind == 'created':
+            status_text = 'By-time CSV generated for these settings. The first build can take longer than future updates.'
+        elif status_kind == 'existing':
+            if csv_path and os.path.exists(csv_path):
+                folder = os.path.dirname(csv_path) or os.path.abspath(csv_path)
+                status_text = (
+                    f'Existing by-time CSV located. '
+                    f'<a href="open">Open containing folder</a> ({html.escape(folder)}).'
+                )
+            else:
+                status_text = 'Existing by-time CSV located.'
+        elif status_kind == 'drop_terms':
+            status_text = 'Drop terms active; a new by-time CSV will be generated when you click OK.'
+        elif csv_status:
+            status_text = html.escape(str(csv_status))
+
+        if status_text:
+            info_label = QLabel(status_text)
+            info_label.setWordWrap(True)
+            info_label.setStyleSheet('color: #555555; font-size: 11px;')
+            info_label.setTextFormat(Qt.RichText)
+            info_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+            info_label.setOpenExternalLinks(False)
+            info_label.linkActivated.connect(self._handle_info_link)
+            layout.addWidget(info_label)
+        else:
+            info_label = None
+        self._info_label = info_label
 
         form = QFormLayout()
 
@@ -1759,6 +1798,10 @@ class CollocationRankSettingsDialog(QDialog):
         self.labels_check = QCheckBox('Show term labels on chart')
         form.addRow(self.labels_check)
 
+        self.log_scale_check = QCheckBox('Use log scale (y-axis)')
+        self.log_scale_check.setChecked(self._initial_log_scale)
+        form.addRow(self.log_scale_check)
+
         layout.addLayout(form)
 
         self._selected_terms: List[str] = list(dict.fromkeys(selected_terms or []))
@@ -1775,6 +1818,11 @@ class CollocationRankSettingsDialog(QDialog):
         self.selection_label.setStyleSheet('color: #555555; font-size: 11px;')
         layout.addWidget(self.selection_label)
 
+        self.drop_terms_label = QLabel()
+        self.drop_terms_label.setWordWrap(True)
+        self.drop_terms_label.setStyleSheet('color: #555555; font-size: 11px;')
+        layout.addWidget(self.drop_terms_label)
+
         self.global_check.toggled.connect(self.home_combo.setDisabled)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1783,6 +1831,7 @@ class CollocationRankSettingsDialog(QDialog):
         layout.addWidget(buttons)
 
         self._update_selection_summary()
+        self._update_drop_terms_note()
 
     def values(self) -> dict:
         return {
@@ -1792,6 +1841,7 @@ class CollocationRankSettingsDialog(QDialog):
             'show_labels': self.labels_check.isChecked(),
             'use_selected_terms': self.use_selected_check.isChecked(),
             'selected_terms': list(self._selected_terms),
+            'log_scale': self.log_scale_check.isChecked(),
         }
 
     def _update_selection_summary(self):
@@ -1823,6 +1873,24 @@ class CollocationRankSettingsDialog(QDialog):
                 self.selection_label.setText(f'{base_text} (overrides Top N).')
             else:
                 self.selection_label.setText(f'{base_text}.')
+
+    def _handle_info_link(self, link: str):
+        if link != 'open':
+            return
+        if self._csv_path:
+            reveal_in_file_manager(self._csv_path)
+
+    def _update_drop_terms_note(self):
+        if not self._drop_terms:
+            self.drop_terms_label.setText('No drop terms active; all collocates are considered.')
+            return
+        preview = ', '.join(self._drop_terms[:3])
+        if len(self._drop_terms) > 3:
+            preview += ', …'
+        count = len(self._drop_terms)
+        self.drop_terms_label.setText(
+            f'Drop terms active ({count}): {html.escape(preview)}. The chart applies these after you click OK.'
+        )
 
 
 
@@ -2759,6 +2827,11 @@ class CollocationDialog(QDialog):
         self._preview_windows = []
         self._collocate_map_settings: Optional[dict] = None
         self._rank_selected_terms: List[str] = []
+        self._drop_section_button: Optional[QToolButton] = None
+        self._selected_section_button: Optional[QToolButton] = None
+        self._drop_terms_prev_count = 0
+        self._selected_terms_prev_count = 0
+        self._rank_log_scale: bool = True
 
         # --- Source selection & status line ---
         mode_row = QHBoxLayout()
@@ -2849,11 +2922,17 @@ class CollocationDialog(QDialog):
             'include_cooccurrence_rate',
             'include_relative_position',
             'drop_stopwords',
+            'write_occurrences_geojson',
         ]
+        self._checkbox_labels = {
+            'write_occurrences_geojson': 'Output occurrences GeoJSON',
+        }
+        self._checkbox_defaults = {opt: True for opt in self._checkbox_order}
+        self._checkbox_defaults['write_occurrences_geojson'] = False
         self.checks = {}
         for opt in self._checkbox_order:
-            cb = QCheckBox(opt)
-            cb.setChecked(True)
+            cb = QCheckBox(self._checkbox_labels.get(opt, opt))
+            cb.setChecked(self._checkbox_defaults.get(opt, True))
             self.checks[opt] = cb
 
         form_widget = QWidget()
@@ -2898,9 +2977,11 @@ class CollocationDialog(QDialog):
         drop_column.addWidget(self.clear_notice_label)
         drop_column.addStretch(1)
 
-        drop_group = QGroupBox('Drop Terms')
-        drop_group.setLayout(drop_column)
-        drop_group.setMaximumWidth(260)
+        drop_content = QWidget()
+        drop_content.setLayout(drop_column)
+        drop_section, drop_toggle = self._create_collapsible_section('Drop Terms', drop_content, expanded=False)
+        drop_section.setMaximumWidth(260)
+        self._drop_section_button = drop_toggle
 
         select_column = QVBoxLayout()
         select_column.setContentsMargins(0, 0, 0, 0)
@@ -2930,15 +3011,17 @@ class CollocationDialog(QDialog):
         select_column.addWidget(self.selected_terms_view)
         select_column.addStretch(1)
 
-        selected_group = QGroupBox('Selected Terms')
-        selected_group.setLayout(select_column)
-        selected_group.setMaximumWidth(260)
+        selected_content = QWidget()
+        selected_content.setLayout(select_column)
+        selected_section, selected_toggle = self._create_collapsible_section('Selected Terms', selected_content, expanded=False)
+        selected_section.setMaximumWidth(260)
+        self._selected_section_button = selected_toggle
 
         right_column = QVBoxLayout()
         right_column.setContentsMargins(0, 0, 0, 0)
         right_column.setSpacing(12)
-        right_column.addWidget(drop_group)
-        right_column.addWidget(selected_group)
+        right_column.addWidget(drop_section)
+        right_column.addWidget(selected_section)
 
         options_group = QGroupBox('Collocation Options')
         options_group.setAlignment(Qt.AlignLeft)
@@ -2951,33 +3034,35 @@ class CollocationDialog(QDialog):
         left_column.addWidget(options_group)
         left_column.addStretch(1)
 
-        context_group = QGroupBox('Context Window')
+        context_group = QGroupBox('Context Window (words)')
         context_group.setAlignment(Qt.AlignLeft)
         context_layout = QHBoxLayout(context_group)
         context_layout.setContentsMargins(12, 12, 12, 12)
         context_layout.setSpacing(6)
-        context_label = QLabel('Context words:')
+        context_label = QLabel('Size:')
         context_layout.addWidget(context_label)
         self.context_left_spin = QSpinBox()
         self.context_left_spin.setRange(0, 99)
         self.context_left_spin.setValue(5)
-        self.context_left_spin.setFixedWidth(60)
+        self.context_left_spin.setFixedWidth(46)
         context_layout.addWidget(self.context_left_spin)
         self.keyword_label = QLabel('<keyword>')
         self.keyword_label.setTextFormat(Qt.PlainText)
-        context_layout.addWidget(self.keyword_label)
+        self.keyword_label.setMinimumWidth(110)
+        self.keyword_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        context_layout.addWidget(self.keyword_label, 1)
         self.context_right_spin = QSpinBox()
         self.context_right_spin.setRange(0, 99)
         self.context_right_spin.setValue(5)
-        self.context_right_spin.setFixedWidth(60)
+        self.context_right_spin.setFixedWidth(46)
         context_layout.addWidget(self.context_right_spin)
         context_layout.addStretch(1)
         context_group.setMaximumWidth(260)
         right_column.addWidget(context_group)
         right_column.addStretch(1)
 
-        main_columns.addLayout(left_column, 1)
-        main_columns.addLayout(right_column, 0)
+        main_columns.addLayout(left_column, 0)
+        main_columns.addLayout(right_column, 1)
         layout.addLayout(main_columns)
 
         self._update_selected_terms_summary()
@@ -3400,7 +3485,8 @@ class CollocationDialog(QDialog):
 
         opts = state.get('options', {})
         for key, cb in self.checks.items():
-            cb.setChecked(bool(opts.get(key, True)))
+            default = self._checkbox_defaults.get(key, cb.isChecked())
+            cb.setChecked(bool(opts.get(key, default)))
 
         context_left = state.get('context_left')
         if context_left is not None:
@@ -3440,6 +3526,7 @@ class CollocationDialog(QDialog):
             self._rank_selected_terms = cleaned
         else:
             self._rank_selected_terms = []
+        self._rank_log_scale = bool(state.get('rank_log_scale', True))
 
     def _prefill_from_current_source(self, reset_state: bool = False):
         parent = self.parent()
@@ -3541,6 +3628,79 @@ class CollocationDialog(QDialog):
         opts['window_right'] = self.context_right_spin.value()
         return opts
 
+    def _generate_by_time_csv(
+        self,
+        *,
+        city: Optional[str],
+        state: Optional[str],
+        start_value: Optional[str],
+        end_value: Optional[str],
+        term: str,
+        time_bin_unit: Optional[str],
+        drop_terms: List[str],
+        options_runtime: dict,
+        options_hash: dict,
+        window_left: int,
+        window_right: int,
+        metadata_enabled: bool,
+        prefer_geo: bool,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        parent = self.parent()
+        if parent is None:
+            return None, 'Parent window not available.'
+        json_path = getattr(parent, 'json_file', None)
+        geo_path = getattr(parent, 'geojson_file', None)
+        candidates = []
+        if prefer_geo:
+            candidates.extend([(geo_path, True), (json_path, False)])
+        else:
+            candidates.extend([(json_path, False), (geo_path, True)])
+        options_runtime = dict(options_runtime)
+        source_path = None
+        source_is_geo = False
+        for candidate, is_geo in candidates:
+            if candidate and os.path.exists(candidate):
+                source_path = candidate
+                source_is_geo = is_geo
+                break
+        if not source_path:
+            return None, 'Locate a JSON or GeoJSON results file before building rank changes.'
+        if not source_is_geo:
+            options_runtime['write_occurrences_geojson'] = False
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            result = run_collocation(
+                parent.project_folder,
+                city=city,
+                state=state,
+                start_date=start_value or None,
+                end_date=end_value or None,
+                term=term,
+                time_bin_unit=time_bin_unit,
+                json_path=None if source_is_geo else source_path,
+                geojson_path=source_path if source_is_geo else None,
+                ignore_bin=self.ignore_bin.isChecked(),
+                write_by_time=True,
+                drop_terms=drop_terms,
+                window_left=window_left,
+                window_right=window_right,
+                metadata_enabled=metadata_enabled,
+                write_metrics=False,
+                **options_runtime,
+            )
+        except Exception as exc:
+            return None, str(exc)
+        finally:
+            QApplication.restoreOverrideCursor()
+        built_path = result.get('by_time') if isinstance(result, dict) else None
+        if built_path and os.path.exists(built_path):
+            return built_path, None
+        predicted = self._build_output_paths(term, start_value, end_value, city, state, options_hash)
+        expected = predicted.get('by_time')
+        if expected and os.path.exists(expected):
+            return expected, None
+        return None, 'By-time data could not be created. Please run the collocation analysis first.'
+
     def _update_context_keyword_label(self):
         if not hasattr(self, 'keyword_label'):
             return
@@ -3572,6 +3732,12 @@ class CollocationDialog(QDialog):
             self.drop_terms_view.setHtml(body)
         else:
             self.drop_terms_view.setHtml('<span style="color:#777777;">(none)</span>')
+        if count == 0:
+            if self._drop_section_button is not None and self._drop_section_button.isChecked():
+                self._drop_section_button.setChecked(False)
+        elif self._drop_terms_prev_count == 0 and self._drop_section_button is not None and not self._drop_section_button.isChecked():
+            self._drop_section_button.setChecked(True)
+        self._drop_terms_prev_count = count
 
     def _update_selected_terms_summary(self):
         terms = list(dict.fromkeys(self._rank_selected_terms))
@@ -3585,6 +3751,12 @@ class CollocationDialog(QDialog):
             self.selected_summary_label.setText('No terms selected.')
             self.selected_terms_view.setHtml('<span style="color:#777777;">(none)</span>')
             self.clear_selected_btn.setEnabled(False)
+        if count == 0:
+            if self._selected_section_button is not None and self._selected_section_button.isChecked():
+                self._selected_section_button.setChecked(False)
+        elif self._selected_terms_prev_count == 0 and self._selected_section_button is not None and not self._selected_section_button.isChecked():
+            self._selected_section_button.setChecked(True)
+        self._selected_terms_prev_count = count
 
     def _set_dropped_terms(self, terms: List[str], *, log_change: bool, show_notice: bool = False):
         parent = self.parent()
@@ -3810,6 +3982,8 @@ class CollocationDialog(QDialog):
         if parent is None:
             raise RuntimeError('Collocation dialog has no parent window')
         time_bin_unit = self._current_time_bin_unit()
+        trimmed_options = dict(options)
+        trimmed_options.pop('write_occurrences_geojson', None)
         return build_collocation_output_paths(
             parent.project_folder,
             term=term,
@@ -3819,7 +3993,7 @@ class CollocationDialog(QDialog):
             state=state,
             time_bin_unit=time_bin_unit,
             ignore_bin=self.ignore_bin.isChecked(),
-            options=options,
+            options=trimmed_options,
             drop_terms=self._get_parent_drop_terms(),
         )
 
@@ -3834,8 +4008,39 @@ class CollocationDialog(QDialog):
 
         preview.destroyed.connect(_cleanup)
 
+    def _create_collapsible_section(self, title: str, content: QWidget, *, expanded: bool = False) -> Tuple[QWidget, QToolButton]:
+        section = QWidget()
+        section_layout = QVBoxLayout(section)
+        section_layout.setContentsMargins(0, 0, 0, 0)
+        section_layout.setSpacing(0)
+
+        toggle = QToolButton(section)
+        toggle.setText(title)
+        toggle.setCheckable(True)
+        toggle.setChecked(expanded)
+        toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        toggle.setStyleSheet('QToolButton { border: none; font-weight: 600; padding: 2px 0; }')
+        toggle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        section_layout.addWidget(toggle)
+
+        body = QWidget(section)
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(12, 6, 0, 0)
+        body_layout.setSpacing(6)
+        body_layout.addWidget(content)
+        section_layout.addWidget(body)
+        body.setVisible(expanded)
+
+        def handle_toggle(checked: bool):
+            toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+            body.setVisible(checked)
+
+        toggle.toggled.connect(handle_toggle)
+        return section, toggle
+
     def _confirm_overwrite_if_needed(self, paths: dict) -> bool:
-        existing = [p for p in (paths.get('metrics'), paths.get('by_time'), paths.get('occurrences')) if p and os.path.exists(p)]
+        existing = [p for p in (paths.get('metrics'), paths.get('occurrences')) if p and os.path.exists(p)]
         if not existing:
             return True
         box = QMessageBox(self)
@@ -3886,6 +4091,7 @@ class CollocationDialog(QDialog):
             'context_left': self.context_left_spin.value(),
             'context_right': self.context_right_spin.value(),
             'rank_selected_terms': list(self._rank_selected_terms),
+            'rank_log_scale': bool(getattr(self, '_rank_log_scale', True)),
         }
         parent.collocation_state = state
 
@@ -3906,6 +4112,9 @@ class CollocationDialog(QDialog):
             self.city_combo.setCurrentIndex(0)
             self.state_combo.setCurrentIndex(0)
             self._prefill_from_current_source()
+        occ_cb = self.checks.get('write_occurrences_geojson')
+        if occ_cb is not None:
+            occ_cb.setEnabled(self.mode_geo.isChecked())
         if not self._loading_defaults:
             self._save_state()
 
@@ -3975,7 +4184,7 @@ class CollocationDialog(QDialog):
                 return
 
         time_bin_unit = self._current_time_bin_unit()
-        write_by_time = not ignore_bin
+        write_by_time = False
         opts_bool = self._collect_options()
         window_left = self.context_left_spin.value()
         window_right = self.context_right_spin.value()
@@ -4011,7 +4220,6 @@ class CollocationDialog(QDialog):
                     time_bin_unit=time_bin_unit,
                     json_path=json_path,
                     geojson_path=None,
-                    write_occurrences_geojson=False,
                     ignore_bin=ignore_bin,
                     write_by_time=write_by_time,
                     drop_terms=parent.collocation_drop_terms,
@@ -4037,7 +4245,6 @@ class CollocationDialog(QDialog):
                     time_bin_unit=time_bin_unit,
                     geojson_path=geo_path,
                     json_path=None,
-                    write_occurrences_geojson=True,
                     ignore_bin=ignore_bin,
                     write_by_time=write_by_time,
                     drop_terms=parent.collocation_drop_terms,
@@ -4089,7 +4296,10 @@ class CollocationDialog(QDialog):
         state_text = self.state_combo.currentText()
         city = None if not city_text or city_text == 'All Cities' else city_text.strip()
         state = None if not state_text or state_text == 'All States' else state_text.strip()
-        paths = self._build_output_paths(term, self.start_input.text().strip(), self.end_input.text().strip(), city, state, self._options_with_context())
+        start_value = self.start_input.text().strip()
+        end_value = self.end_input.text().strip()
+        options_with_context = self._options_with_context()
+        paths = self._build_output_paths(term, start_value, end_value, city, state, options_with_context)
         metrics_path = paths.get('metrics')
         if not metrics_path or not os.path.exists(metrics_path):
             QMessageBox.warning(self, 'File Not Found', 'Metrics file not found. Please run the collocation analysis first.')
@@ -4227,16 +4437,72 @@ class CollocationDialog(QDialog):
         state_text = self.state_combo.currentText()
         city = None if not city_text or city_text == 'All Cities' else city_text.strip()
         state = None if not state_text or state_text == 'All States' else state_text.strip()
-        paths = self._build_output_paths(term, self.start_input.text().strip(), self.end_input.text().strip(), city, state, self._options_with_context())
+        start_value = self.start_input.text().strip()
+        end_value = self.end_input.text().strip()
+        options_with_context = self._options_with_context()
+        paths = self._build_output_paths(term, start_value, end_value, city, state, options_with_context)
         file_path = paths.get('by_time')
-        if not file_path or not os.path.exists(file_path):
-            QMessageBox.warning(self, 'No Data', 'Collocation by-time data not found. Run collocation with a time bin first.')
+        time_bin_unit = self._current_time_bin_unit()
+        if not file_path:
+            QMessageBox.warning(
+                self,
+                'Time Bin Required',
+                'Enable time bin settings before viewing rank changes.',
+            )
             return
+
+        parent = self.parent()
+        metadata_enabled = getattr(parent, 'metadata_enabled', True) if parent is not None else True
+        opts_bool = self._collect_options()
+        window_left = self.context_left_spin.value()
+        window_right = self.context_right_spin.value()
+        drop_terms_raw = self._get_parent_drop_terms()
+        drop_terms = [str(t).strip() for t in drop_terms_raw if str(t).strip()]
+        drop_terms_set = set(drop_terms)
+        prefer_geo = self.mode_geo.isChecked()
+
+        csv_exists = bool(file_path and os.path.exists(file_path))
+        if drop_terms_set:
+            csv_status = 'drop_terms'
+        else:
+            csv_status = 'existing' if csv_exists else None
+
+        if not csv_exists:
+            if parent is None:
+                QMessageBox.warning(self, 'Unavailable', 'Parent window not available.')
+                return
+            if not time_bin_unit:
+                QMessageBox.warning(self, 'Time Bin Required', 'Provide a Bin Size and Time Unit before building rank changes.')
+                return
+            built_path, error = self._generate_by_time_csv(
+                city=city,
+                state=state,
+                start_value=start_value or None,
+                end_value=end_value or None,
+                term=term,
+                time_bin_unit=time_bin_unit,
+                drop_terms=drop_terms,
+                options_runtime=opts_bool,
+                options_hash=options_with_context,
+                window_left=window_left,
+                window_right=window_right,
+                metadata_enabled=metadata_enabled,
+                prefer_geo=prefer_geo,
+            )
+            if not built_path:
+                QMessageBox.critical(self, 'Error', error or 'Unable to build by-time data.')
+                return
+            file_path = built_path
+            csv_status = 'created'
+            csv_exists = True
+
         try:
             df = pd.read_csv(file_path)
         except Exception as e:
             QMessageBox.critical(self, 'Error', f'Could not read by-time data: {e}')
             return
+        if drop_terms_set:
+            df = df[~df['collocate_term'].isin(drop_terms_set)].reset_index(drop=True)
         if df.empty or 'time_bin' not in df.columns or 'collocate_term' not in df.columns or 'ordinal_rank' not in df.columns:
             QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available for the selected parameters.')
             return
@@ -4259,13 +4525,62 @@ class CollocationDialog(QDialog):
             len(unique_terms),
             default_top,
             selected_terms=selected_manual,
+            csv_status=csv_status,
+            csv_path=file_path,
+            drop_terms=drop_terms,
+            log_scale=getattr(self, '_rank_log_scale', True),
         )
         if settings_dialog.exec_() != QDialog.Accepted:
             return
         settings = settings_dialog.values()
         self._rank_selected_terms = list(dict.fromkeys(settings.get('selected_terms', [])))
         self._update_selected_terms_summary()
+        log_scale = bool(settings.get('log_scale', True))
+        self._rank_log_scale = log_scale
         self._save_state()
+        regen_on_accept = bool(drop_terms_set) or not csv_exists
+        if regen_on_accept:
+            built_path, error = self._generate_by_time_csv(
+                city=city,
+                state=state,
+                start_value=start_value or None,
+                end_value=end_value or None,
+                term=term,
+                time_bin_unit=time_bin_unit,
+                drop_terms=drop_terms,
+                options_runtime=opts_bool,
+                options_hash=options_with_context,
+                window_left=window_left,
+                window_right=window_right,
+                metadata_enabled=metadata_enabled,
+                prefer_geo=prefer_geo,
+            )
+            if not built_path:
+                QMessageBox.critical(self, 'Error', error or 'Unable to build by-time data.')
+                return
+            file_path = built_path
+            try:
+                df = pd.read_csv(file_path)
+            except Exception as exc:
+                QMessageBox.critical(self, 'Error', f'Could not read by-time data: {exc}')
+                return
+            if drop_terms_set:
+                df = df[~df['collocate_term'].isin(drop_terms_set)].reset_index(drop=True)
+            if df.empty or 'time_bin' not in df.columns or 'collocate_term' not in df.columns or 'ordinal_rank' not in df.columns:
+                QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available for the selected parameters.')
+                return
+            try:
+                bins_ordered = sorted(df['time_bin'].unique(), key=lambda x: pd.to_datetime(str(x), errors='coerce'))
+            except Exception:
+                bins_ordered = sorted(df['time_bin'].unique())
+            if not bins_ordered:
+                QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available.')
+                return
+            unique_terms = df['collocate_term'].dropna().unique().tolist()
+            if not unique_terms:
+                QMessageBox.information(self, 'No Rank Data', 'No collocate terms available to plot.')
+                return
+
         top_n = settings['top_n']
         use_global = settings['use_global']
         show_labels = settings['show_labels']
@@ -4297,6 +4612,8 @@ class CollocationDialog(QDialog):
         legend_order: List[str]
         home_label_value = None
 
+        home_label_value = bins_ordered[home_idx] if bins_ordered else None
+
         if manual_mode:
             top_terms = manual_terms
             legend_order = manual_terms
@@ -4309,7 +4626,6 @@ class CollocationDialog(QDialog):
             ordered_series = averages.reindex(top_terms).dropna().sort_values()
             legend_order = ordered_series.index.tolist() if not ordered_series.empty else list(top_terms)
         else:
-            home_label_value = bins_ordered[home_idx]
             df_home = df[df['time_bin'] == home_label_value].dropna(subset=['ordinal_rank'])
             if df_home.empty:
                 QMessageBox.information(self, 'No Data', 'The selected bin contains no collocates.')
@@ -4330,9 +4646,7 @@ class CollocationDialog(QDialog):
             QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
             return
 
-        if manual_mode:
-            home_label_display = 'Manual selection'
-        elif use_global:
+        if use_global:
             home_label_display = 'All time (global)'
         else:
             try:
@@ -4342,8 +4656,8 @@ class CollocationDialog(QDialog):
 
         city_display = city_text if city else 'All Cities'
         state_display = state_text if state else 'All States'
-        start_display = self.start_input.text().strip() or 'All dates'
-        end_display = self.end_input.text().strip() or 'All dates'
+        start_display = start_value or 'All dates'
+        end_display = end_value or 'All dates'
         if self.ignore_bin.isChecked():
             time_unit_display = 'Time Bin: none'
         else:
@@ -4368,6 +4682,7 @@ class CollocationDialog(QDialog):
                 legend_order=legend_order,
                 show_term_labels=show_labels,
                 settings_text=settings_text,
+                use_log_scale=log_scale,
             )
         except Exception as exc:
             QMessageBox.critical(self, 'Plot Error', str(exc))

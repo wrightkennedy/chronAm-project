@@ -481,6 +481,7 @@ def run_collocation(
     write_by_time: bool = True,
     drop_terms: Optional[List[str]] = None,
     metadata_enabled: bool = True,
+    write_metrics: bool = True,
 ) -> Dict[str, Optional[str]]:
     """
     Execute collocation analysis. Writes outputs into data/processed/<term>/.
@@ -555,6 +556,7 @@ def run_collocation(
             'ignore_bin': bool(ignore_bin),
             'options': opt_dict,
             'drop_terms': sorted(drop_set),
+            'write_occurrences_geojson': bool(write_occurrences_geojson),
         },
         'inputs': {
             'json_path': json_path,
@@ -562,23 +564,39 @@ def run_collocation(
         },
     }
 
+    metrics_path: Optional[str] = None
+    by_time_path: Optional[str] = None
+
     if df.empty:
         # Still write empty CSVs to keep UI predictable
-        empty_paths = _build_output_paths(proc, term, start_date, end_date, city, state, time_bin_unit, ignore_bin, opt_dict, suffix)
+        empty_paths = _build_output_paths(
+            proc,
+            term,
+            start_date,
+            end_date,
+            city,
+            state,
+            time_bin_unit,
+            ignore_bin,
+            opt_dict,
+            suffix,
+        )
         metrics_dir = os.path.dirname(empty_paths.get("metrics") or proc)
         if metrics_dir:
             os.makedirs(metrics_dir, exist_ok=True)
-        pd.DataFrame(columns=["collocate_term","frequency"]).to_csv(empty_paths["metrics"], index=False)
-        metrics_meta = dict(metadata_common)
-        metrics_meta.update({
-            'output_type': 'metrics_csv',
-            'row_count': 0,
-        })
-        meta_path = write_metadata_file(project_dir, empty_paths["metrics"], metrics_meta, enabled=metadata_enabled)
-        if meta_path:
-            metadata_paths['metrics'] = meta_path
-        if write_by_time and empty_paths["by_time"]:
-            pd.DataFrame(columns=["time_bin","collocate_term","frequency","ordinal_rank"]).to_csv(empty_paths["by_time"], index=False)
+        if write_metrics and empty_paths.get("metrics"):
+            pd.DataFrame(columns=["collocate_term", "frequency"]).to_csv(empty_paths["metrics"], index=False)
+            metrics_meta = dict(metadata_common)
+            metrics_meta.update({
+                'output_type': 'metrics_csv',
+                'row_count': 0,
+            })
+            meta_path = write_metadata_file(project_dir, empty_paths["metrics"], metrics_meta, enabled=metadata_enabled)
+            if meta_path:
+                metadata_paths['metrics'] = meta_path
+            metrics_path = empty_paths["metrics"]
+        if write_by_time and empty_paths.get("by_time"):
+            pd.DataFrame(columns=["time_bin", "collocate_term", "frequency", "ordinal_rank"]).to_csv(empty_paths["by_time"], index=False)
             by_time_meta = dict(metadata_common)
             by_time_meta.update({
                 'output_type': 'by_time_csv',
@@ -587,9 +605,10 @@ def run_collocation(
             meta_path = write_metadata_file(project_dir, empty_paths["by_time"], by_time_meta, enabled=metadata_enabled)
             if meta_path:
                 metadata_paths['by_time'] = meta_path
+            by_time_path = empty_paths["by_time"]
         return {
-            "metrics": empty_paths["metrics"],
-            "by_time": empty_paths["by_time"] if write_by_time else None,
+            "metrics": metrics_path,
+            "by_time": by_time_path,
             "occurrences": None,
             "metadata": metadata_paths,
         }
@@ -605,15 +624,17 @@ def run_collocation(
     metrics_dir = os.path.dirname(output_paths.get("metrics") or proc)
     if metrics_dir:
         os.makedirs(metrics_dir, exist_ok=True)
-    metrics.to_csv(output_paths["metrics"], index=False)
-    metrics_meta = dict(metadata_common)
-    metrics_meta.update({
-        'output_type': 'metrics_csv',
-        'row_count': int(len(metrics)),
-    })
-    meta_path = write_metadata_file(project_dir, output_paths["metrics"], metrics_meta, enabled=metadata_enabled)
-    if meta_path:
-        metadata_paths['metrics'] = meta_path
+    if write_metrics and output_paths.get("metrics"):
+        metrics.to_csv(output_paths["metrics"], index=False)
+        metrics_meta = dict(metadata_common)
+        metrics_meta.update({
+            'output_type': 'metrics_csv',
+            'row_count': int(len(metrics)),
+        })
+        meta_path = write_metadata_file(project_dir, output_paths["metrics"], metrics_meta, enabled=metadata_enabled)
+        if meta_path:
+            metadata_paths['metrics'] = meta_path
+        metrics_path = output_paths["metrics"]
 
     # Build by-time CSV if requested
     if write_by_time and output_paths["by_time"] and time_bin_unit and isinstance(time_bin_unit, str):
@@ -636,6 +657,7 @@ def run_collocation(
         meta_path = write_metadata_file(project_dir, output_paths["by_time"], by_time_meta, enabled=metadata_enabled)
         if meta_path:
             metadata_paths['by_time'] = meta_path
+        by_time_path = output_paths["by_time"]
 
     # Optionally write occurrences geojson (filtered subset)
     occurrence_path = None
@@ -685,8 +707,8 @@ def run_collocation(
             occurrence_path = None
 
     result = {
-        "metrics": output_paths["metrics"],
-        "by_time": output_paths["by_time"] if write_by_time else None,
+        "metrics": metrics_path,
+        "by_time": by_time_path,
         "occurrences": occurrence_path,
         "metadata": metadata_paths,
     }
