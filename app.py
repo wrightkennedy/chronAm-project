@@ -2370,11 +2370,6 @@ class MapToolDialog(QDialog):
         self._update_enabled_state()
 
     def _apply_defaults(self, defaults: dict):
-        map_type_def = str(defaults.get('map_type', 'rank')).lower()
-        idx = self.map_type_combo.findData(map_type_def)
-        if idx >= 0:
-            self.map_type_combo.setCurrentIndex(idx)
-
         mode_def = str(defaults.get('mode', 'points')).lower()
         idx = self.mode_combo.findData(mode_def)
         if idx >= 0:
@@ -2419,7 +2414,6 @@ class MapToolDialog(QDialog):
         self.table_row_limit.blockSignals(False)
         self._user_row_limit_override = row_limit_def > 0
         self._on_table_mode_changed()
-        self._apply_map_type_constraints()
 
     def _metric_info(self) -> dict:
         key = self.metric_combo.currentData()
@@ -2512,7 +2506,6 @@ class MapToolDialog(QDialog):
     def _collect_config(self) -> dict:
         info = self._metric_info()
         cfg = {
-            'map_type': self.map_type_combo.currentData(),
             'mode': self.mode_combo.currentData(),
             'time_unit': self.time_unit.currentText(),
             'time_step': self.time_step.value(),
