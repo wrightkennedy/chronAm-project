@@ -963,9 +963,11 @@ class DownloadDialog(QDialog):
         outputs_layout = QVBoxLayout(outputs_group)
         outputs_layout.setContentsMargins(9, 9, 9, 9)
         self.yearly_csv_cb = QCheckBox('Create yearly summary CSV')
+        self.yearly_csv_only_cb = QCheckBox('Create yearly summary CSV (only)')
         self.yearly_chart_cb = QCheckBox('Show yearly article chart')
         self.yearly_chart_cb.setChecked(True)
         outputs_layout.addWidget(self.yearly_csv_cb)
+        outputs_layout.addWidget(self.yearly_csv_only_cb)
         outputs_layout.addWidget(self.yearly_chart_cb)
         layout.addWidget(outputs_group)
 
@@ -1005,6 +1007,13 @@ class DownloadDialog(QDialog):
         self._current_start = ''
         self._current_end = ''
         self._current_term_dir: Optional[str] = None
+        self._summary_only_active = False
+        self._summary_only_requested = False
+
+        self.yearly_csv_only_cb.toggled.connect(self._update_summary_outputs_state)
+        self.yearly_csv_cb.toggled.connect(self._update_summary_outputs_state)
+        self.yearly_chart_cb.toggled.connect(self._update_summary_outputs_state)
+        self._update_summary_outputs_state()
 
     def showEvent(self, event):
         self.refresh_dataset_label()
@@ -1023,6 +1032,40 @@ class DownloadDialog(QDialog):
         self.dataset_change_btn.setEnabled(True)
         self.dataset_years_label.setText(self._format_year_summary(years))
         self._apply_year_defaults(years)
+
+    def _update_summary_outputs_state(self):
+        summary_only = self.yearly_csv_only_cb.isChecked()
+        if summary_only and not self._summary_only_active:
+            self._prev_yearly_chart_state = self.yearly_chart_cb.isChecked()
+            self._prev_clean_geo_state = self.clean_geo_cb.isChecked()
+        if summary_only:
+            self._summary_only_active = True
+            if not self.yearly_csv_cb.isChecked():
+                self.yearly_csv_cb.blockSignals(True)
+                self.yearly_csv_cb.setChecked(True)
+                self.yearly_csv_cb.blockSignals(False)
+            self.yearly_csv_cb.setEnabled(False)
+            if self.yearly_chart_cb.isChecked():
+                self.yearly_chart_cb.blockSignals(True)
+                self.yearly_chart_cb.setChecked(False)
+                self.yearly_chart_cb.blockSignals(False)
+            self.yearly_chart_cb.setEnabled(False)
+            if self.clean_geo_cb.isChecked():
+                self.clean_geo_cb.blockSignals(True)
+                self.clean_geo_cb.setChecked(False)
+                self.clean_geo_cb.blockSignals(False)
+            self.clean_geo_cb.setEnabled(False)
+        else:
+            if self._summary_only_active:
+                self.yearly_chart_cb.setChecked(getattr(self, '_prev_yearly_chart_state', True))
+                if getattr(self, '_prev_clean_geo_state', False):
+                    self.clean_geo_cb.setChecked(True)
+            self._summary_only_active = False
+            self.yearly_csv_cb.setEnabled(True)
+            self.yearly_chart_cb.setEnabled(True)
+            self.clean_geo_cb.setEnabled(True)
+
+        self.clean_geo_unmatched_cb.setEnabled(self.clean_geo_cb.isChecked() and self.clean_geo_cb.isEnabled())
 
     def _change_dataset_folder(self):
         start_dir = getattr(self.parent(), 'dataset_folder', None) or self.parent().project_folder
@@ -1250,6 +1293,7 @@ class DownloadDialog(QDialog):
         term  = self.search_input.text().strip()
         start = self.start_input.text().strip()
         end   = self.end_input.text().strip()
+        summary_only = self.yearly_csv_only_cb.isChecked()
 
         self._current_run_lines = []
         dataset_folder = self.parent().ensure_dataset_folder()
@@ -1265,20 +1309,22 @@ class DownloadDialog(QDialog):
         processed_root = os.path.join(self.parent().project_folder, 'data', 'processed')
         term_dir = os.path.join(processed_root, term_directory_name(term))
         os.makedirs(term_dir, exist_ok=True)
-        out_path = os.path.join(term_dir, f"{term}_{start}_{end}.json")
-        if os.path.exists(out_path):
-            if QMessageBox.warning(
-                self, 'Overwrite Warning', f'Will overwrite:\n{out_path}',
-                QMessageBox.Yes | QMessageBox.No
-            ) != QMessageBox.Yes:
-                self._log_plain('Search cancelled — existing file retained.')
-                self._finalize_project_log()
-                return
+        if not summary_only:
+            out_path = os.path.join(term_dir, f"{term}_{start}_{end}.json")
+            if os.path.exists(out_path):
+                if QMessageBox.warning(
+                    self, 'Overwrite Warning', f'Will overwrite:\n{out_path}',
+                    QMessageBox.Yes | QMessageBox.No
+                ) != QMessageBox.Yes:
+                    self._log_plain('Search cancelled — existing file retained.')
+                    self._finalize_project_log()
+                    return
 
         self._current_term = term
         self._current_start = start
         self._current_end = end
         self._current_term_dir = term_dir
+        self._summary_only_requested = summary_only
 
         if self.log.toPlainText().strip():
             self._log_blank()
@@ -1309,6 +1355,7 @@ class DownloadDialog(QDialog):
                 'collapse_hyphenated_breaks': self.clean_hyphen_cb.isChecked(),
             },
             metadata_enabled=getattr(self.parent(), 'metadata_enabled', True),
+            summary_only=summary_only,
         )
         self.thread.progress.connect(self.update_progress)
         self.thread.finished.connect(self.download_finished)
@@ -1390,6 +1437,83 @@ class DownloadDialog(QDialog):
         else:
             self._log_plain(f"Found {count:,} articles — elapsed {elapsed:.1f}s")
 
+    def _handle_summary_only_output(self, result_payload: Dict[str, Any], elapsed: float) -> Optional[str]:
+        per_year = result_payload.get('per_year') or []
+        totals = result_payload.get('totals') or {}
+        search_term_val = (result_payload.get('search_term') or self._current_term or '').strip()
+        raw_term_input = self.search_input.text().strip()
+        if not search_term_val and raw_term_input:
+            search_term_val = raw_term_input
+        csv_term_value = search_term_val if search_term_val else 'All Terms'
+
+        rows: List[Dict[str, Any]] = []
+        for entry in per_year:
+            year_label = str(entry.get('year', '') or '')
+            rows.append({
+                'search_term': csv_term_value,
+                'year': year_label,
+                'keyword_frequency': int(entry.get('keyword_frequency', 0)),
+                'total_articles': int(entry.get('article_count', 0)),
+                'total_pages': int(entry.get('page_count', 0)),
+                'total_issues': int(entry.get('issue_count', 0)),
+                'total_newspapers': int(entry.get('newspaper_count', 0)),
+                'total_words': int(entry.get('word_count', 0)),
+            })
+
+        if not rows:
+            self._log_plain('No records found within the selected range.')
+            return None
+
+        totals_row = {
+            'search_term': csv_term_value,
+            'year': 'Total',
+            'keyword_frequency': int(totals.get('keyword_frequency', 0)),
+            'total_articles': int(totals.get('article_count', 0)),
+            'total_pages': int(totals.get('page_count', 0)),
+            'total_issues': int(totals.get('issue_count', 0)),
+            'total_newspapers': int(totals.get('newspaper_count', 0)),
+            'total_words': int(totals.get('word_count', 0)),
+        }
+        rows.append(totals_row)
+
+        df = pd.DataFrame(rows)
+        term_dir = self._current_term_dir
+        if not term_dir:
+            processed_root = os.path.join(self.parent().project_folder, 'data', 'processed')
+            term_dir = os.path.join(processed_root, term_directory_name(search_term_val))
+            os.makedirs(term_dir, exist_ok=True)
+            self._current_term_dir = term_dir
+        else:
+            os.makedirs(term_dir, exist_ok=True)
+
+        term_label = search_term_val or 'all'
+        start_label = self._current_start or self.start_input.text().strip() or 'start'
+        end_label = self._current_end or self.end_input.text().strip() or 'end'
+        csv_name = f"{term_label}_{start_label}_{end_label}_yearly_summary.csv"
+        csv_path = os.path.join(term_dir, csv_name)
+
+        if os.path.exists(csv_path):
+            self._log_plain(f'Overwriting existing yearly summary CSV at {csv_path}')
+
+        try:
+            df.to_csv(csv_path, index=False)
+        except Exception as exc:
+            self._log_plain(f'Yearly summary CSV failed: {exc}')
+            return None
+
+        self._log_plain(
+            f"Summary-only search finished in {elapsed:.1f}s — "
+            f"{totals_row['total_articles']:,} articles, "
+            f"{totals_row['total_pages']:,} pages, "
+            f"{totals_row['total_issues']:,} issues, "
+            f"{totals_row['total_newspapers']:,} newspapers."
+        )
+        if search_term_val:
+            self._log_plain(f"Keyword frequency total: {totals_row['keyword_frequency']:,}")
+        self._log_plain(f"Total words: {totals_row['total_words']:,}")
+        self._log_link('Yearly summary CSV', csv_path)
+        return csv_path
+
     def _collect_year_counts(self, result_paths: List[str]) -> Tuple[Dict[str, int], Optional[str]]:
         counts: Dict[str, int] = {}
         detected_term: Optional[str] = None
@@ -1432,11 +1556,13 @@ class DownloadDialog(QDialog):
     def download_finished(self, result):
         elapsed = time.time() - self._start_time
         self._set_running_state(False)
+        summary_only_mode = bool(getattr(self, '_summary_only_requested', False))
         if isinstance(result, Exception):
             QMessageBox.critical(self, 'Error', str(result))
             self._log_plain(f"Search failed: {result}")
             self._cancel_event.clear()
             self._cancel_requested = False
+            self._summary_only_requested = False
             self._finalize_project_log()
             return
 
@@ -1448,8 +1574,20 @@ class DownloadDialog(QDialog):
                 self._log_plain(f'Search cancelled after {elapsed:.1f}s — no records saved')
             self._cancel_event.clear()
             self._cancel_requested = False
+            self._summary_only_requested = False
             self._finalize_project_log()
             return
+
+        if summary_only_mode and isinstance(result, dict) and result.get('summary_only'):
+            self._log_separator()
+            self._handle_summary_only_output(result, elapsed)
+            self._cancel_event.clear()
+            self._cancel_requested = False
+            self._summary_only_requested = False
+            self._finalize_project_log()
+            return
+
+        self._summary_only_requested = False
 
         self._log_separator()
 

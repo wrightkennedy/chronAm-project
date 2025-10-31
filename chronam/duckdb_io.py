@@ -38,7 +38,8 @@ Output JSON (per year) matches the app's existing downstream expectations:
 """
 
 
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any, Union
+from collections import defaultdict
 import os, json, re, threading
 import pandas as pd
 import duckdb
@@ -63,14 +64,18 @@ def download_data(
     max_saved_articles_per_year: Optional[int] = None,  # kept for API compat; still acts per-file scan
     progress_callback=None,
     cancel_event: Optional[threading.Event] = None,
+    summary_only: bool = False,
     cleaning_options: Optional[Dict[str, bool]] = None,
     metadata_enabled: bool = True,
-) -> List[str]:
+) -> Union[List[str], Dict[str, Any]]:
     """
-    Query local Parquet with DuckDB and write *one* JSON payload for the full date range
-    into data/processed/<term>/<term>_<start>_<end>.json.
+    Query local Parquet with DuckDB.
 
-    Returns: [path_to_single_json]
+    When ``summary_only`` is False (default), write a single JSON payload for the full date
+    range into ``data/processed/<term>/<term>_<start>_<end>.json`` and return the path.
+
+    When ``summary_only`` is True, return aggregated per-year metrics instead of writing
+    the JSON payload. The caller is responsible for persisting any downstream artifacts.
     """
     # Validate dates
     from datetime import datetime
@@ -135,10 +140,18 @@ def download_data(
     except Exception:
         pass
 
+    year_sequence = list(_years_between(start_date_str, end_date_str))
+    keyword_pattern = re.compile(re.escape(search_term), re.IGNORECASE) if search_term.strip() else None
+    word_pattern = re.compile(r'\b\w+\b')
+
     # Accumulate across all per-year Parquet files
     all_records: List[Dict] = []
+    summary_stats: Dict[str, Dict[str, int]] = {}
+    pages_seen = defaultdict(set)
+    issues_seen = defaultdict(set)
+    newspapers_seen = defaultdict(set)
 
-    for y in _years_between(start_date_str, end_date_str):
+    for y in year_sequence:
         if cancel_event and cancel_event.is_set():
             return []
         fpath = _file_for_year(parquet_root, y, parquet_prefix)
@@ -176,7 +189,36 @@ def download_data(
         if lccn_to_title:
             df["newspaper_name"] = df["lccn"].map(lccn_to_title)
 
-        all_records.extend(df.to_dict("records"))
+        if summary_only:
+            year_key = str(y)
+            stats = summary_stats.setdefault(
+                year_key,
+                {
+                    "keyword_frequency": 0,
+                    "article_count": 0,
+                    "word_count": 0,
+                }
+            )
+            for row in df.itertuples(index=False):
+                stats["article_count"] += 1
+                article_text = getattr(row, "article", "") or ""
+                if article_text:
+                    stats["word_count"] += len(word_pattern.findall(article_text))
+                    if keyword_pattern:
+                        stats["keyword_frequency"] += len(keyword_pattern.findall(article_text))
+                elif keyword_pattern:
+                    # No article text — still ensure key exists
+                    stats["keyword_frequency"] += 0
+                date_val = getattr(row, "date", "") or ""
+                page_val = getattr(row, "page", "") or ""
+                lccn_val = getattr(row, "lccn", "") or ""
+                pages_seen[year_key].add((date_val, page_val, lccn_val))
+                issues_seen[year_key].add((date_val, lccn_val))
+                if lccn_val:
+                    newspapers_seen[year_key].add(lccn_val)
+        else:
+            all_records.extend(df.to_dict("records"))
+
         if cancel_event and cancel_event.is_set():
             return []
         if progress_callback:
@@ -184,6 +226,48 @@ def download_data(
 
     if cancel_event and cancel_event.is_set():
         return []
+
+    if summary_only:
+        per_year: List[Dict[str, Any]] = []
+        totals = {
+            "keyword_frequency": 0,
+            "article_count": 0,
+            "page_count": 0,
+            "issue_count": 0,
+            "newspaper_count": 0,
+            "word_count": 0,
+        }
+        for year in year_sequence:
+            year_key = str(year)
+            stats = summary_stats.get(year_key, {})
+            page_count = len(pages_seen.get(year_key, set()))
+            issue_count = len(issues_seen.get(year_key, set()))
+            newspaper_count = len(newspapers_seen.get(year_key, set()))
+            row = {
+                "year": year_key,
+                "keyword_frequency": int(stats.get("keyword_frequency", 0)),
+                "article_count": int(stats.get("article_count", 0)),
+                "page_count": page_count,
+                "issue_count": issue_count,
+                "newspaper_count": newspaper_count,
+                "word_count": int(stats.get("word_count", 0)),
+            }
+            per_year.append(row)
+            totals["keyword_frequency"] += row["keyword_frequency"]
+            totals["article_count"] += row["article_count"]
+            totals["page_count"] += row["page_count"]
+            totals["issue_count"] += row["issue_count"]
+            totals["newspaper_count"] += row["newspaper_count"]
+            totals["word_count"] += row["word_count"]
+
+        return {
+            "summary_only": True,
+            "per_year": per_year,
+            "totals": totals,
+            "search_term": search_term,
+            "start_date": start_date_str,
+            "end_date": end_date_str,
+        }
 
     if not all_records:
         return []
