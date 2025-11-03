@@ -6,6 +6,7 @@ from datasets import load_dataset
 import pandas as pd
 from .config import init_project, DATASET_NAME, DATASET_CONFIG_NAME
 from .utils import term_directory_name
+from .metrics import metric_total_for_year_within_dates
 
 def download_data(
     project_dir: str,
@@ -41,6 +42,7 @@ def download_data(
     pattern = re.compile(re.escape(search_term), re.IGNORECASE)
     out_paths = []
 
+    cumulative_matches = 0
     for year_str in years:
         window_start = max(start_date, date(int(year_str), 1, 1))
         window_end = min(end_date, date(int(year_str), 12, 31))
@@ -54,12 +56,10 @@ def download_data(
         checked = 0
         batch = []
         limit_reached = False
+        year_total_articles = metric_total_for_year_within_dates(int(year_str), start_date, end_date, "article_count")
 
         for ex in ds:
             checked += 1
-            if heartbeat_interval and checked % heartbeat_interval == 0 and progress_callback:
-                progress_callback(checked)
-
             batch.append(ex)
             if len(batch) < batch_size and not limit_reached:
                 continue
@@ -100,6 +100,21 @@ def download_data(
                     matches.append(batch[idx])
                     if max_saved_articles_per_year and len(matches) >= max_saved_articles_per_year:
                         break
+
+        year_match_count = len(matches)
+        cumulative_matches += year_match_count
+        if progress_callback:
+            progress_callback({
+                "metric": "article_count",
+                "mode": "stream",
+                "year": year_str,
+                "increment": year_match_count,
+                "cumulative": cumulative_matches,
+                "year_dataset_total": year_total_articles,
+                "range_start": start_date_str,
+                "range_end": end_date_str,
+                "heartbeat": False,
+            })
 
         out_file = os.path.join(term_dir, f"{search_term}_{year_str}.json")
         payload = {

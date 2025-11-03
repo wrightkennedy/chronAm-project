@@ -45,6 +45,7 @@ import pandas as pd
 import duckdb
 from .config import init_project
 from .utils import term_directory_name, write_metadata_file
+from .metrics import metric_total_for_year_within_dates
 
 DEFAULT_PARQUET_PREFIX = "AmericanStories"
 SEARCH_LOCATIONS_REL = ["data/parquet", "parquet"]
@@ -80,8 +81,8 @@ def download_data(
     # Validate dates
     from datetime import datetime
     try:
-        _ = datetime.strptime(start_date_str, "%Y-%m-%d")
-        _ = datetime.strptime(end_date_str, "%Y-%m-%d")
+        start_date_obj = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+        end_date_obj = datetime.strptime(end_date_str, "%Y-%m-%d").date()
     except ValueError:
         raise ValueError("start_date_str and end_date_str must be 'YYYY-MM-DD'.")
 
@@ -151,6 +152,7 @@ def download_data(
     issues_seen = defaultdict(set)
     newspapers_seen = defaultdict(set)
 
+    cumulative_matches = 0
     for y in year_sequence:
         if cancel_event and cancel_event.is_set():
             return []
@@ -180,9 +182,21 @@ def download_data(
         df = con.execute(sql, params).fetchdf()
         if cancel_event and cancel_event.is_set():
             return []
+        year_key = str(y)
+        match_count = int(len(df))
         if df.empty:
             if progress_callback:
-                progress_callback(0)
+                progress_callback({
+                    "metric": "article_count",
+                    "mode": "summary_only" if summary_only else "search",
+                    "year": year_key,
+                    "increment": 0,
+                    "cumulative": cumulative_matches,
+                    "year_dataset_total": metric_total_for_year_within_dates(y, start_date_obj, end_date_obj, "article_count"),
+                    "range_start": start_date_str,
+                    "range_end": end_date_str,
+                    "heartbeat": False,
+                })
             continue
 
         # Enrich with newspaper_name where possible
@@ -190,7 +204,6 @@ def download_data(
             df["newspaper_name"] = df["lccn"].map(lccn_to_title)
 
         if summary_only:
-            year_key = str(y)
             stats = summary_stats.setdefault(
                 year_key,
                 {
@@ -221,8 +234,19 @@ def download_data(
 
         if cancel_event and cancel_event.is_set():
             return []
+        cumulative_matches += match_count
         if progress_callback:
-            progress_callback(int(len(df)))
+            progress_callback({
+                "metric": "article_count",
+                "mode": "summary_only" if summary_only else "search",
+                "year": year_key,
+                "increment": match_count,
+                "cumulative": cumulative_matches,
+                "year_dataset_total": metric_total_for_year_within_dates(y, start_date_obj, end_date_obj, "article_count"),
+                "range_start": start_date_str,
+                "range_end": end_date_str,
+                "heartbeat": False,
+            })
 
     if cancel_event and cancel_event.is_set():
         return []

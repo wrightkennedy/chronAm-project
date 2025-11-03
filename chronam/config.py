@@ -34,11 +34,13 @@ DATASET_SPLIT = "train"
 DEFAULT_CSV_FILENAME = "ChronAm_newspapers_XY.csv"
 DEFAULT_MERGED_GEOJSON = "merged.geojson"
 DEFAULT_COLLATED_GEOJSON = "collocated.geojson"
+DEFAULT_YEARLY_SUMMARY_FILENAME = "ChronAm_yearly_dataset_summary.csv"
 
 
 CSV_RESOURCE_PACKAGE = "chronam.resources"
 PACKAGE_ROOT = Path(__file__).resolve().parent
 _BUNDLED_CSV = PACKAGE_ROOT / "resources" / DEFAULT_CSV_FILENAME
+_BUNDLED_YEARLY_SUMMARY = PACKAGE_ROOT / "resources" / DEFAULT_YEARLY_SUMMARY_FILENAME
 
 
 def default_csv_path() -> str:
@@ -52,6 +54,19 @@ def default_csv_path() -> str:
         except ModuleNotFoundError:
             pass
     return str(_BUNDLED_CSV)
+
+
+def default_yearly_summary_path() -> str:
+    """Return the packaged yearly dataset summary CSV path."""
+    if _BUNDLED_YEARLY_SUMMARY.exists():
+        return str(_BUNDLED_YEARLY_SUMMARY)
+    if files:
+        try:
+            resource = files(CSV_RESOURCE_PACKAGE) / DEFAULT_YEARLY_SUMMARY_FILENAME
+            return str(resource)
+        except ModuleNotFoundError:
+            pass
+    return str(_BUNDLED_YEARLY_SUMMARY)
 
 
 def init_project(project_dir: str) -> dict:

@@ -9,7 +9,7 @@ from string import Template as StrTemplate
 
 from jinja2 import Template as JinjaTemplate
 from branca.element import MacroElement
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import List, Dict, Any, Tuple, Optional, Callable, Set
 
 import folium
@@ -18,6 +18,7 @@ from folium.plugins import HeatMap, HeatMapWithTime, MarkerCluster
 
 from .collocate import STOPWORDS as _STOPWORDS, WORD_RE as _WORD_RE
 from .utils import write_metadata_file
+from .metrics import metric_total_for_year_within_dates
 
 
 def _tok(text: Any, drop_stop: bool = False) -> List[str]:
@@ -1680,8 +1681,6 @@ def create_map(
     end_meta = end_override or metadata.get('end_date') or metadata.get('EndDate')
     start_dt_meta = _parse_date(start_meta) if start_meta else None
     end_dt_meta = _parse_date(end_meta) if end_meta else None
-    start_dt_meta = _parse_date(start_meta) if start_meta else None
-    end_dt_meta = _parse_date(end_meta) if end_meta else None
 
     if dates_dt:
         min_dt = min(dates_dt)
@@ -1740,6 +1739,21 @@ def create_map(
 
     popup_width = 320 if lightweight else 360
 
+    start_date_for_metrics: Optional[date] = None
+    end_date_for_metrics: Optional[date] = None
+    if isinstance(range_start, datetime):
+        start_date_for_metrics = range_start.date()
+    elif isinstance(range_start, date):
+        start_date_for_metrics = range_start
+    if isinstance(range_end, datetime):
+        end_date_for_metrics = range_end.date()
+    elif isinstance(range_end, date):
+        end_date_for_metrics = range_end
+    if start_date_for_metrics is None and min_dt:
+        start_date_for_metrics = min_dt.date()
+    if end_date_for_metrics is None and max_dt:
+        end_date_for_metrics = max_dt.date()
+
     embed_articles = not lightweight
     values: List[float] = []
     popup_dataset: Dict[str, Any] = {}
@@ -1768,6 +1782,7 @@ def create_map(
             loc_lon = 0.0
 
         entry_payloads = []
+        year_match_counts: Dict[str, int] = {}
         for entry_idx, entry in enumerate(entries):
             payload = _entry_payload(
                 entry,
@@ -1776,6 +1791,31 @@ def create_map(
                 lightweight=lightweight,
             )
             payload['full_index'] = entry_idx
+            entry_date = str(entry.get('date') or '').strip()
+            if entry_date:
+                year_token = entry_date[:4]
+                if year_token.isdigit():
+                    payload['dataset_year'] = year_token
+                    year_match_counts[year_token] = year_match_counts.get(year_token, 0) + 1
+                    try:
+                        year_int = int(year_token)
+                    except (TypeError, ValueError):
+                        year_int = None
+                    if year_int is not None:
+                        start_for_year = start_date_for_metrics or date(year_int, 1, 1)
+                        end_for_year = end_date_for_metrics or date(year_int, 12, 31)
+                        try:
+                            year_total_val = metric_total_for_year_within_dates(
+                                year_int,
+                                start_for_year,
+                                end_for_year,
+                                "article_count",
+                            )
+                        except Exception:
+                            year_total_val = None
+                        if year_total_val:
+                            payload['dataset_year_total'] = int(year_total_val)
+                            payload['dataset_metric_label'] = 'articles'
             entry_payloads.append(payload)
 
         for entry in entries:
@@ -1792,7 +1832,6 @@ def create_map(
         title_text, article_count, _ = _group_header(entries, stats, search_term)
         dataset_entry: Dict[str, Any] = {
             'entries': entry_payloads,
-            'full_entries': entry_payloads,
             'value': value,
             'full_value': value,
             'article_count': article_count,
@@ -1814,6 +1853,8 @@ def create_map(
             'state': state_raw,
             'place_label': place_label,
         }
+        if year_match_counts:
+            dataset_entry['year_match_counts'] = year_match_counts
 
         if (use_time_slider or rank_time_bins) and time_index:
             time_bins: Dict[str, Dict[str, Any]] = {}
@@ -2849,6 +2890,8 @@ def create_map(
   var topTermStyleInjected = false;
   var topTermLegendItems = {};
   var topTermActiveFilterTerm = '';
+  var topTermCollapseButton = null;
+  var topTermLegendCollapsed = false;
 
   (function parseConfig() {
     var tag = document.getElementById('map-config');
@@ -2975,8 +3018,13 @@ def create_map(
     var style = document.createElement('style');
     style.textContent = `
 .top-term-legend { position: fixed; top: 60px; right: 12px; z-index: 9999; background: rgba(255,255,255,0.94); box-shadow: 0 1px 4px rgba(0,0,0,0.25); border-radius: 6px; padding: 8px 10px; max-width: 240px; font-size: 13px; line-height: 1.4; }
-.top-term-legend h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; color: #2d3748; }
-.top-term-legend .legend-body { max-height: 200px; overflow-y: auto; margin-top: 6px; }
+.top-term-legend h3 { margin: 0; font-size: 14px; font-weight: 600; color: #2d3748; }
+.top-term-legend .legend-body { max-height: 200px; overflow-y: auto; margin-top: 6px; transition: max-height 0.25s ease, margin-top 0.25s ease; }
+.top-term-legend.collapsed .legend-body { max-height: 0; margin-top: 0; overflow: hidden; }
+.top-term-legend .legend-header-controls { display: flex; align-items: center; gap: 8px; }
+.top-term-legend .legend-header-spacer { flex: 1 1 auto; }
+.top-term-legend button.legend-toggle { border: none; background: none; cursor: pointer; font-size: 14px; line-height: 1; padding: 0 4px; color: #2d3748; }
+.top-term-legend button.legend-toggle:focus { outline: 2px solid #3182ce; outline-offset: 2px; }
 .top-term-legend .legend-item { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 12px; color: #2d3748; }
 .top-term-legend .legend-item:last-child { margin-bottom: 0; }
 .top-term-legend .swatch { width: 14px; height: 14px; border-radius: 3px; border: 1px solid rgba(0,0,0,0.2); flex: 0 0 auto; }
@@ -2987,6 +3035,32 @@ def create_map(
 .top-term-label { background: rgba(255,255,255,0.85); border-radius: 4px; padding: 2px 6px; border: 1px solid rgba(0,0,0,0.15); box-shadow: 0 1px 3px rgba(0,0,0,0.3); color: #1a202c; font-weight: 600; }
 `.trim();
     document.head.appendChild(style);
+  }
+
+  function setTopTermLegendCollapsed(collapsed) {
+    topTermLegendCollapsed = !!collapsed;
+    if (topTermLegendContainer) {
+      if (topTermLegendCollapsed) {
+        topTermLegendContainer.classList.add('collapsed');
+      } else {
+        topTermLegendContainer.classList.remove('collapsed');
+      }
+    }
+    if (topTermLegendList) {
+      if (topTermLegendCollapsed) {
+        topTermLegendList.style.maxHeight = '0';
+        topTermLegendList.style.marginTop = '0';
+      } else {
+        topTermLegendList.style.maxHeight = '200px';
+        topTermLegendList.style.marginTop = '6px';
+      }
+    }
+    if (topTermCollapseButton) {
+      topTermCollapseButton.textContent = topTermLegendCollapsed ? '▾' : '▴';
+      var label = topTermLegendCollapsed ? 'Expand term list' : 'Collapse term list';
+      topTermCollapseButton.setAttribute('aria-label', label);
+      topTermCollapseButton.title = label;
+    }
   }
 
   function colorForTerm(term) {
@@ -3034,6 +3108,9 @@ def create_map(
     ensureTopTermStyle();
     if (topTermLegendContainer && document.body.contains(topTermLegendContainer)) {
       topTermLegendContainer.style.display = '';
+      topTermLegendList = topTermLegendContainer.querySelector('.legend-body');
+      topTermCollapseButton = topTermLegendContainer.querySelector('[data-top-term-collapse]');
+      setTopTermLegendCollapsed(topTermLegendCollapsed);
       return;
     }
     var container = document.createElement('div');
@@ -3042,10 +3119,29 @@ def create_map(
 
     var headerRow = document.createElement('div');
     headerRow.className = 'legend-controls';
+    headerRow.style.display = 'flex';
+    headerRow.style.alignItems = 'center';
+    headerRow.style.gap = '8px';
     var title = document.createElement('h3');
     title.textContent = 'Top Terms';
-    title.style.margin = '0';
     headerRow.appendChild(title);
+
+    var headerSpacer = document.createElement('span');
+    headerSpacer.className = 'legend-header-spacer';
+    headerRow.appendChild(headerSpacer);
+
+    var collapseBtn = document.createElement('button');
+    collapseBtn.type = 'button';
+    collapseBtn.className = 'legend-toggle';
+    collapseBtn.setAttribute('data-top-term-collapse', '1');
+    collapseBtn.textContent = topTermLegendCollapsed ? '▾' : '▴';
+    collapseBtn.title = topTermLegendCollapsed ? 'Expand term list' : 'Collapse term list';
+    collapseBtn.setAttribute('aria-label', collapseBtn.title);
+    collapseBtn.addEventListener('click', function(ev) {
+      ev.preventDefault();
+      setTopTermLegendCollapsed(!topTermLegendCollapsed);
+    });
+    headerRow.appendChild(collapseBtn);
 
     var toggleLabel = document.createElement('label');
     toggleLabel.style.display = 'flex';
@@ -3111,6 +3207,8 @@ def create_map(
     topTermLegend = container;
     topTermLegendList = list;
     topTermLabelToggle = toggle;
+    topTermCollapseButton = collapseBtn;
+    setTopTermLegendCollapsed(topTermLegendCollapsed);
   }
 
   function removeTopTermLegend() {
@@ -3204,6 +3302,7 @@ def create_map(
       topTermLabelToggle.checked = topTermLabelsEnabled;
     }
     updateTopTermLegendActiveState();
+    setTopTermLegendCollapsed(topTermLegendCollapsed);
   }
 
   function applyTopTermLabelState(layer, term) {
@@ -5206,7 +5305,52 @@ def create_map(
     var current = index + 1;
     if (!Number.isFinite(current) || current < 1) current = 1;
     if (current > total) current = total;
-    progress.textContent = 'Article ' + current + ' of ' + total;
+    var entry = groupData.entries[index] || null;
+    var baseText = 'Article ' + current + ' of ' + total;
+    if (!entry) {
+      progress.textContent = baseText;
+      return;
+    }
+    var parts = [baseText];
+    var yearToken = entry.dataset_year || entry.datasetYear || null;
+    if (yearToken) {
+      var yearStr = String(yearToken);
+      var yearCounts = groupData.year_match_counts || groupData.yearMatchCounts || {};
+      var totalMatchesForYear = 0;
+      if (yearCounts && Object.prototype.hasOwnProperty.call(yearCounts, yearStr)) {
+        totalMatchesForYear = Number(yearCounts[yearStr]) || 0;
+      }
+      if (totalMatchesForYear > 0) {
+        var withinYearIndex = 0;
+        for (var i = 0; i <= index; i++) {
+          var candidate = groupData.entries[i];
+          if (candidate && String(candidate.dataset_year || candidate.datasetYear || '') === yearStr) {
+            withinYearIndex += 1;
+          }
+        }
+        if (withinYearIndex < 1) withinYearIndex = 1;
+        parts.push('— ' + yearStr + ' match ' + withinYearIndex + ' of ' + totalMatchesForYear);
+      } else {
+        parts.push('— ' + yearStr);
+      }
+      var rawYearTotal = entry.dataset_year_total || entry.datasetYearTotal;
+      var metricLabel = entry.dataset_metric_label || entry.datasetMetricLabel || 'articles';
+      var numericYearTotal = Number(rawYearTotal);
+      if (Number.isFinite(numericYearTotal) && numericYearTotal > 0) {
+        var localizedTotal = numericYearTotal.toLocaleString();
+        var percent = null;
+        if (totalMatchesForYear > 0) {
+          percent = (totalMatchesForYear / numericYearTotal) * 100;
+        }
+        if (percent && percent > 0) {
+          var rounded = percent >= 0.01 ? percent.toFixed(2) : percent.toFixed(4);
+          parts.push('(~' + rounded + '% of ' + localizedTotal + ' ' + metricLabel + ')');
+        } else {
+          parts.push('(' + localizedTotal + ' ' + metricLabel + ' in dataset)');
+        }
+      }
+    }
+    progress.textContent = parts.join(' ');
   }
   function updateDockButtonState(root, btn) {
     if (!root || !btn) {

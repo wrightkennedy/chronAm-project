@@ -62,6 +62,7 @@ from chronam.config import DEFAULT_CSV_FILENAME, default_csv_path
 from chronam.map_create import create_map, _build_time_index, _parse_date
 from chronam.collocate import run_collocation, build_collocation_output_paths
 from chronam.utils import term_directory_name
+from chronam.metrics import metric_total_for_dates
 
 
 def reveal_in_file_manager(path: str):
@@ -264,7 +265,7 @@ class Spinner(QWidget):
         painter.drawArc(rect, (self._angle * 16), 270 * 16)
 
 class WorkerThread(QThread):
-    progress = pyqtSignal(int)
+    progress = pyqtSignal(object)
     finished = pyqtSignal(object)
 
     def __init__(self, task_func, *args, **kwargs):
@@ -976,8 +977,19 @@ class DownloadDialog(QDialog):
         self.log.anchorClicked.connect(self._handle_log_link)
         self.log.setReadOnly(True)
         self.progress = QProgressBar()
+        self.progress.setTextVisible(True)
         layout.addWidget(self.log)
         layout.addWidget(self.progress)
+        self.progress_details = QLabel()
+        self.progress_details.setWordWrap(True)
+        self.progress_details.setStyleSheet("color:#555; font-size:11px;")
+        self.progress_details.hide()
+        layout.addWidget(self.progress_details)
+        self.progress_eta = QLabel()
+        self.progress_eta.setWordWrap(True)
+        self.progress_eta.setStyleSheet("color:#555; font-size:11px;")
+        self.progress_eta.hide()
+        layout.addWidget(self.progress_eta)
 
         btns = QHBoxLayout()
         self.run_btn = QPushButton('Search Records')
@@ -1009,6 +1021,16 @@ class DownloadDialog(QDialog):
         self._current_term_dir: Optional[str] = None
         self._summary_only_active = False
         self._summary_only_requested = False
+        self._current_start_date_obj = None
+        self._current_end_date_obj = None
+        self._progress_metric_key = 'article_count'
+        self._progress_total_metric = 0
+        self._progress_cumulative = 0
+        self._progress_year_totals: Dict[str, int] = {}
+        self._processed_dataset_units = 0
+        self._processed_years: Set[str] = set()
+        self._first_year_sec_per_unit: Optional[float] = None
+        self._eta_seconds_remaining: Optional[float] = None
 
         self.yearly_csv_only_cb.toggled.connect(self._update_summary_outputs_state)
         self.yearly_csv_cb.toggled.connect(self._update_summary_outputs_state)
@@ -1295,6 +1317,21 @@ class DownloadDialog(QDialog):
         end   = self.end_input.text().strip()
         summary_only = self.yearly_csv_only_cb.isChecked()
 
+        try:
+            start_date_obj = datetime.strptime(start, '%Y-%m-%d').date()
+            end_date_obj = datetime.strptime(end, '%Y-%m-%d').date()
+        except ValueError:
+            QMessageBox.warning(self, 'Invalid Dates', 'Enter start and end dates as YYYY-MM-DD.')
+            self._log_plain('Search cancelled — invalid date format.')
+            self._finalize_project_log()
+            return
+
+        if end_date_obj < start_date_obj:
+            QMessageBox.warning(self, 'Invalid Range', 'The end date must be on or after the start date.')
+            self._log_plain('Search cancelled — end date precedes start date.')
+            self._finalize_project_log()
+            return
+
         self._current_run_lines = []
         dataset_folder = self.parent().ensure_dataset_folder()
         if not dataset_folder:
@@ -1325,6 +1362,8 @@ class DownloadDialog(QDialog):
         self._current_end = end
         self._current_term_dir = term_dir
         self._summary_only_requested = summary_only
+        self._current_start_date_obj = start_date_obj
+        self._current_end_date_obj = end_date_obj
 
         if self.log.toPlainText().strip():
             self._log_blank()
@@ -1332,7 +1371,31 @@ class DownloadDialog(QDialog):
         header = f'Searching for "{term}" between {start} and {end}'
         self._log_plain(header)
         self._log_plain('Starting search...')
-        self.progress.setValue(0)
+        self._progress_metric_key = 'article_count'
+        self._progress_cumulative = 0
+        self._progress_year_totals.clear()
+        self._processed_dataset_units = 0
+        self._processed_years.clear()
+        self._first_year_sec_per_unit = None
+        self._eta_seconds_remaining = None
+        self._progress_total_metric = metric_total_for_dates(start_date_obj, end_date_obj, self._progress_metric_key)
+        self.progress.setFormat('%p%')
+        if self._progress_total_metric > 0:
+            self.progress.setRange(0, self._progress_total_metric)
+            self.progress.setValue(0)
+            self.progress_details.setText(
+                f"0 of {self._progress_total_metric:,} articles (~0.00%) across the selected range "
+                "(based on the packaged yearly totals)."
+            )
+        else:
+            self.progress.setRange(0, 0)
+            self.progress.setValue(0)
+            self.progress_details.setText(
+                'Progress will update as results are found (yearly totals unavailable for this range).'
+            )
+        self.progress_details.show()
+        self.progress_eta.hide()
+        self.progress_eta.setText('')
         self._start_time = time.time()
         self.logged_years.clear()
         self._cancel_event.clear()
@@ -1361,81 +1424,178 @@ class DownloadDialog(QDialog):
         self.thread.finished.connect(self.download_finished)
         self.thread.start()
 
-    def update_progress(self, count: int):
+    def update_progress(self, payload: object):
         now = time.time()
-        elapsed = now - self._start_time
-        year_value = None
+        elapsed = max(0.0, now - (self._start_time or now))
+
+        year = None
+        increment = 0
+        cumulative = None
+        year_total = None
+        heartbeat = False
+        is_new_year_entry = False
         year_elapsed = None
 
-        def parquet_dir_candidates():
-            explicit_dir = getattr(self, 'current_parquet_dir', None)
-            if explicit_dir:
-                yield explicit_dir
-
-            project_dir = getattr(self.parent(), 'project_folder', None)
-            if project_dir:
-                yield os.path.join(project_dir, 'data', 'parquet')
-                yield os.path.join(project_dir, 'parquet')
-                dataset_from_parent = getattr(self.parent(), 'dataset_folder', None)
-                if dataset_from_parent:
-                    yield dataset_from_parent
-                yield project_dir
-
-        def parse_year(text):
-            match = re.match(r"(\d{4})", text or "")
-            return int(match.group(1)) if match else None
-
-        start_year = parse_year(self.start_input.text().strip())
-        end_year = parse_year(self.end_input.text().strip())
-        year_pattern = re.compile(r"AmericanStories_(\d{4})\.parquet")
-
-        year_range = []
-        if start_year and end_year:
-            lo, hi = sorted((start_year, end_year))
-            year_range = [str(y) for y in range(lo, hi + 1)]
-
-        seen_dirs = set()
-
-        for directory in parquet_dir_candidates():
-            if not directory or directory in seen_dirs:
-                continue
-            seen_dirs.add(directory)
-            if not os.path.isdir(directory):
-                continue
-
+        if isinstance(payload, dict):
+            raw_year = payload.get('year')
+            if raw_year:
+                year = str(raw_year)
+            heartbeat = bool(payload.get('heartbeat'))
             try:
-                files = [f for f in os.listdir(directory) if f.endswith('.parquet')]
-            except OSError:
-                continue
-
-            year_map = {}
-            for file in files:
-                match = year_pattern.fullmatch(file)
-                if match:
-                    year_map[match.group(1)] = file
-
-            for target_year in year_range or sorted(year_map.keys()):
-                if target_year in year_map and target_year not in self.logged_years:
-                    self.logged_years.add(target_year)
-                    year_value = target_year
-                    if self._year_timer is None:
-                        self._year_timer = now
-                    year_elapsed = max(0.0, now - self._year_timer)
-                    self._year_timer = now
-                    break
-
-            if year_value is not None:
-                break
-
-        self.progress.setValue(count)
-        if year_value is not None:
-            if year_elapsed is None:
-                year_elapsed = max(0.0, now - (self._year_timer or now))
-            self._log_plain(
-                f"Found {count:,} articles in year {year_value} - search time {year_elapsed:.1f}s"
-            )
+                increment = int(payload.get('increment', 0) or 0)
+            except (TypeError, ValueError):
+                increment = 0
+            year_total_raw = payload.get('year_dataset_total')
+            if year_total_raw is not None:
+                try:
+                    year_total = int(year_total_raw)
+                except (TypeError, ValueError):
+                    year_total = None
+            cumulative_raw = payload.get('cumulative')
+            if cumulative_raw is not None:
+                try:
+                    cumulative = max(0, int(cumulative_raw))
+                except (TypeError, ValueError):
+                    cumulative = None
         else:
-            self._log_plain(f"Found {count:,} articles — elapsed {elapsed:.1f}s")
+            try:
+                increment = int(payload)
+            except (TypeError, ValueError):
+                increment = 0
+
+        if increment < 0:
+            increment = 0
+
+        if cumulative is None:
+            cumulative = max(0, self._progress_cumulative + increment)
+
+        self._progress_cumulative = cumulative
+
+        bar_value = cumulative
+        display_value = cumulative
+        if self._progress_total_metric and self._progress_total_metric > 0:
+            if self.progress.maximum() != self._progress_total_metric:
+                self.progress.setRange(0, self._progress_total_metric)
+            bar_value = min(cumulative, self._progress_total_metric)
+            display_value = bar_value
+        else:
+            if self.progress.minimum() != 0 or self.progress.maximum() != 0:
+                self.progress.setRange(0, 0)
+            bar_value = 0
+            display_value = cumulative
+        self.progress.setValue(bar_value)
+
+        if year:
+            self._progress_year_totals[year] = self._progress_year_totals.get(year, 0) + increment
+
+        if self._progress_total_metric and self._progress_total_metric > 0:
+            pct = (display_value / self._progress_total_metric * 100.0) if self._progress_total_metric else 0.0
+            coverage_text = f"{display_value:,} of {self._progress_total_metric:,} articles (~{pct:.2f}%)"
+        else:
+            coverage_text = f"{display_value:,} articles processed"
+
+        detail_parts = []
+        if year:
+            if increment > 0:
+                if year_total:
+                    year_pct = (increment / year_total * 100.0) if year_total else 0.0
+                    detail_parts.append(
+                        f"{increment:,} matches from {year} (~{year_pct:.2f}% of {int(year_total):,})"
+                    )
+                else:
+                    detail_parts.append(f"{increment:,} matches from {year}")
+            elif not heartbeat:
+                detail_parts.append(f"No matches from {year}")
+
+        detail_text = coverage_text + (". " + " ".join(detail_parts) if detail_parts else ".")
+        self.progress_details.setText(detail_text)
+        if not self.progress_details.isVisible():
+            self.progress_details.show()
+
+        if year and not heartbeat and year not in self.logged_years:
+            year_elapsed = max(0.0, now - (self._year_timer or now))
+            self._year_timer = now
+            self.logged_years.add(year)
+            is_new_year_entry = True
+            if increment > 0:
+                if year_total:
+                    year_pct = (increment / year_total * 100.0) if year_total else 0.0
+                    self._log_plain(
+                        f"Found {increment:,} articles in {year} (~{year_pct:.2f}% of {int(year_total):,}) "
+                        f"— search time {year_elapsed:.1f}s"
+                    )
+                else:
+                    self._log_plain(f"Found {increment:,} articles in {year} — search time {year_elapsed:.1f}s")
+            else:
+                self._log_plain(f"No matching articles found in {year} — search time {year_elapsed:.1f}s")
+        elif not year and increment and not heartbeat:
+            self._log_plain(f"Found {increment:,} articles — elapsed {elapsed:.1f}s")
+
+        self._update_time_estimate(year, year_total, year_elapsed, is_new_year_entry)
+
+    def _update_time_estimate(
+        self,
+        year: Optional[str],
+        year_total: Optional[int],
+        year_elapsed: Optional[float],
+        is_new_year_entry: bool,
+    ) -> None:
+        if not self._progress_total_metric or self._progress_total_metric <= 0:
+            self.progress_eta.hide()
+            return
+
+        updated = False
+        if is_new_year_entry and year:
+            if year_total is None:
+                year_total = 0
+            if year not in self._processed_years:
+                self._processed_years.add(year)
+                self._processed_dataset_units += max(0, int(year_total))
+                if self._progress_total_metric:
+                    self._processed_dataset_units = min(self._processed_dataset_units, self._progress_total_metric)
+                if (
+                    self._first_year_sec_per_unit is None
+                    and year_elapsed is not None
+                    and year_elapsed > 0
+                    and year_total
+                ):
+                    self._first_year_sec_per_unit = year_elapsed / max(1, int(year_total))
+                updated = True
+
+        remaining_units = max(0, self._progress_total_metric - self._processed_dataset_units)
+        if remaining_units == 0 and self.logged_years:
+            self._eta_seconds_remaining = 0.0
+            self.progress_eta.setText('Estimated time remaining: 0s')
+            self.progress_eta.show()
+            return
+
+        if self._first_year_sec_per_unit:
+            est_seconds = remaining_units * self._first_year_sec_per_unit
+            self._eta_seconds_remaining = est_seconds
+            self.progress_eta.setText(
+                f"Estimated time remaining: {self._format_duration(est_seconds)}"
+            )
+            self.progress_eta.show()
+        else:
+            if self._processed_years or updated:
+                self.progress_eta.setText('Estimating remaining time…')
+                self.progress_eta.show()
+            else:
+                self.progress_eta.hide()
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(0, int(round(seconds)))
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, sec = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes}m {sec}s"
+        hours, minutes = divmod(minutes, 60)
+        if hours < 24:
+            return f"{hours}h {minutes}m"
+        days, hours = divmod(hours, 24)
+        return f"{days}d {hours}h"
 
     def _handle_summary_only_output(self, result_payload: Dict[str, Any], elapsed: float) -> Optional[str]:
         per_year = result_payload.get('per_year') or []
@@ -1556,6 +1716,11 @@ class DownloadDialog(QDialog):
     def download_finished(self, result):
         elapsed = time.time() - self._start_time
         self._set_running_state(False)
+        if self._progress_total_metric and self._processed_dataset_units >= self._progress_total_metric:
+            self.progress_eta.setText('Estimated time remaining: 0s')
+            self.progress_eta.show()
+        else:
+            self.progress_eta.hide()
         summary_only_mode = bool(getattr(self, '_summary_only_requested', False))
         if isinstance(result, Exception):
             QMessageBox.critical(self, 'Error', str(result))
@@ -1981,6 +2146,7 @@ class CollocationRankSettingsDialog(QDialog):
         form.addRow(self.global_check)
 
         self.labels_check = QCheckBox('Show term labels on chart')
+        self.labels_check.setChecked(True)
         form.addRow(self.labels_check)
 
         self.log_scale_check = QCheckBox('Use log scale (y-axis)')
@@ -2087,7 +2253,7 @@ class CollocateMapSettingsDialog(QDialog):
         time_bins: List[Tuple[str, str]],
         cities: List[Tuple[str, str]],
         states: List[str],
-        default_top_n: int = 25,
+        default_top_n: int = 10,
         max_top_n: int = 150,
         selected_terms: Optional[Iterable[str]] = None,
         use_selected_default: bool = False,
@@ -2124,6 +2290,10 @@ class CollocateMapSettingsDialog(QDialog):
         self.colorize_check = QCheckBox('Color markers by collocate article count')
         self.colorize_check.setChecked(True)
         form.addRow(self.colorize_check)
+
+        self.lightweight_check = QCheckBox('Lightweight mode (trim popup payloads)')
+        self.lightweight_check.setChecked(True)
+        form.addRow(self.lightweight_check)
 
         self.export_csv_check = QCheckBox('Export collocate CSV with XY')
         self.export_csv_check.setToolTip('Writes a CSV summarizing collocates with coordinates for further analysis.')
@@ -2320,6 +2490,7 @@ class CollocateMapSettingsDialog(QDialog):
             'location_city': str(city_val or ''),
             'location_state': str(state_val or ''),
             'colorize': self.colorize_check.isChecked(),
+            'lightweight': self.lightweight_check.isChecked(),
             'location_label': location_label,
             'enable_time_slider': self.enable_time_slider.isEnabled() and self.enable_time_slider.isChecked(),
             'use_selected_terms': self.use_selected_terms_check.isChecked(),
@@ -3702,7 +3873,7 @@ class CollocationDialog(QDialog):
         btn_run = QPushButton('Run Collocation')
         btn_bar = QPushButton('Show Bar Chart')
         btn_rank = QPushButton('Show Rank Changes')
-        btn_map_collocate = QPushButton('Create Collocate‑Rank Map (lightweight)')
+        btn_map_collocate = QPushButton('Create Collocate‑Rank Map')
         btn_run.clicked.connect(self.run_collocate)
         btn_bar.clicked.connect(self.show_bar)
         btn_rank.clicked.connect(self.show_rank)
@@ -3807,7 +3978,7 @@ class CollocationDialog(QDialog):
         )
         sorted_states = sorted(state_set, key=lambda s: s.lower())
 
-        default_top = self._collocate_map_settings.get('top_n') if isinstance(self._collocate_map_settings, dict) else 25
+        default_top = self._collocate_map_settings.get('top_n') if isinstance(self._collocate_map_settings, dict) else 10
         manual_terms_current = list(dict.fromkeys(self._rank_selected_terms))
         use_selected_default = bool(manual_terms_current)
         if isinstance(self._collocate_map_settings, dict) and 'use_selected_terms' in self._collocate_map_settings:
@@ -3817,7 +3988,7 @@ class CollocationDialog(QDialog):
             time_bins=time_bin_pairs,
             cities=sorted_cities,
             states=sorted_states,
-            default_top_n=max(1, min(int(default_top or 25), 150)),
+            default_top_n=max(1, min(int(default_top or 10), 150)),
             max_top_n=150,
             selected_terms=manual_terms_current,
             use_selected_default=use_selected_default,
@@ -3830,6 +4001,7 @@ class CollocationDialog(QDialog):
                 settings_dialog.map_type_combo.setCurrentIndex(idx)
             settings_dialog._apply_map_type_constraints()
             settings_dialog.colorize_check.setChecked(bool(prev.get('colorize')))
+            settings_dialog.lightweight_check.setChecked(bool(prev.get('lightweight', True)))
             settings_dialog.export_csv_check.setChecked(bool(prev.get('export_csv')))
             if prev.get('term_scope') == 'time' and settings_dialog.time_combo.count() > 0:
                 desired = prev.get('time_key')
@@ -3873,7 +4045,7 @@ class CollocationDialog(QDialog):
 
         manual_terms = list(dict.fromkeys(self._rank_selected_terms))
         use_selected_terms = bool(map_settings.get('use_selected_terms')) if map_type != 'top_term' else False
-        default_top_n = int(map_settings.get('top_n', 25))
+        default_top_n = int(map_settings.get('top_n', 10))
         if use_selected_terms and manual_terms:
             metrics_path = None
             if isinstance(self._last_output_paths, dict):
@@ -3923,7 +4095,10 @@ class CollocationDialog(QDialog):
         location_label = map_settings.get('location_label') or ''
 
         try:
-            # Create lightweight map with embedded collocate rank index
+            lightweight_mode = bool(map_settings.get('lightweight', True))
+            map_settings['lightweight'] = lightweight_mode
+            self._collocate_map_settings['lightweight'] = lightweight_mode
+            # Create map with optional lightweight payload trimming
             result = create_map(
                 geo_path,
                 mode='points',
@@ -3932,7 +4107,7 @@ class CollocationDialog(QDialog):
                 linger_unit='week',
                 linger_step=0,
                 disable_time=not enable_time_slider,
-                lightweight=True,
+                lightweight=lightweight_mode,
                 table_mode='minimal',
                 table_row_limit=1000,
                 # Extended kwargs consumed by map_create
