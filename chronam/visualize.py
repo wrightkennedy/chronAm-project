@@ -200,6 +200,86 @@ def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
         return fig
 
 
+def plot_topics_over_time(df_or_path: Union[str, pd.DataFrame],
+                          output_path: Optional[str] = None,
+                          top_n: Optional[int] = 10,
+                          weight_field: str = "weight_sum"):
+    """
+    Plot topic weight trajectories across time bins.
+
+    Parameters
+    ----------
+    df_or_path : str or DataFrame
+        Expected columns: time_bin, topic_id, weight_sum (default) and optional topic_label.
+    output_path : str, optional
+        If provided, chart is saved to this path instead of shown.
+    top_n : int, optional
+        Limit to the top-N topics by aggregate weight. If None, plot all topics.
+    weight_field : str
+        Column representing topic weight per time bin. Defaults to 'weight_sum'.
+    """
+    plt = _ensure_pyplot()
+    df = _load_df(df_or_path)
+    required = {"time_bin", "topic_id", weight_field}
+    if not required.issubset(df.columns):
+        raise ValueError(f"Data must contain columns: {', '.join(sorted(required))}")
+    if df.empty:
+        raise ValueError("No topic data to plot.")
+
+    df = df.copy()
+    df["topic_id"] = df["topic_id"].astype(int)
+    if "topic_label" in df.columns:
+        df["topic_label"] = df["topic_label"].fillna("").astype(str)
+    else:
+        df["topic_label"] = df["topic_id"].map(lambda tid: f"Topic {tid}")
+
+    # Determine time bin order
+    try:
+        bins_ordered = sorted(df["time_bin"].dropna().unique(), key=lambda x: pd.to_datetime(str(x), errors="coerce"))
+    except Exception:
+        bins_ordered = list(df["time_bin"].dropna().unique())
+
+    if not bins_ordered:
+        bins_ordered = list(df["time_bin"].unique())
+
+    df = df[df["time_bin"].isin(bins_ordered)].copy()
+    if df.empty:
+        raise ValueError("Time bin data is empty after filtering.")
+
+    # Limit to top topics if requested
+    if top_n is not None and top_n > 0:
+        totals = (
+            df.groupby(["topic_id", "topic_label"], as_index=False)[weight_field]
+            .sum()
+            .sort_values(weight_field, ascending=False)
+        )
+        top_topics = totals.head(top_n)["topic_id"].tolist()
+        df = df[df["topic_id"].isin(top_topics)]
+
+    pivot = df.pivot_table(index="time_bin", columns="topic_label", values=weight_field, aggfunc="sum").fillna(0.0)
+    pivot = pivot.reindex(bins_ordered).fillna(0.0)
+
+    fig, ax = plt.subplots()
+    x = np.arange(len(pivot.index))
+    for idx, column in enumerate(pivot.columns, start=1):
+        ax.plot(x, pivot[column], marker="o", label=column)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(b) for b in pivot.index], rotation=45 if len(pivot.index) > 6 else 0)
+    ax.set_ylabel("Topic Weight")
+    ax.set_xlabel("Time Bin")
+    ax.set_title("Topic Weights over Time")
+    ax.legend(title="Topic", bbox_to_anchor=(1.02, 1), loc="upper left")
+    plt.tight_layout()
+
+    if output_path:
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
+        return fig
+    plt.show(block=False)
+    return fig
+
+
 def plot_articles_by_year(data: Union[str, pd.DataFrame, Dict[str, int]],
                           output_path: Optional[str] = None,
                           title: Optional[str] = None):

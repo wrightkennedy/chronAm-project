@@ -8,7 +8,7 @@ import threading
 import time
 import urllib.parse
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from PyQt5.QtCore import (
@@ -34,6 +34,7 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -61,6 +62,11 @@ from chronam import download_data
 from chronam.config import DEFAULT_CSV_FILENAME, default_csv_path
 from chronam.map_create import create_map, _build_time_index, _parse_date
 from chronam.collocate import run_collocation, build_collocation_output_paths
+from chronam.topics import (
+    TopicModelParameters,
+    build_topic_model_output_paths,
+    run_topic_model,
+)
 from chronam.utils import term_directory_name
 from chronam.metrics import metric_total_for_dates
 
@@ -137,6 +143,14 @@ def _import_plot_articles_by_year():
         from chronam.visualize import plot_articles_by_year as _plot
     except Exception as exc:  # pragma: no cover
         raise RuntimeError('Yearly article charts require matplotlib. Install it to view charts.') from exc
+    return _plot
+
+
+def _import_plot_topics_over_time():
+    try:
+        from chronam.visualize import plot_topics_over_time as _plot
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError('Topic trend charts require matplotlib. Install it to view charts.') from exc
     return _plot
 
 
@@ -308,7 +322,7 @@ class MainWindow(QMainWindow):
         self.search_log_history = []
         self.project_log_entries = []
         self.project_file = None
-        self.collocation_state = {'dropped_terms': [], 'term_groups': []}
+        self.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}}
         self.collocation_drop_terms = []
         self.collocation_term_groups: List[dict] = []
         self.map_settings = _default_map_settings()
@@ -613,7 +627,7 @@ class MainWindow(QMainWindow):
         self.locations_csv_path = None
         self.search_log_history.clear()
         self.project_log_entries.clear()
-        self.collocation_state = {'dropped_terms': [], 'term_groups': []}
+        self.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}}
         self.collocation_drop_terms = []
         self.collocation_term_groups = []
         self.map_settings = _default_map_settings()
@@ -1174,7 +1188,7 @@ class DownloadDialog(QDialog):
             parent.geojson_file = out_paths[-1]
             if parent.locations_csv_path and not os.path.samefile(parent.locations_csv_path, csv_path):
                 parent.locations_csv_path = csv_path
-            parent.collocation_state = {}
+            parent.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}}
             parent.collocation_drop_terms = []
             parent._update_loaded_file_labels()
         return out_paths
@@ -1762,7 +1776,7 @@ class DownloadDialog(QDialog):
             p = self.parent()
             p.json_file = last_json
             p._update_loaded_file_labels()
-            p.collocation_state = {}
+            p.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}}
             p.collocation_drop_terms = []
 
         total_articles = 0
@@ -3563,6 +3577,7 @@ class CollocationDialog(QDialog):
         self.setMinimumSize(620, 580)
         layout = QVBoxLayout(self)
         self._last_output_paths = None
+        self._last_topic_paths = None
         self._preview_windows = []
         self._collocate_map_settings: Optional[dict] = None
         self._rank_selected_terms: List[str] = []
@@ -3842,6 +3857,90 @@ class CollocationDialog(QDialog):
         main_columns.addLayout(right_column, 1)
         layout.addLayout(main_columns)
 
+        topic_group = QGroupBox('Topic Modeling (beta)')
+        topic_group.setAlignment(Qt.AlignLeft)
+        topic_layout = QGridLayout(topic_group)
+        topic_layout.setContentsMargins(12, 12, 12, 12)
+        topic_layout.setHorizontalSpacing(10)
+        topic_layout.setVerticalSpacing(6)
+
+        topic_row = 0
+        topic_layout.addWidget(QLabel('Model:'), topic_row, 0)
+        self.topic_model_combo = QComboBox()
+        self.topic_model_combo.addItems(['LDA', 'NMF'])
+        topic_layout.addWidget(self.topic_model_combo, topic_row, 1)
+
+        topic_layout.addWidget(QLabel('Topics:'), topic_row, 2)
+        self.topic_topic_count_spin = QSpinBox()
+        self.topic_topic_count_spin.setRange(2, 50)
+        self.topic_topic_count_spin.setValue(10)
+        topic_layout.addWidget(self.topic_topic_count_spin, topic_row, 3)
+
+        topic_layout.addWidget(QLabel('Top words:'), topic_row, 4)
+        self.topic_top_words_spin = QSpinBox()
+        self.topic_top_words_spin.setRange(5, 50)
+        self.topic_top_words_spin.setValue(12)
+        topic_layout.addWidget(self.topic_top_words_spin, topic_row, 5)
+
+        topic_row += 1
+        topic_layout.addWidget(QLabel('Max features:'), topic_row, 0)
+        self.topic_max_features_spin = QSpinBox()
+        self.topic_max_features_spin.setRange(500, 50000)
+        self.topic_max_features_spin.setSingleStep(500)
+        self.topic_max_features_spin.setValue(3000)
+        topic_layout.addWidget(self.topic_max_features_spin, topic_row, 1)
+
+        topic_layout.addWidget(QLabel('Min doc freq:'), topic_row, 2)
+        self.topic_min_df_spin = QSpinBox()
+        self.topic_min_df_spin.setRange(1, 100)
+        self.topic_min_df_spin.setValue(5)
+        topic_layout.addWidget(self.topic_min_df_spin, topic_row, 3)
+
+        topic_layout.addWidget(QLabel('Max doc freq:'), topic_row, 4)
+        self.topic_max_df_spin = QDoubleSpinBox()
+        self.topic_max_df_spin.setRange(0.05, 1.0)
+        self.topic_max_df_spin.setSingleStep(0.05)
+        self.topic_max_df_spin.setDecimals(2)
+        self.topic_max_df_spin.setValue(0.5)
+        topic_layout.addWidget(self.topic_max_df_spin, topic_row, 5)
+
+        topic_row += 1
+        topic_layout.addWidget(QLabel('Max documents:'), topic_row, 0)
+        self.topic_max_docs_spin = QSpinBox()
+        self.topic_max_docs_spin.setRange(0, 100000)
+        self.topic_max_docs_spin.setSingleStep(1000)
+        self.topic_max_docs_spin.setSpecialValueText('All')
+        self.topic_max_docs_spin.setValue(0)
+        topic_layout.addWidget(self.topic_max_docs_spin, topic_row, 1)
+
+        topic_layout.addWidget(QLabel('Min topic weight:'), topic_row, 2)
+        self.topic_min_weight_spin = QDoubleSpinBox()
+        self.topic_min_weight_spin.setRange(0.0, 1.0)
+        self.topic_min_weight_spin.setSingleStep(0.05)
+        self.topic_min_weight_spin.setDecimals(2)
+        self.topic_min_weight_spin.setValue(0.05)
+        topic_layout.addWidget(self.topic_min_weight_spin, topic_row, 3)
+
+        topic_layout.addWidget(QLabel('Topics per article:'), topic_row, 4)
+        self.topic_doc_topics_spin = QSpinBox()
+        self.topic_doc_topics_spin.setRange(1, 10)
+        self.topic_doc_topics_spin.setValue(3)
+        topic_layout.addWidget(self.topic_doc_topics_spin, topic_row, 5)
+
+        topic_row += 1
+        self.topic_restrict_selected_check = QCheckBox('Only include articles containing selected terms')
+        topic_layout.addWidget(self.topic_restrict_selected_check, topic_row, 0, 1, 3)
+        self.topic_exclude_drop_docs_check = QCheckBox('Exclude articles containing drop terms')
+        topic_layout.addWidget(self.topic_exclude_drop_docs_check, topic_row, 3, 1, 3)
+
+        topic_row += 1
+        self.topic_remove_drop_tokens_check = QCheckBox('Remove drop terms from tokenization')
+        self.topic_remove_drop_tokens_check.setChecked(True)
+        topic_layout.addWidget(self.topic_remove_drop_tokens_check, topic_row, 0, 1, 3)
+
+        topic_layout.setColumnStretch(5, 1)
+        layout.addWidget(topic_group)
+
         self._update_selected_terms_summary()
 
         self._loading_defaults = True
@@ -3868,17 +3967,33 @@ class CollocationDialog(QDialog):
             cb.stateChanged.connect(lambda *_: self._save_state())
         self.context_left_spin.valueChanged.connect(lambda *_: self._save_state())
         self.context_right_spin.valueChanged.connect(lambda *_: self._save_state())
+        self.topic_model_combo.currentIndexChanged.connect(lambda *_: self._save_state())
+        self.topic_topic_count_spin.valueChanged.connect(lambda *_: self._save_state())
+        self.topic_top_words_spin.valueChanged.connect(lambda *_: self._save_state())
+        self.topic_max_features_spin.valueChanged.connect(lambda *_: self._save_state())
+        self.topic_min_df_spin.valueChanged.connect(lambda *_: self._save_state())
+        self.topic_max_df_spin.valueChanged.connect(lambda *_: self._save_state())
+        self.topic_max_docs_spin.valueChanged.connect(lambda *_: self._save_state())
+        self.topic_min_weight_spin.valueChanged.connect(lambda *_: self._save_state())
+        self.topic_doc_topics_spin.valueChanged.connect(lambda *_: self._save_state())
+        self.topic_restrict_selected_check.stateChanged.connect(lambda *_: self._save_state())
+        self.topic_exclude_drop_docs_check.stateChanged.connect(lambda *_: self._save_state())
+        self.topic_remove_drop_tokens_check.stateChanged.connect(lambda *_: self._save_state())
 
         # Action buttons
         btn_run = QPushButton('Run Collocation')
         btn_bar = QPushButton('Show Bar Chart')
         btn_rank = QPushButton('Show Rank Changes')
         btn_map_collocate = QPushButton('Create Collocate‑Rank Map')
+        btn_topic = QPushButton('Run Topic Model')
+        btn_topic_trends = QPushButton('Plot Topic Trends')
         btn_run.clicked.connect(self.run_collocate)
         btn_bar.clicked.connect(self.show_bar)
         btn_rank.clicked.connect(self.show_rank)
         btn_map_collocate.clicked.connect(self.create_collocate_rank_map)
-        for b in (btn_run, btn_bar, btn_rank, btn_map_collocate):
+        btn_topic.clicked.connect(self.run_topic_model_action)
+        btn_topic_trends.clicked.connect(self.show_topic_trends)
+        for b in (btn_run, btn_bar, btn_rank, btn_map_collocate, btn_topic, btn_topic_trends):
             layout.addWidget(b)
 
     def _source_text(self):
@@ -4184,7 +4299,7 @@ class CollocationDialog(QDialog):
         # Update source label text
         self.source_label.setText(self._source_text())
         if parent is not None:
-            parent.collocation_state = {}
+                parent.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}}
         self._last_output_paths = None
         self._rank_selected_terms = []
         self._update_selected_terms_summary()
@@ -4333,6 +4448,11 @@ class CollocationDialog(QDialog):
         else:
             self._rank_selected_terms = []
         self._rank_log_scale = bool(state.get('rank_log_scale', True))
+        topic_settings = state.get('topic_settings') or state.get('topic')
+        if isinstance(topic_settings, dict):
+            self._apply_topic_state(topic_settings)
+        else:
+            self._update_topic_toggle_states()
 
     def _prefill_from_current_source(self, reset_state: bool = False):
         parent = self.parent()
@@ -4434,6 +4554,155 @@ class CollocationDialog(QDialog):
         opts['window_right'] = self.context_right_spin.value()
         return opts
 
+    def _collect_topic_settings(self) -> dict:
+        return {
+            'model': self.topic_model_combo.currentText().strip().lower(),
+            'n_topics': self.topic_topic_count_spin.value(),
+            'n_top_words': self.topic_top_words_spin.value(),
+            'max_features': self.topic_max_features_spin.value(),
+            'min_df': self.topic_min_df_spin.value(),
+            'max_df': round(self.topic_max_df_spin.value(), 2),
+            'max_documents': self.topic_max_docs_spin.value(),
+            'min_topic_weight': round(self.topic_min_weight_spin.value(), 2),
+            'max_topics_per_document': self.topic_doc_topics_spin.value(),
+            'restrict_selected': self.topic_restrict_selected_check.isChecked(),
+            'exclude_drop_docs': self.topic_exclude_drop_docs_check.isChecked(),
+            'remove_drop_tokens': self.topic_remove_drop_tokens_check.isChecked(),
+        }
+
+    def _topic_parameters(self, drop_terms: Sequence[str], selected_terms: Sequence[str]) -> TopicModelParameters:
+        settings = self._collect_topic_settings()
+        max_docs_val = int(settings.get('max_documents') or 0)
+        drop_stopwords = bool(self.checks.get('drop_stopwords') and self.checks['drop_stopwords'].isChecked())
+        raw_min_df = settings.get('min_df', 5)
+        try:
+            min_df_numeric = float(raw_min_df)
+        except (TypeError, ValueError):
+            min_df_numeric = 5.0
+        if min_df_numeric >= 1.0 and abs(min_df_numeric - round(min_df_numeric)) < 1e-9:
+            min_df_value = int(round(min_df_numeric))
+        else:
+            min_df_value = max(0.0, min_df_numeric)
+
+        raw_max_df = settings.get('max_df', 0.5)
+        try:
+            max_df_numeric = float(raw_max_df)
+        except (TypeError, ValueError):
+            max_df_numeric = 0.5
+        if max_df_numeric <= 0.0:
+            max_df_numeric = 0.05
+        if max_df_numeric > 1.0:
+            max_df_numeric = 1.0
+        params = TopicModelParameters(
+            model=str(settings.get('model', 'lda') or 'lda'),
+            n_topics=int(settings.get('n_topics', 10)),
+            n_top_words=int(settings.get('n_top_words', 12)),
+            max_features=int(settings.get('max_features', 3000)),
+            min_df=min_df_value,
+            max_df=max_df_numeric,
+            max_documents=max_docs_val if max_docs_val > 0 else None,
+            drop_stopwords=drop_stopwords,
+            restrict_to_selected_terms=bool(settings.get('restrict_selected') and selected_terms),
+            exclude_drop_term_documents=bool(settings.get('exclude_drop_docs') and drop_terms),
+            remove_drop_terms_from_tokens=bool(settings.get('remove_drop_tokens') and drop_terms),
+            min_topic_weight=float(settings.get('min_topic_weight', 0.05)),
+            max_topics_per_document=int(settings.get('max_topics_per_document', 3)),
+        )
+        return params
+
+    def _build_topic_output_paths_topic(
+        self,
+        term: str,
+        start: Optional[str],
+        end: Optional[str],
+        city: Optional[str],
+        state: Optional[str],
+        params: TopicModelParameters,
+        selected_terms: Sequence[str],
+    ):
+        parent = self.parent()
+        if parent is None:
+            raise RuntimeError('Collocation dialog has no parent window')
+        time_bin_unit = self._current_time_bin_unit()
+        return build_topic_model_output_paths(
+            parent.project_folder,
+            term=term,
+            start_date=start or None,
+            end_date=end or None,
+            city=city,
+            state=state,
+            time_bin_unit=time_bin_unit,
+            ignore_bin=self.ignore_bin.isChecked(),
+            params=params,
+            drop_terms=self._get_parent_drop_terms(),
+            term_groups=self._get_parent_term_groups(),
+            selected_terms=selected_terms,
+        )
+
+    def _apply_topic_state(self, settings: dict):
+        model = str(settings.get('model', 'lda') or 'lda').lower()
+        model_label = 'LDA' if model == 'lda' else 'NMF'
+        idx = self.topic_model_combo.findText(model_label, Qt.MatchFixedString)
+        if idx < 0:
+            idx = 0
+        self.topic_model_combo.setCurrentIndex(idx)
+
+        def _set_int_spin(spin: QSpinBox, value: Any):
+            try:
+                if value is None:
+                    return
+                spin.setValue(int(value))
+            except (TypeError, ValueError):
+                pass
+
+        def _set_double_spin(spin: QDoubleSpinBox, value: Any):
+            try:
+                if value is None:
+                    return
+                spin.setValue(float(value))
+            except (TypeError, ValueError):
+                pass
+
+        _set_int_spin(self.topic_topic_count_spin, settings.get('n_topics'))
+        _set_int_spin(self.topic_top_words_spin, settings.get('n_top_words'))
+        _set_int_spin(self.topic_max_features_spin, settings.get('max_features'))
+        _set_int_spin(self.topic_min_df_spin, settings.get('min_df'))
+        _set_double_spin(self.topic_max_df_spin, settings.get('max_df'))
+        max_docs = settings.get('max_documents')
+        if max_docs in (None, '', 0):
+            self.topic_max_docs_spin.setValue(0)
+        else:
+            _set_int_spin(self.topic_max_docs_spin, max_docs)
+        _set_double_spin(self.topic_min_weight_spin, settings.get('min_topic_weight'))
+        _set_int_spin(self.topic_doc_topics_spin, settings.get('max_topics_per_document'))
+
+        self.topic_restrict_selected_check.setChecked(bool(settings.get('restrict_selected')))
+        self.topic_exclude_drop_docs_check.setChecked(bool(settings.get('exclude_drop_docs')))
+        self.topic_remove_drop_tokens_check.setChecked(bool(settings.get('remove_drop_tokens', True)))
+        self._update_topic_toggle_states()
+
+    def _update_topic_toggle_states(self):
+        has_selected = bool(self._rank_selected_terms)
+        if not has_selected and self.topic_restrict_selected_check.isChecked():
+            self.topic_restrict_selected_check.blockSignals(True)
+            self.topic_restrict_selected_check.setChecked(False)
+            self.topic_restrict_selected_check.blockSignals(False)
+        self.topic_restrict_selected_check.setEnabled(has_selected)
+
+        has_drop = bool(self._get_parent_drop_terms())
+        if not has_drop and self.topic_exclude_drop_docs_check.isChecked():
+            self.topic_exclude_drop_docs_check.blockSignals(True)
+            self.topic_exclude_drop_docs_check.setChecked(False)
+            self.topic_exclude_drop_docs_check.blockSignals(False)
+        self.topic_exclude_drop_docs_check.setEnabled(has_drop)
+
+        if not has_drop:
+            self.topic_remove_drop_tokens_check.blockSignals(True)
+            self.topic_remove_drop_tokens_check.setChecked(False)
+            self.topic_remove_drop_tokens_check.blockSignals(False)
+            self.topic_remove_drop_tokens_check.setEnabled(False)
+        else:
+            self.topic_remove_drop_tokens_check.setEnabled(True)
     def _generate_by_time_csv(
         self,
         *,
@@ -4696,6 +4965,7 @@ class CollocationDialog(QDialog):
         elif self._drop_terms_prev_count == 0 and self._drop_section_button is not None and not self._drop_section_button.isChecked():
             self._drop_section_button.setChecked(True)
         self._drop_terms_prev_count = count
+        self._update_topic_toggle_states()
 
     def _update_selected_terms_summary(self):
         terms = list(dict.fromkeys(self._rank_selected_terms))
@@ -4715,6 +4985,7 @@ class CollocationDialog(QDialog):
         elif self._selected_terms_prev_count == 0 and self._selected_section_button is not None and not self._selected_section_button.isChecked():
             self._selected_section_button.setChecked(True)
         self._selected_terms_prev_count = count
+        self._update_topic_toggle_states()
 
     def _update_group_summary(self):
         groups = self._get_parent_term_groups()
@@ -5160,6 +5431,7 @@ class CollocationDialog(QDialog):
             'context_right': self.context_right_spin.value(),
             'rank_selected_terms': list(self._rank_selected_terms),
             'rank_log_scale': bool(getattr(self, '_rank_log_scale', True)),
+            'topic_settings': self._collect_topic_settings(),
         }
         parent.collocation_state = state
 
@@ -5357,6 +5629,96 @@ class CollocationDialog(QDialog):
         )
         self._set_clear_notice('')
 
+    def run_topic_model_action(self):
+        term = self.term_input.text().strip()
+        if not term:
+            QMessageBox.warning(self, 'Search Term Required', 'Enter a search term before running topic modeling.')
+            return
+
+        city_text = self.city_combo.currentText()
+        state_text = self.state_combo.currentText()
+        city = None if not city_text or city_text == 'All Cities' else city_text.strip()
+        state = None if not state_text or state_text == 'All States' else state_text.strip()
+        start = self.start_input.text().strip()
+        end = self.end_input.text().strip()
+
+        parent = self.parent()
+        if parent is None:
+            QMessageBox.warning(self, 'Unavailable', 'Parent window not available.')
+            return
+
+        drop_terms = self._get_parent_drop_terms()
+        selected_terms = list(dict.fromkeys(self._rank_selected_terms))
+        params = self._topic_parameters(drop_terms, selected_terms)
+        effective_selected = selected_terms if params.restrict_to_selected_terms else []
+
+        json_path = getattr(parent, 'json_file', None)
+        geo_path = getattr(parent, 'geojson_file', None)
+
+        if self.mode_json.isChecked():
+            if not json_path or not os.path.exists(json_path):
+                self.choose_source_file()
+                json_path = getattr(parent, 'json_file', None)
+                if not json_path or not os.path.exists(json_path):
+                    return
+            source_kwargs = {'json_path': json_path, 'geojson_path': None}
+        else:
+            if not geo_path or not os.path.exists(geo_path):
+                self.choose_source_file()
+                geo_path = getattr(parent, 'geojson_file', None)
+                if not geo_path or not os.path.exists(geo_path):
+                    return
+            source_kwargs = {'json_path': None, 'geojson_path': geo_path}
+
+        time_bin_unit = self._current_time_bin_unit()
+        metadata_enabled = getattr(parent, 'metadata_enabled', True)
+
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            result = run_topic_model(
+                parent.project_folder,
+                term=term,
+                city=city,
+                state=state,
+                start_date=start or None,
+                end_date=end or None,
+                time_bin_unit=time_bin_unit,
+                ignore_bin=self.ignore_bin.isChecked(),
+                params=params,
+                drop_terms=drop_terms,
+                term_groups=self._get_parent_term_groups(),
+                selected_terms=effective_selected,
+                metadata_enabled=metadata_enabled,
+                **source_kwargs,
+            )
+        except RuntimeError as exc:
+            QMessageBox.critical(self, 'Topic Modeling Error', str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, 'Topic Modeling Error', f'Unexpected error:\n{exc}')
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self._last_topic_paths = result
+        topics_path = (result or {}).get('topics')
+        if topics_path and os.path.exists(topics_path):
+            preview = CSVPreviewDialog(topics_path, parent=self, max_rows=150)
+            preview.resize(1000, 620)
+            preview.show()
+            preview.raise_()
+            preview.activateWindow()
+            preview.setFocus()
+            self._register_preview(preview)
+
+        start_display = start or 'all'
+        end_display = end or 'all'
+        city_display = city or 'All'
+        state_display = state or 'All'
+        self._log_topic_model_run(term, start_display, end_display, city_display, state_display, params, result)
+        self._set_clear_notice('')
+        self._save_state()
+
     def show_bar(self):
         term = self.term_input.text().strip()
         if not term:
@@ -5423,6 +5785,117 @@ class CollocationDialog(QDialog):
             return
         if fig is not None:
             fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
+
+    def show_topic_trends(self):
+        if self.ignore_bin.isChecked():
+            QMessageBox.information(self, 'Time Bins Required', 'Enable time binning to plot topic trends.')
+            return
+        term = self.term_input.text().strip()
+        if not term:
+            QMessageBox.warning(self, 'Search Term Required', 'Enter a search term before plotting topic trends.')
+            return
+        time_bin_unit = self._current_time_bin_unit()
+        if not time_bin_unit:
+            QMessageBox.warning(self, 'Invalid Bin Size', 'Enter a valid bin size and time unit to plot topic trends.')
+            return
+        city_text = self.city_combo.currentText()
+        state_text = self.state_combo.currentText()
+        city = None if not city_text or city_text == 'All Cities' else city_text.strip()
+        state = None if not state_text or state_text == 'All States' else state_text.strip()
+
+        drop_terms = self._get_parent_drop_terms()
+        selected_terms = list(dict.fromkeys(self._rank_selected_terms))
+        params = self._topic_parameters(drop_terms, selected_terms)
+        effective_selected = selected_terms if params.restrict_to_selected_terms else []
+
+        target_path = None
+        if isinstance(self._last_topic_paths, dict):
+            guess = self._last_topic_paths.get('by_time')
+            if guess and os.path.exists(guess):
+                target_path = guess
+        if not target_path:
+            paths = self._build_topic_output_paths_topic(
+                term,
+                self.start_input.text().strip() or None,
+                self.end_input.text().strip() or None,
+                city,
+                state,
+                params,
+                effective_selected,
+            )
+            candidate = paths.get('by_time')
+            if candidate and os.path.exists(candidate):
+                target_path = candidate
+
+        if not target_path:
+            QMessageBox.information(self, 'Data Not Found', 'Run the topic model with time binning to generate trends first.')
+            return
+
+        try:
+            plot_topics = _import_plot_topics_over_time()
+            top_n = min(max(1, params.n_topics), 12)
+            fig = plot_topics(target_path, top_n=top_n)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Plot Error', str(exc))
+            return
+        if fig is not None:
+            fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
+
+    def _log_topic_model_run(
+        self,
+        term: str,
+        start: str,
+        end: str,
+        city: str,
+        state: str,
+        params: TopicModelParameters,
+        paths: Optional[dict],
+    ):
+        parent = self.parent()
+        if parent is None or not hasattr(parent, 'append_project_log'):
+            return
+
+        options = []
+        if params.drop_stopwords:
+            options.append('drop stopwords')
+        if params.exclude_drop_term_documents:
+            options.append('exclude drop terms')
+        if params.remove_drop_terms_from_tokens:
+            options.append('remove drop tokens')
+        if params.restrict_to_selected_terms:
+            options.append('selected-term filter')
+        if params.max_documents:
+            options.append(f'max docs {params.max_documents}')
+
+        lines = [
+            f'<div>Term: {html.escape(term or "(none)")}</div>',
+            f'<div>Dates: {html.escape(start)} → {html.escape(end)}</div>',
+            f'<div>Location: {html.escape(city)}, {html.escape(state)}</div>',
+            f'<div>Model: {html.escape(params.model.upper())} | Topics: {params.n_topics} | Top words: {params.n_top_words}</div>',
+            f'<div>Max features: {params.max_features} | Options: {html.escape(", ".join(options) if options else "none")}</div>',
+        ]
+
+        if params.restrict_to_selected_terms:
+            lines.append(f'<div>Selected terms used: {len(self._rank_selected_terms)} term(s)</div>')
+        drop_terms = self._get_parent_drop_terms()
+        if drop_terms:
+            lines.append(f'<div>Drop terms active: {len(drop_terms)} term(s)</div>')
+
+        if isinstance(paths, dict):
+            topics_path = paths.get('topics')
+            doc_topics_path = paths.get('doc_topics')
+            by_time_path = paths.get('by_time')
+            if topics_path and os.path.exists(topics_path):
+                encoded = urllib.parse.quote(topics_path)
+                lines.append(f'<div>Topics CSV: <a href="chronam-open:{encoded}">{html.escape(topics_path)}</a></div>')
+            if doc_topics_path and os.path.exists(doc_topics_path):
+                encoded = urllib.parse.quote(doc_topics_path)
+                lines.append(f'<div>Article-topic CSV: <a href="chronam-open:{encoded}">{html.escape(doc_topics_path)}</a></div>')
+            if by_time_path and os.path.exists(by_time_path):
+                encoded = urllib.parse.quote(by_time_path)
+                lines.append(f'<div>Topics-by-time CSV: <a href="chronam-open:{encoded}">{html.escape(by_time_path)}</a></div>')
+
+        parent.append_project_log('Topic Modeling', lines)
 
     def _log_collocation_run(self, mode: str, term: str, start: str, end: str, city: str, state: str,
                               time_bin_unit: Optional[str], ignore_bin: bool, options: dict,

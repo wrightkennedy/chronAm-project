@@ -35,6 +35,16 @@ def build_collocation_output_paths(*args, **kwargs):
     return _build_paths(*args, **kwargs)
 
 
+def run_topic_model(*args, **kwargs):
+    from .topics import run_topic_model as _run_topics
+    return _run_topics(*args, **kwargs)
+
+
+def build_topic_model_output_paths(*args, **kwargs):
+    from .topics import build_topic_model_output_paths as _build_topic_paths
+    return _build_topic_paths(*args, **kwargs)
+
+
 def plot_bar(*args, **kwargs):
     from .visualize import plot_bar as _plot_bar
     return _plot_bar(*args, **kwargs)
@@ -57,6 +67,8 @@ __all__ = [
     "fetch_missing_metadata",
     "run_collocation",
     "build_collocation_output_paths",
+    "run_topic_model",
+    "build_topic_model_output_paths",
     "plot_bar",
     "plot_rank_changes",
 ]
