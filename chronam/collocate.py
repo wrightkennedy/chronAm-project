@@ -17,6 +17,7 @@ import os
 import json
 import hashlib
 import math
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any, Set
@@ -27,6 +28,7 @@ import re
 from collections import Counter, defaultdict
 
 from .config import init_project  # type: ignore
+from .exceptions import OperationCancelledError
 from .utils import term_directory_name, write_metadata_file
 
 
@@ -52,6 +54,11 @@ STOPWORDS = {
 }
 
 WORD_RE = re.compile(r"[A-Za-z0-9']+")  # keep letters, digits, apostrophes
+
+
+def _check_cancel(cancel_event: Optional[threading.Event]):
+    if cancel_event and cancel_event.is_set():
+        raise OperationCancelledError()
 
 
 @dataclass
@@ -186,8 +193,12 @@ def _filter_df(df: pd.DataFrame, start_date: Optional[str], end_date: Optional[s
     return out
 
 
-def _collocate_from_df(df: pd.DataFrame, term: str, opts: CollocationOptions
-                       ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _collocate_from_df(
+    df: pd.DataFrame,
+    term: str,
+    opts: CollocationOptions,
+    cancel_event: Optional[threading.Event] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Process DataFrame of articles and compute collocation metrics and by-time counts.
     """
@@ -210,6 +221,7 @@ def _collocate_from_df(df: pd.DataFrame, term: str, opts: CollocationOptions
     track_pages = opts.include_page_count
 
     for _, row in df.iterrows():
+        _check_cancel(cancel_event)
         text = row.get("article", "")
         if not isinstance(text, str) or not text.strip():
             continue
@@ -232,6 +244,7 @@ def _collocate_from_df(df: pd.DataFrame, term: str, opts: CollocationOptions
         )
 
         for st in starts:
+            _check_cancel(cancel_event)
             left_idx = max(0, st - max(0, int(opts.window_left)))
             right_idx = min(len(tokens), st + len(term_tokens) + max(0, int(opts.window_right)))
             left_segment = tokens[left_idx:st]
@@ -298,9 +311,16 @@ def _collocate_from_df(df: pd.DataFrame, term: str, opts: CollocationOptions
     return metrics, pd.DataFrame()
 
 
-def _build_by_time(df: pd.DataFrame, term: str, opts: CollocationOptions,
-                   start_date: Optional[str], end_date: Optional[str],
-                   size: int, unit: str) -> pd.DataFrame:
+def _build_by_time(
+    df: pd.DataFrame,
+    term: str,
+    opts: CollocationOptions,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    size: int,
+    unit: str,
+    cancel_event: Optional[threading.Event] = None,
+) -> pd.DataFrame:
     """Return DataFrame of counts per time bin and term with ordinal ranks."""
     if df.empty:
         return pd.DataFrame()
@@ -331,12 +351,14 @@ def _build_by_time(df: pd.DataFrame, term: str, opts: CollocationOptions,
     # Create per-bin counters
     records = []
     for label in labels:
+        _check_cancel(cancel_event)
         # subset rows within this time bin
         sub = df[df["time_bin"] == label]
         if sub.empty:
             continue
         counter = Counter()
         for toks in sub["tokens"]:
+            _check_cancel(cancel_event)
             starts = _find_phrase_positions(toks, term_tokens)
             if not starts:
                 continue
@@ -701,6 +723,7 @@ def run_collocation(
     term_groups: Optional[List[dict]] = None,
     metadata_enabled: bool = True,
     write_metrics: bool = True,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Optional[str]]:
     """
     Execute collocation analysis. Writes outputs into data/processed/<term>/.
@@ -743,6 +766,7 @@ def run_collocation(
         df = _load_json(json_path)  # type: ignore
 
     df = _filter_df(df, start_date, end_date, city, state, is_geo=is_geo)
+    _check_cancel(cancel_event)
 
     # Ensure term is present
     if not term:
@@ -808,6 +832,7 @@ def run_collocation(
         metrics_dir = os.path.dirname(empty_paths.get("metrics") or proc)
         if metrics_dir:
             os.makedirs(metrics_dir, exist_ok=True)
+        _check_cancel(cancel_event)
         if write_metrics and empty_paths.get("metrics"):
             pd.DataFrame(columns=["collocate_term", "frequency"]).to_csv(empty_paths["metrics"], index=False)
             metrics_meta = dict(metadata_common)
@@ -820,6 +845,7 @@ def run_collocation(
                 metadata_paths['metrics'] = meta_path
             metrics_path = empty_paths["metrics"]
         if write_by_time and empty_paths.get("by_time"):
+            _check_cancel(cancel_event)
             pd.DataFrame(columns=["time_bin", "collocate_term", "frequency", "ordinal_rank"]).to_csv(empty_paths["by_time"], index=False)
             by_time_meta = dict(metadata_common)
             by_time_meta.update({
@@ -838,7 +864,7 @@ def run_collocation(
         }
 
     # Build metrics (without time dimension)
-    metrics, _ = _collocate_from_df(df, term, opts)
+    metrics, _ = _collocate_from_df(df, term, opts, cancel_event=cancel_event)
 
     if drop_set:
         metrics = metrics[~metrics['collocate_term'].isin(drop_set)].reset_index(drop=True)
@@ -871,7 +897,7 @@ def run_collocation(
         else:
             # default 1 month
             size, unit = 1, "months"
-        by_time = _build_by_time(df, term, opts, start_date, end_date, size, unit)
+        by_time = _build_by_time(df, term, opts, start_date, end_date, size, unit, cancel_event=cancel_event)
         if drop_set:
             by_time = by_time[~by_time['collocate_term'].isin(drop_set)].reset_index(drop=True)
         by_time = _apply_term_groups_to_by_time(by_time, normalized_groups)
@@ -896,6 +922,7 @@ def run_collocation(
             # Filter by city/state/dates
             sel = []
             for ft in feats:
+                _check_cancel(cancel_event)
                 pr = ft.get("properties", {})
                 dt = pd.to_datetime(pr.get("date"), errors="coerce")
                 if start_date and pd.notna(dt) and dt < pd.to_datetime(start_date):

@@ -4,6 +4,7 @@ import os
 import re
 import uuid
 import csv
+import threading
 from collections import Counter, defaultdict
 from string import Template as StrTemplate
 
@@ -17,6 +18,7 @@ from folium import Html, Popup
 from folium.plugins import HeatMap, HeatMapWithTime, MarkerCluster
 
 from .collocate import STOPWORDS as _STOPWORDS, WORD_RE as _WORD_RE
+from .exceptions import OperationCancelledError
 from .utils import write_metadata_file
 from .metrics import metric_total_for_year_within_dates
 
@@ -27,6 +29,11 @@ def _tok(text: Any, drop_stop: bool = False) -> List[str]:
     if drop_stop:
         toks = [t for t in toks if t not in _STOPWORDS]
     return toks
+
+
+def _check_cancel(cancel_event: Optional[threading.Event]):
+    if cancel_event and cancel_event.is_set():
+        raise OperationCancelledError()
 
 def _find_positions(tokens: List[str], phrase_tokens: List[str]) -> List[int]:
     if not tokens or not phrase_tokens:
@@ -97,6 +104,7 @@ def _build_collocate_rank_index(
     manual_terms: Optional[List[str]] = None,
     rank_limit: int = COLLOCATE_RANK_LIMIT,
     selector_limit: int = COLLOCATE_SELECTOR_LIMIT,
+    cancel_event: Optional[threading.Event] = None,
     ) -> Tuple[
         List[str],
         Dict[str, Dict[str, Dict[str, int]]],
@@ -173,6 +181,7 @@ def _build_collocate_rank_index(
     rank_max = 0
 
     for group in groups:
+        _check_cancel(cancel_event)
         entries = group.get('entries') or []
         if not entries:
             continue
@@ -184,6 +193,7 @@ def _build_collocate_rank_index(
         index_time_keys: Dict[int, Set[str]] = defaultdict(set)
         if isinstance(time_bins, dict):
             for bin_key, info in time_bins.items():
+                _check_cancel(cancel_event)
                 if not isinstance(info, dict):
                     continue
                 indexes = info.get('indexes') or []
@@ -217,6 +227,7 @@ def _build_collocate_rank_index(
         term_hits = city_term_hits.setdefault(city_key, defaultdict(set))
 
         for idx, entry in enumerate(entries):
+            _check_cancel(cancel_event)
             article_text = entry.get('_article_full') or entry.get('props', {}).get('article')
             if not article_text or not isinstance(article_text, str):
                 continue
@@ -227,10 +238,12 @@ def _build_collocate_rank_index(
             if not starts:
                 continue
             for start in starts:
+                _check_cancel(cancel_event)
                 left = max(0, start - window_size)
                 right = min(len(tokens), start + term_length + window_size)
                 neighbors = tokens[left:start] + tokens[start + term_length:right]
                 for tok in neighbors:
+                    _check_cancel(cancel_event)
                     if not tok or tok.isdigit():
                         continue
                     tok_norm = tok.lower()
@@ -249,6 +262,7 @@ def _build_collocate_rank_index(
             continue
 
         for key, counter in time_counters.items():
+            _check_cancel(cancel_event)
             if counter:
                 aggregate_time_global[key].update(counter)
 
@@ -259,12 +273,14 @@ def _build_collocate_rank_index(
             if city_match:
                 focus_city_counter.update(group_counter)
                 for key, counter in time_counters.items():
+                    _check_cancel(cancel_event)
                     if counter:
                         focus_city_time[key].update(counter)
         elif focus_mode_norm == 'state' and focus_state_norm:
             if state_norm == focus_state_norm and state_norm:
                 focus_state_counter.update(group_counter)
                 for key, counter in time_counters.items():
+                    _check_cancel(cancel_event)
                     if counter:
                         focus_state_time[key].update(counter)
 
@@ -845,13 +861,14 @@ def _build_time_index(min_dt: datetime, max_dt: datetime, unit: str, step: int) 
 # Core
 # ----------------------------
 
-def _extract_points(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _extract_points(features: List[Dict[str, Any]], cancel_event: Optional[threading.Event] = None) -> List[Dict[str, Any]]:
     """
     Extract and validate points/features from GeoJSON features.
     Returns list of dicts with: lat, lon, props(dict), date(dt)
     """
     out: List[Dict[str, Any]] = []
     for feat in features:
+        _check_cancel(cancel_event)
         if not feat or not isinstance(feat, dict):
             continue
         geometry = feat.get("geometry")
@@ -1132,15 +1149,17 @@ def _group_popup_html(
     )
 
 
-def _group_points(points: List[Dict[str, Any]], precision: int = 6) -> List[Dict[str, Any]]:
+def _group_points(points: List[Dict[str, Any]], precision: int = 6, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, Any]]:
     """Group point dictionaries by rounded lat/lon for shared popups."""
     grouped_map: Dict[Tuple[float, float], List[Dict[str, Any]]] = {}
     for pt in points:
+        _check_cancel(cancel_event)
         key = (round(pt["lat"], precision), round(pt["lon"], precision))
         grouped_map.setdefault(key, []).append(pt)
 
     groups: List[Dict[str, Any]] = []
     for idx, (key, entries) in enumerate(grouped_map.items()):
+        _check_cancel(cancel_event)
         groups.append({
             'location': key,
             'entries': entries,
@@ -1540,6 +1559,7 @@ def create_map(
     time_start_override: Optional[str] = None,
     time_end_override: Optional[str] = None,
     collocate_export_csv: bool = False,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Optional[str]]:
     """
     Create a leaflet map next to the GeoJSON.
@@ -1600,19 +1620,25 @@ def create_map(
     collocate_map_variant = variant_norm
     top_term_variant = collocate_map_variant == 'top_term'
 
+    _check_cancel(cancel_event)
+
     with open(geojson_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     features = data.get("features") or []
     if not isinstance(features, list):
         raise ValueError("GeoJSON does not contain a valid 'features' list.")
 
-    pts = _extract_points(features)
+    pts = _extract_points(features, cancel_event=cancel_event)
+    _check_cancel(cancel_event)
     for entry in pts:
+        _check_cancel(cancel_event)
         props = entry.get('props') or {}
         entry['_article_full'] = props.get('article') or ''
     for idx, entry in enumerate(pts):
+        _check_cancel(cancel_event)
         entry['_popup_row_id'] = _sanitize_element_id(f'feature-row-{idx}')
-    groups = _group_points(pts)
+    groups = _group_points(pts, cancel_event=cancel_event)
+    _check_cancel(cancel_event)
     search_term = _detect_search_term(geojson_path, data)
 
     start_override = (time_start_override or '').strip()
@@ -1758,6 +1784,7 @@ def create_map(
     values: List[float] = []
     popup_dataset: Dict[str, Any] = {}
     for group in groups:
+        _check_cancel(cancel_event)
         entries = group.get("entries", [])
         stats = _compute_group_stats(entries, search_term)
         group["stats"] = stats
@@ -1784,6 +1811,7 @@ def create_map(
         entry_payloads = []
         year_match_counts: Dict[str, int] = {}
         for entry_idx, entry in enumerate(entries):
+            _check_cancel(cancel_event)
             payload = _entry_payload(
                 entry,
                 search_term,
@@ -1819,6 +1847,7 @@ def create_map(
             entry_payloads.append(payload)
 
         for entry in entries:
+            _check_cancel(cancel_event)
             entry["value"] = value
 
         first_props = entries[0].get('props', {}) if entries else {}
@@ -1862,6 +1891,7 @@ def create_map(
                 dt = entry.get('date')
                 bin_indices = _assign_time_bins(dt, time_index, linger_unit, int(linger_step or 0))
                 for bin_idx in bin_indices:
+                    _check_cancel(cancel_event)
                     if bin_idx < len(time_labels):
                         label = time_labels[bin_idx]
                     else:
@@ -1873,6 +1903,7 @@ def create_map(
             if time_bins:
                 time_payload: Dict[str, Any] = {}
                 for bin_key, info in time_bins.items():
+                    _check_cancel(cancel_event)
                     indexes = info.get('indexes') or []
                     if not indexes:
                         continue
@@ -1926,6 +1957,7 @@ def create_map(
             focus_city=collocate_rank_focus_city,
             focus_state=collocate_rank_focus_state,
             manual_terms=collocate_rank_terms,
+            cancel_event=cancel_event,
         )
         if collocate_hits_by_city:
             for group in groups:

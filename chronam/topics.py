@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -21,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from .config import init_project  # type: ignore
+from .exceptions import OperationCancelledError
 from .utils import term_directory_name, write_metadata_file
 
 # Reuse internal helpers from collocate to stay aligned with filtering/tokenization.
@@ -117,18 +119,25 @@ def _remove_drop_tokens(tokens: List[str], drop_terms: Sequence[str]) -> List[st
     return [tok for tok in tokens if tok not in drop_single_tokens]
 
 
+def _check_cancel(cancel_event: Optional[threading.Event]):
+    if cancel_event and cancel_event.is_set():
+        raise OperationCancelledError()
+
+
 def _preprocess_documents(
     df: pd.DataFrame,
     *,
     params: TopicModelParameters,
     drop_terms: Sequence[str],
     selected_terms: Sequence[str],
+    cancel_event: Optional[threading.Event] = None,
 ) -> pd.DataFrame:
     drop_phrases = _prepare_phrases(drop_terms)
     selected_phrases = _prepare_phrases(selected_terms)
 
     rows = []
     for _, row in df.iterrows():
+        _check_cancel(cancel_event)
         text = row.get("article", "")
         if not isinstance(text, str) or not text.strip():
             continue
@@ -149,6 +158,7 @@ def _preprocess_documents(
         if not tokens:
             continue
 
+        _check_cancel(cancel_event)
         rows.append(
             {
                 "article_id": row.get("article_id") or row.get("filename") or f"row{_}",
@@ -313,6 +323,7 @@ def _melt_doc_topics(
     *,
     params: TopicModelParameters,
     topic_labels: Dict[int, str],
+    cancel_event: Optional[threading.Event] = None,
 ) -> pd.DataFrame:
     if matrix.size == 0:
         return pd.DataFrame(columns=["article_id", "topic_id", "weight"])
@@ -323,6 +334,7 @@ def _melt_doc_topics(
 
     records: List[Dict[str, Any]] = []
     for doc_idx in range(matrix.shape[0]):
+        _check_cancel(cancel_event)
         doc_row = df_docs.iloc[doc_idx]
         article_id = doc_row.get("article_id")
         date_val = doc_row.get("date")
@@ -331,6 +343,7 @@ def _melt_doc_topics(
         newspaper = doc_row.get("newspaper_name")
 
         for rank in range(min(params.max_topics_per_document, matrix.shape[1])):
+            _check_cancel(cancel_event)
             topic_id = int(topic_ids_sorted[doc_idx, rank])
             weight = float(weights_sorted[doc_idx, rank])
             if weight < params.min_topic_weight:
@@ -357,7 +370,7 @@ def _melt_doc_topics(
     return pd.DataFrame(records)
 
 
-def _build_topics_by_time(doc_topics: pd.DataFrame) -> pd.DataFrame:
+def _build_topics_by_time(doc_topics: pd.DataFrame, cancel_event: Optional[threading.Event] = None) -> pd.DataFrame:
     if doc_topics.empty or "time_bin" not in doc_topics.columns:
         return pd.DataFrame(columns=["time_bin", "topic_id", "weight_sum", "doc_count", "ordinal_rank"])
 
@@ -369,6 +382,7 @@ def _build_topics_by_time(doc_topics: pd.DataFrame) -> pd.DataFrame:
         working.groupby(["time_bin", "topic_id"], as_index=False)
         .agg(weight_sum=("weight", "sum"), doc_count=("article_id", "nunique"))
     )
+    _check_cancel(cancel_event)
     grouped["ordinal_rank"] = (
         grouped.sort_values(["time_bin", "weight_sum", "topic_id"], ascending=[True, False, True])
         .groupby("time_bin")
@@ -395,6 +409,7 @@ def run_topic_model(
     term_groups: Optional[List[dict]] = None,
     selected_terms: Optional[Sequence[str]] = None,
     metadata_enabled: bool = True,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Optional[str]]:
     if not json_path and not geojson_path:
         raise ValueError("Provide either json_path or geojson_path for topic modeling.")
@@ -415,6 +430,7 @@ def run_topic_model(
         df_raw = _load_json(json_path)  # type: ignore[arg-type]
 
     df_filtered = _filter_df(df_raw, start_date, end_date, city, state, is_geo=is_geo)
+    _check_cancel(cancel_event)
 
     metadata_common = {
         "tool": "topic_model",
@@ -462,16 +478,19 @@ def run_topic_model(
         params=params,
         drop_terms=drop_terms,
         selected_terms=selected_terms,
+        cancel_event=cancel_event,
     )
     if df_prepared.empty:
         return _write_empty_outputs(output_paths, project_dir, metadata_common, metadata_enabled)
 
     df_prepared = _limit_documents(df_prepared, params.max_documents, params.random_state)
+    _check_cancel(cancel_event)
 
     if not ignore_bin and time_bin_unit:
         df_prepared, _ = _assign_time_bins(df_prepared, start_date, end_date, time_bin_unit)
     else:
         df_prepared = df_prepared.assign(time_bin=None)
+    _check_cancel(cancel_event)
 
     try:
         min_df_numeric = float(params.min_df)
@@ -497,6 +516,7 @@ def run_topic_model(
         max_df=max_df_numeric,
         dtype=np.float64,
     )
+    _check_cancel(cancel_event)
     matrix = vectorizer.fit_transform(df_prepared["text"])
     feature_names = vectorizer.get_feature_names_out()
 
@@ -519,6 +539,7 @@ def run_topic_model(
             random_state=params.random_state,
         )
         transformed = model.fit_transform(matrix)
+    _check_cancel(cancel_event)
 
     topics = _topic_top_terms(model, feature_names, params.n_top_words)
     topic_labels = {topic["topic_id"]: ", ".join(topic["top_terms"][:5]) for topic in topics}
@@ -528,6 +549,7 @@ def run_topic_model(
         df_prepared.reset_index(drop=True),
         params=params,
         topic_labels=topic_labels,
+        cancel_event=cancel_event,
     )
 
     if doc_topics.empty:
@@ -536,6 +558,10 @@ def run_topic_model(
     topics_df = pd.DataFrame(topics)
     topics_df["top_terms"] = topics_df["top_terms"].apply(lambda terms: ", ".join(terms))
     topics_df["top_scores"] = topics_df["top_scores"].apply(lambda scores: ", ".join(f"{score:.4f}" for score in scores))
+    topic_doc_counts = doc_topics.groupby("topic_id")["article_id"].nunique()
+    total_documents = len(df_prepared)
+    topics_df["doc_count"] = topics_df["topic_id"].map(topic_doc_counts).fillna(0).astype(int)
+    topics_df["total_documents"] = total_documents
 
     os.makedirs(os.path.dirname(output_paths["topics"] or ""), exist_ok=True)
     topics_df.to_csv(output_paths["topics"], index=False)
@@ -569,7 +595,7 @@ def run_topic_model(
 
     by_time_path = output_paths.get("by_time")
     if by_time_path:
-        by_time = _build_topics_by_time(doc_topics)
+        by_time = _build_topics_by_time(doc_topics, cancel_event=cancel_event)
         by_time.to_csv(by_time_path, index=False)
         by_time_meta = dict(metadata_common)
         by_time_meta.update(

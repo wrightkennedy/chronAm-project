@@ -8,7 +8,7 @@ import threading
 import time
 import urllib.parse
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from PyQt5.QtCore import (
@@ -16,10 +16,12 @@ from PyQt5.QtCore import (
     QObject,
     QPropertyAnimation,
     QThread,
+    QTimer,
     QUrl,
     Qt,
     pyqtProperty,
     pyqtSignal,
+    QSize,
 )
 from PyQt5.QtGui import QDesktopServices, QIntValidator, QKeySequence, QPainter, QPen, QTextCursor
 from PyQt5.QtWidgets import (
@@ -56,6 +58,7 @@ from PyQt5.QtWidgets import (
     QTextBrowser,
     QVBoxLayout,
     QWidget,
+    QFrame,
 )
 
 from chronam import download_data
@@ -67,6 +70,7 @@ from chronam.topics import (
     build_topic_model_output_paths,
     run_topic_model,
 )
+from chronam.exceptions import OperationCancelledError
 from chronam.utils import term_directory_name
 from chronam.metrics import metric_total_for_dates
 
@@ -295,6 +299,134 @@ class WorkerThread(QThread):
         except Exception as e:
             self.finished.emit(e)
 
+
+class OperationOverlay(QWidget):
+    cancel_requested = pyqtSignal()
+
+    def __init__(self, parent: QWidget, message: str):
+        super().__init__(parent)
+        self._parent = parent
+        self._start_time: Optional[float] = None
+        self._timer = QTimer(self)
+        self._timer.setInterval(250)
+        self._timer.timeout.connect(self._update_elapsed)
+
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("background-color: rgba(0, 0, 0, 150);")
+        self.setVisible(False)
+        self.setFocusPolicy(Qt.NoFocus)
+        if parent is not None:
+            parent.installEventFilter(self)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setAlignment(Qt.AlignCenter)
+
+        container = QFrame(self)
+        container.setStyleSheet("background-color: #ffffff; border-radius: 10px;")
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(24, 24, 24, 24)
+        container_layout.setSpacing(12)
+        container_layout.setAlignment(Qt.AlignCenter)
+
+        self._spinner = Spinner(container, radius=18, line_width=4)
+        container_layout.addWidget(self._spinner, 0, Qt.AlignHCenter)
+
+        self._message_label = QLabel(message, container)
+        self._message_label.setStyleSheet("font-weight: 600; font-size: 14px;")
+        self._message_label.setAlignment(Qt.AlignCenter)
+        container_layout.addWidget(self._message_label, 0, Qt.AlignHCenter)
+
+        self._elapsed_label = QLabel("Elapsed: 0s", container)
+        self._elapsed_label.setStyleSheet("color: #555555; font-size: 12px;")
+        self._elapsed_label.setAlignment(Qt.AlignCenter)
+        container_layout.addWidget(self._elapsed_label, 0, Qt.AlignHCenter)
+
+        self._cancel_btn = QPushButton("Cancel", container)
+        self._cancel_btn.setFixedWidth(120)
+        self._cancel_btn.clicked.connect(self._handle_cancel_clicked)
+        container_layout.addWidget(self._cancel_btn, 0, Qt.AlignHCenter)
+
+        layout.addWidget(container, 0, Qt.AlignCenter)
+
+    def eventFilter(self, obj, event):
+        if obj is self._parent and event.type() in (QEvent.Resize, QEvent.Move):
+            self._sync_geometry()
+        return super().eventFilter(obj, event)
+
+    def _sync_geometry(self):
+        if self._parent is not None:
+            self.setGeometry(self._parent.rect())
+
+    def show_overlay(self):
+        self._sync_geometry()
+        self._start_time = time.monotonic()
+        self._timer.start()
+        self.setVisible(True)
+        self.raise_()
+
+    def close_overlay(self):
+        self._timer.stop()
+        self.setVisible(False)
+        if self._parent is not None:
+            self._parent.removeEventFilter(self)
+        self.deleteLater()
+
+    def mark_cancelled(self):
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setText("Cancelling…")
+
+    def set_message(self, message: str):
+        self._message_label.setText(message)
+
+    def _update_elapsed(self):
+        if self._start_time is None:
+            self._elapsed_label.setText("Elapsed: 0s")
+            return
+        elapsed = int(max(0.0, time.monotonic() - self._start_time))
+        minutes, seconds = divmod(elapsed, 60)
+        if minutes:
+            self._elapsed_label.setText(f"Elapsed: {minutes}m {seconds:02d}s")
+        else:
+            self._elapsed_label.setText(f"Elapsed: {seconds}s")
+
+    def _handle_cancel_clicked(self):
+        self.mark_cancelled()
+        self.cancel_requested.emit()
+
+
+class CancelableWorker(QThread):
+    finished = pyqtSignal(object, bool)  # result, cancelled
+    error = pyqtSignal(Exception)
+
+    def __init__(self, task: Callable[..., Any], *args, **kwargs):
+        super().__init__()
+        self._task = task
+        self._args = args
+        self._kwargs = kwargs
+        self._cancel_event = threading.Event()
+
+    def run(self):
+        try:
+            result = self._task(*self._args, cancel_event=self._cancel_event, **self._kwargs)
+        except OperationCancelledError:
+            self.finished.emit(None, True)
+            return
+        except Exception as exc:
+            self.error.emit(exc)
+            return
+        if self._cancel_event.is_set():
+            self.finished.emit(result, True)
+        else:
+            self.finished.emit(result, False)
+
+    def request_cancel(self):
+        self._cancel_event.set()
+
+    @property
+    def cancel_event(self) -> threading.Event:
+        return self._cancel_event
+
 class CloseShortcutFilter(QObject):
     def eventFilter(self, obj, event):
         if event.type() == QEvent.KeyPress and event.key() == Qt.Key_W:
@@ -385,7 +517,7 @@ class MainWindow(QMainWindow):
         self.btn_download.clicked.connect(self.action_download)
         self.btn_update = QPushButton('B) Add Geographic Info')
         self.btn_update.clicked.connect(self.action_update_locations)
-        self.btn_collocate = QPushButton('C) Collocation Analysis')
+        self.btn_collocate = QPushButton('C) Text Analysis')
         self.btn_collocate.clicked.connect(self.action_collocate)
         self.btn_map = QPushButton('D) Create Map')
         self.btn_map.clicked.connect(self.open_create_map_dialog)
@@ -3573,7 +3705,7 @@ class TermGroupDialog(TermSelectionDialog):
 class CollocationDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Collocation Analysis')
+        self.setWindowTitle('Text Analysis')
         self.setMinimumSize(620, 580)
         layout = QVBoxLayout(self)
         self._last_output_paths = None
@@ -3584,10 +3716,16 @@ class CollocationDialog(QDialog):
         self._drop_section_button: Optional[QToolButton] = None
         self._selected_section_button: Optional[QToolButton] = None
         self._group_section_button: Optional[QToolButton] = None
+        self._topic_section_button: Optional[QToolButton] = None
         self._drop_terms_prev_count = 0
         self._selected_terms_prev_count = 0
         self._group_terms_prev_count = 0
         self._rank_log_scale: bool = True
+        self._operation_overlay: Optional[OperationOverlay] = None
+        self._operation_worker: Optional[CancelableWorker] = None
+        self._operation_context: Optional[str] = None
+        self._operation_cancel_message: Optional[str] = None
+        self._base_height: int = 0
 
         # --- Source selection & status line ---
         mode_row = QHBoxLayout()
@@ -3857,89 +3995,143 @@ class CollocationDialog(QDialog):
         main_columns.addLayout(right_column, 1)
         layout.addLayout(main_columns)
 
-        topic_group = QGroupBox('Topic Modeling (beta)')
-        topic_group.setAlignment(Qt.AlignLeft)
-        topic_layout = QGridLayout(topic_group)
+        topic_content = QWidget()
+        topic_layout = QGridLayout(topic_content)
         topic_layout.setContentsMargins(12, 12, 12, 12)
         topic_layout.setHorizontalSpacing(10)
         topic_layout.setVerticalSpacing(6)
 
-        topic_row = 0
-        topic_layout.addWidget(QLabel('Model:'), topic_row, 0)
+        info_row_widget = QWidget(topic_content)
+        info_row_layout = QHBoxLayout(info_row_widget)
+        info_row_layout.setContentsMargins(0, 0, 0, 0)
+        info_row_layout.setSpacing(6)
+        topic_header = QLabel('Topic modeling settings')
+        topic_header.setStyleSheet('font-weight: 600;')
+        info_row_layout.addWidget(topic_header)
+        topic_info_btn = QToolButton()
+        topic_info_btn.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxInformation))
+        topic_info_btn.setAutoRaise(True)
+        topic_info_btn.setIconSize(QSize(16, 16))
+        topic_info_btn.setStyleSheet('QToolButton { border: none; padding: 0; }')
+        topic_info_btn.setToolTip('Topic modeling takes a long time on large corpora, and cancellation requests can take additional time to finish the current iteration.')
+        info_row_layout.addWidget(topic_info_btn)
+        info_row_layout.addStretch(1)
+        topic_layout.addWidget(info_row_widget, 0, 0, 1, 6)
+
+        topic_row = 1
+        model_label = QLabel('Model:')
+        model_label.setToolTip('Choose the topic modeling algorithm (LDA or NMF).')
+        topic_layout.addWidget(model_label, topic_row, 0)
         self.topic_model_combo = QComboBox()
         self.topic_model_combo.addItems(['LDA', 'NMF'])
+        self.topic_model_combo.setToolTip('Choose the topic modeling algorithm (LDA or NMF).')
         topic_layout.addWidget(self.topic_model_combo, topic_row, 1)
 
-        topic_layout.addWidget(QLabel('Topics:'), topic_row, 2)
+        topics_label = QLabel('Topics:')
+        topics_label.setToolTip('Number of latent topics to estimate.')
+        topic_layout.addWidget(topics_label, topic_row, 2)
         self.topic_topic_count_spin = QSpinBox()
         self.topic_topic_count_spin.setRange(2, 50)
         self.topic_topic_count_spin.setValue(10)
+        self.topic_topic_count_spin.setToolTip('Number of latent topics to estimate.')
         topic_layout.addWidget(self.topic_topic_count_spin, topic_row, 3)
 
-        topic_layout.addWidget(QLabel('Top words:'), topic_row, 4)
+        topwords_label = QLabel('Top words:')
+        topwords_label.setToolTip('How many of the most probable words to list for each topic.')
+        topic_layout.addWidget(topwords_label, topic_row, 4)
         self.topic_top_words_spin = QSpinBox()
         self.topic_top_words_spin.setRange(5, 50)
         self.topic_top_words_spin.setValue(12)
+        self.topic_top_words_spin.setToolTip('How many of the most probable words to list for each topic.')
         topic_layout.addWidget(self.topic_top_words_spin, topic_row, 5)
 
         topic_row += 1
-        topic_layout.addWidget(QLabel('Max features:'), topic_row, 0)
+        maxfeat_label = QLabel('Max features:')
+        maxfeat_label.setToolTip('Maximum vocabulary size for the vectorizer.')
+        topic_layout.addWidget(maxfeat_label, topic_row, 0)
         self.topic_max_features_spin = QSpinBox()
         self.topic_max_features_spin.setRange(500, 50000)
         self.topic_max_features_spin.setSingleStep(500)
         self.topic_max_features_spin.setValue(3000)
+        self.topic_max_features_spin.setToolTip('Maximum vocabulary size for the vectorizer.')
         topic_layout.addWidget(self.topic_max_features_spin, topic_row, 1)
 
-        topic_layout.addWidget(QLabel('Min doc freq:'), topic_row, 2)
+        mindoc_label = QLabel('Min doc freq:')
+        mindoc_label.setToolTip('Ignore tokens that appear in fewer documents than this threshold.')
+        topic_layout.addWidget(mindoc_label, topic_row, 2)
         self.topic_min_df_spin = QSpinBox()
         self.topic_min_df_spin.setRange(1, 100)
         self.topic_min_df_spin.setValue(5)
+        self.topic_min_df_spin.setToolTip('Ignore tokens that appear in fewer documents than this threshold.')
         topic_layout.addWidget(self.topic_min_df_spin, topic_row, 3)
 
-        topic_layout.addWidget(QLabel('Max doc freq:'), topic_row, 4)
+        maxdoc_label = QLabel('Max doc freq:')
+        maxdoc_label.setToolTip('Ignore tokens that appear in more than this fraction of documents.')
+        topic_layout.addWidget(maxdoc_label, topic_row, 4)
         self.topic_max_df_spin = QDoubleSpinBox()
         self.topic_max_df_spin.setRange(0.05, 1.0)
         self.topic_max_df_spin.setSingleStep(0.05)
         self.topic_max_df_spin.setDecimals(2)
         self.topic_max_df_spin.setValue(0.5)
+        self.topic_max_df_spin.setToolTip('Ignore tokens that appear in more than this fraction of documents.')
         topic_layout.addWidget(self.topic_max_df_spin, topic_row, 5)
 
         topic_row += 1
-        topic_layout.addWidget(QLabel('Max documents:'), topic_row, 0)
+        maxdocs_label = QLabel('Max documents:')
+        maxdocs_label.setToolTip('Optional cap on the number of documents used for modeling.')
+        topic_layout.addWidget(maxdocs_label, topic_row, 0)
         self.topic_max_docs_spin = QSpinBox()
         self.topic_max_docs_spin.setRange(0, 100000)
         self.topic_max_docs_spin.setSingleStep(1000)
         self.topic_max_docs_spin.setSpecialValueText('All')
         self.topic_max_docs_spin.setValue(0)
+        self.topic_max_docs_spin.setToolTip('Optional cap on the number of documents used for modeling.')
         topic_layout.addWidget(self.topic_max_docs_spin, topic_row, 1)
 
-        topic_layout.addWidget(QLabel('Min topic weight:'), topic_row, 2)
+        minweight_label = QLabel('Min topic weight:')
+        minweight_label.setToolTip('Only keep topic assignments with at least this weight in each document.')
+        topic_layout.addWidget(minweight_label, topic_row, 2)
         self.topic_min_weight_spin = QDoubleSpinBox()
         self.topic_min_weight_spin.setRange(0.0, 1.0)
         self.topic_min_weight_spin.setSingleStep(0.05)
         self.topic_min_weight_spin.setDecimals(2)
         self.topic_min_weight_spin.setValue(0.05)
+        self.topic_min_weight_spin.setToolTip('Only keep topic assignments with at least this weight in each document.')
         topic_layout.addWidget(self.topic_min_weight_spin, topic_row, 3)
 
-        topic_layout.addWidget(QLabel('Topics per article:'), topic_row, 4)
+        topicsper_label = QLabel('Topics per article:')
+        topicsper_label.setToolTip('Limit how many topics are recorded for each document.')
+        topic_layout.addWidget(topicsper_label, topic_row, 4)
         self.topic_doc_topics_spin = QSpinBox()
         self.topic_doc_topics_spin.setRange(1, 10)
         self.topic_doc_topics_spin.setValue(3)
+        self.topic_doc_topics_spin.setToolTip('Limit how many topics are recorded for each document.')
         topic_layout.addWidget(self.topic_doc_topics_spin, topic_row, 5)
 
         topic_row += 1
         self.topic_restrict_selected_check = QCheckBox('Only include articles containing selected terms')
+        self.topic_restrict_selected_check.setToolTip('Only analyze documents that contain the manually selected terms.')
         topic_layout.addWidget(self.topic_restrict_selected_check, topic_row, 0, 1, 3)
         self.topic_exclude_drop_docs_check = QCheckBox('Exclude articles containing drop terms')
+        self.topic_exclude_drop_docs_check.setToolTip('Skip documents that contain any drop terms.')
         topic_layout.addWidget(self.topic_exclude_drop_docs_check, topic_row, 3, 1, 3)
 
         topic_row += 1
         self.topic_remove_drop_tokens_check = QCheckBox('Remove drop terms from tokenization')
         self.topic_remove_drop_tokens_check.setChecked(True)
+        self.topic_remove_drop_tokens_check.setToolTip('Remove drop terms from the token list before modeling.')
         topic_layout.addWidget(self.topic_remove_drop_tokens_check, topic_row, 0, 1, 3)
 
         topic_layout.setColumnStretch(5, 1)
-        layout.addWidget(topic_group)
+
+        topic_section, topic_toggle = self._create_collapsible_section(
+            'Topic Modeling (beta)',
+            topic_content,
+            expanded=False,
+            on_toggle=self._handle_topic_section_toggle,
+        )
+        layout.addWidget(topic_section)
+        self._topic_section_button = topic_toggle
 
         self._update_selected_terms_summary()
 
@@ -3979,6 +4171,10 @@ class CollocationDialog(QDialog):
         self.topic_restrict_selected_check.stateChanged.connect(lambda *_: self._save_state())
         self.topic_exclude_drop_docs_check.stateChanged.connect(lambda *_: self._save_state())
         self.topic_remove_drop_tokens_check.stateChanged.connect(lambda *_: self._save_state())
+
+        if not self._base_height:
+            self._base_height = self.sizeHint().height()
+        self.setMinimumHeight(self._base_height)
 
         # Action buttons
         btn_run = QPushButton('Run Collocation')
@@ -4209,12 +4405,12 @@ class CollocationDialog(QDialog):
         location_state = map_settings.get('location_state') or ''
         location_label = map_settings.get('location_label') or ''
 
-        try:
-            lightweight_mode = bool(map_settings.get('lightweight', True))
-            map_settings['lightweight'] = lightweight_mode
-            self._collocate_map_settings['lightweight'] = lightweight_mode
-            # Create map with optional lightweight payload trimming
-            result = create_map(
+        lightweight_mode = bool(map_settings.get('lightweight', True))
+        map_settings['lightweight'] = lightweight_mode
+        self._collocate_map_settings['lightweight'] = lightweight_mode
+
+        def task(*, cancel_event: Optional[threading.Event]):
+            return create_map(
                 geo_path,
                 mode='points',
                 time_unit=time_unit,
@@ -4225,7 +4421,6 @@ class CollocationDialog(QDialog):
                 lightweight=lightweight_mode,
                 table_mode='minimal',
                 table_row_limit=1000,
-                # Extended kwargs consumed by map_create
                 collocate_rank_mode=True,
                 collocate_drop_stopwords=drop_stop,
                 collocate_drop_terms=self._get_parent_drop_terms(),
@@ -4248,31 +4443,48 @@ class CollocationDialog(QDialog):
                 time_start_override=start_value or None,
                 time_end_override=end_value or None,
                 collocate_export_csv=export_csv,
+                cancel_event=cancel_event,
             )
-        except Exception as exc:
-            QMessageBox.critical(self, 'Map Error', str(exc))
-            return
 
-        map_path = (result or {}).get('map_path')
-        if map_path and os.path.exists(map_path):
-            self._set_clear_notice('')
-            encoded = urllib.parse.quote(map_path)
-            log_lines = [
-                f'<div>Created map: <a href="chronam-open:{encoded}">{html.escape(map_path)}</a></div>'
-            ]
-            map_type_display = 'Top Ranked Term by Location' if map_type == 'top_term' else 'Select Term Rank Map'
-            log_lines.append(f'<div>Map type: {html.escape(map_type_display)}</div>')
-            csv_export_path = (result or {}).get('collocate_csv')
-            if csv_export_path:
-                encoded_csv = urllib.parse.quote(csv_export_path)
-                log_lines.append(
-                    f'<div>Collocate CSV: <a href="chronam-open:{encoded_csv}">{html.escape(csv_export_path)}</a></div>'
-                )
-            if parent and hasattr(parent, 'append_project_log'):
-                parent.append_project_log('Collocate‑Rank Map', log_lines)
-            QDesktopServices.openUrl(QUrl.fromLocalFile(map_path))
-        else:
-            QMessageBox.information(self, 'No Map Created', 'The map was not created.')
+        def handle_success(result: Dict[str, Optional[str]]):
+            map_path = (result or {}).get('map_path')
+            if map_path and os.path.exists(map_path):
+                self._set_clear_notice('')
+                encoded = urllib.parse.quote(map_path)
+                log_lines = [
+                    f'<div>Created map: <a href="chronam-open:{encoded}">{html.escape(map_path)}</a></div>'
+                ]
+                map_type_display = 'Top Ranked Term by Location' if map_type == 'top_term' else 'Select Term Rank Map'
+                log_lines.append(f'<div>Map type: {html.escape(map_type_display)}</div>')
+                csv_export_path = (result or {}).get('collocate_csv')
+                if csv_export_path and os.path.exists(csv_export_path):
+                    encoded_csv = urllib.parse.quote(csv_export_path)
+                    log_lines.append(
+                        f'<div>Collocate CSV: <a href="chronam-open:{encoded_csv}">{html.escape(csv_export_path)}</a></div>'
+                    )
+                if parent and hasattr(parent, 'append_project_log'):
+                    parent.append_project_log('Collocate‑Rank Map', log_lines)
+                QDesktopServices.openUrl(QUrl.fromLocalFile(map_path))
+            else:
+                QMessageBox.information(self, 'No Map Created', 'The map was not created.')
+
+        def handle_error(exc: Exception):
+            QMessageBox.critical(self, 'Map Error', str(exc))
+
+        def handle_cancel():
+            self._set_clear_notice('Map build cancelled.')
+
+        started = self._start_operation(
+            'Building collocate map…',
+            task,
+            on_success=handle_success,
+            on_error=handle_error,
+            on_cancel=handle_cancel,
+            context='collocate-map',
+        )
+        if started:
+            return
+        return
 
     def choose_source_file(self):
         parent = self.parent()
@@ -4703,6 +4915,88 @@ class CollocationDialog(QDialog):
             self.topic_remove_drop_tokens_check.setEnabled(False)
         else:
             self.topic_remove_drop_tokens_check.setEnabled(True)
+
+    def _handle_topic_section_toggle(self, checked: bool):
+        if not self._base_height:
+            self._base_height = self.sizeHint().height()
+        if checked:
+            new_min = max(self._base_height, self.sizeHint().height())
+        else:
+            new_min = self._base_height
+        self.setMinimumHeight(new_min)
+        self.resize(self.width(), max(new_min, self.sizeHint().height()))
+
+    def _start_operation(
+        self,
+        message: str,
+        task: Callable[..., Any],
+        *,
+        on_success: Optional[Callable[[Any], None]] = None,
+        on_error: Optional[Callable[[Exception], None]] = None,
+        on_cancel: Optional[Callable[[], None]] = None,
+        context: Optional[str] = None,
+        cancel_requested_message: Optional[str] = None,
+    ) -> bool:
+        if self._operation_overlay is not None:
+            QMessageBox.information(self, 'Busy', 'Another task is already running. Please wait for it to finish.')
+            return False
+        overlay = OperationOverlay(self, message)
+        worker = CancelableWorker(task)
+        overlay.cancel_requested.connect(lambda: self._handle_operation_cancel(worker, overlay))
+        worker.finished.connect(lambda result, cancelled: self._handle_operation_finished(result, cancelled, on_success, on_cancel))
+        worker.error.connect(lambda exc: self._handle_operation_error(exc, on_error))
+        self._operation_overlay = overlay
+        self._operation_worker = worker
+        self._operation_context = context
+        self._operation_cancel_message = cancel_requested_message
+        overlay.show_overlay()
+        worker.start()
+        return True
+
+    def _handle_operation_cancel(self, worker: CancelableWorker, overlay: OperationOverlay):
+        if worker is not None:
+            worker.request_cancel()
+        if overlay is not None:
+            overlay.mark_cancelled()
+        if self._operation_cancel_message:
+            self._set_clear_notice(self._operation_cancel_message)
+
+    def _handle_operation_finished(
+        self,
+        result: Any,
+        cancelled: bool,
+        on_success: Optional[Callable[[Any], None]],
+        on_cancel: Optional[Callable[[], None]],
+    ):
+        self._cleanup_operation()
+        if cancelled:
+            if on_cancel:
+                on_cancel()
+            else:
+                self._set_clear_notice('Operation cancelled.')
+            return
+        if on_success:
+            on_success(result)
+
+    def _handle_operation_error(self, exc: Exception, on_error: Optional[Callable[[Exception], None]]):
+        self._cleanup_operation()
+        if on_error:
+            on_error(exc)
+        else:
+            QMessageBox.critical(self, 'Error', str(exc))
+
+    def _cleanup_operation(self):
+        overlay = self._operation_overlay
+        worker = self._operation_worker
+        self._operation_overlay = None
+        self._operation_worker = None
+        self._operation_context = None
+        self._operation_cancel_message = None
+        if worker is not None:
+            worker.wait(50)
+            worker.deleteLater()
+        if overlay is not None:
+            overlay.close_overlay()
     def _generate_by_time_csv(
         self,
         *,
@@ -4719,6 +5013,7 @@ class CollocationDialog(QDialog):
         window_right: int,
         metadata_enabled: bool,
         prefer_geo: bool,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Tuple[Optional[str], Optional[str]]:
         parent = self.parent()
         if parent is None:
@@ -4742,32 +5037,27 @@ class CollocationDialog(QDialog):
             return None, 'Locate a JSON or GeoJSON results file before building rank changes.'
         if not source_is_geo:
             options_runtime['write_occurrences_geojson'] = False
-        try:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            result = run_collocation(
-                parent.project_folder,
-                city=city,
-                state=state,
-                start_date=start_value or None,
-                end_date=end_value or None,
-                term=term,
-                time_bin_unit=time_bin_unit,
-                json_path=None if source_is_geo else source_path,
-                geojson_path=source_path if source_is_geo else None,
-                ignore_bin=self.ignore_bin.isChecked(),
-                write_by_time=True,
-                drop_terms=drop_terms,
-                term_groups=self._get_parent_term_groups(),
-                window_left=window_left,
-                window_right=window_right,
-                metadata_enabled=metadata_enabled,
-                write_metrics=False,
-                **options_runtime,
-            )
-        except Exception as exc:
-            return None, str(exc)
-        finally:
-            QApplication.restoreOverrideCursor()
+        result = run_collocation(
+            parent.project_folder,
+            city=city,
+            state=state,
+            start_date=start_value or None,
+            end_date=end_value or None,
+            term=term,
+            time_bin_unit=time_bin_unit,
+            json_path=None if source_is_geo else source_path,
+            geojson_path=source_path if source_is_geo else None,
+            ignore_bin=self.ignore_bin.isChecked(),
+            write_by_time=True,
+            drop_terms=drop_terms,
+            term_groups=self._get_parent_term_groups(),
+            window_left=window_left,
+            window_right=window_right,
+            metadata_enabled=metadata_enabled,
+            write_metrics=False,
+            cancel_event=cancel_event,
+            **options_runtime,
+        )
         built_path = result.get('by_time') if isinstance(result, dict) else None
         if built_path and os.path.exists(built_path):
             return built_path, None
@@ -4917,7 +5207,7 @@ class CollocationDialog(QDialog):
         if parent is None:
             return
         if not current:
-            parent.append_project_log('Collocation Analysis', ['<div>Term groups cleared.</div>'])
+            parent.append_project_log('Text Analysis', ['<div>Term groups cleared.</div>'])
             return
         items = []
         for group in current:
@@ -4943,7 +5233,7 @@ class CollocationDialog(QDialog):
             f'<div>Updated term groups ({len(current)})</div>',
             f'<div style="max-height:220px; overflow-y:auto;"><ul>{"".join(items)}</ul></div>',
         ]
-        parent.append_project_log('Collocation Analysis', lines)
+        parent.append_project_log('Text Analysis', lines)
 
     def _update_drop_summary(self):
         terms = self._get_parent_drop_terms()
@@ -5066,7 +5356,7 @@ class CollocationDialog(QDialog):
                 f'<div>Updated dropped terms ({count})</div>',
                 f'<div style="max-height:220px; overflow-y:auto;"><ul>{items}</ul></div>',
             ]
-        parent.append_project_log('Collocation Analysis', lines)
+        parent.append_project_log('Text Analysis', lines)
 
     def _set_clear_notice(self, text: str):
         if not hasattr(self, 'clear_notice_label'):
@@ -5346,7 +5636,14 @@ class CollocationDialog(QDialog):
 
         preview.destroyed.connect(_cleanup)
 
-    def _create_collapsible_section(self, title: str, content: QWidget, *, expanded: bool = False) -> Tuple[QWidget, QToolButton]:
+    def _create_collapsible_section(
+        self,
+        title: str,
+        content: QWidget,
+        *,
+        expanded: bool = False,
+        on_toggle: Optional[Callable[[bool], None]] = None,
+    ) -> Tuple[QWidget, QToolButton]:
         section = QWidget()
         section_layout = QVBoxLayout(section)
         section_layout.setContentsMargins(0, 0, 0, 0)
@@ -5373,6 +5670,8 @@ class CollocationDialog(QDialog):
         def handle_toggle(checked: bool):
             toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
             body.setVisible(checked)
+            if on_toggle:
+                on_toggle(checked)
 
         toggle.toggled.connect(handle_toggle)
         return section, toggle
@@ -5542,92 +5841,92 @@ class CollocationDialog(QDialog):
         if not self._confirm_overwrite_if_needed(predicted_paths):
             return
 
-        try:
-            if self.mode_json.isChecked():
+        if self.mode_json.isChecked():
+            json_path = getattr(parent, 'json_file', None)
+            if not json_path or not os.path.exists(json_path):
+                self.choose_source_file()
                 json_path = getattr(parent, 'json_file', None)
                 if not json_path or not os.path.exists(json_path):
-                    self.choose_source_file()
-                    json_path = getattr(parent, 'json_file', None)
-                    if not json_path:
-                        return
-                result = run_collocation(
-                    parent.project_folder,
-                    city=city,
-                    state=state,
-                    start_date=start or None,
-                    end_date=end or None,
-                    term=term,
-                    time_bin_unit=time_bin_unit,
-                    json_path=json_path,
-                    geojson_path=None,
-                    ignore_bin=ignore_bin,
-                    write_by_time=write_by_time,
-                    drop_terms=parent.collocation_drop_terms,
-                    term_groups=getattr(parent, 'collocation_term_groups', []),
-                    window_left=window_left,
-                    window_right=window_right,
-                    metadata_enabled=metadata_enabled,
-                    **opts_bool,
-                )
-            else:
+                    return
+            source_kwargs = {'json_path': json_path, 'geojson_path': None}
+        else:
+            geo_path = getattr(parent, 'geojson_file', None)
+            if not geo_path or not os.path.exists(geo_path):
+                self.choose_source_file()
                 geo_path = getattr(parent, 'geojson_file', None)
                 if not geo_path or not os.path.exists(geo_path):
-                    self.choose_source_file()
-                    geo_path = getattr(parent, 'geojson_file', None)
-                    if not geo_path:
-                        return
-                result = run_collocation(
-                    parent.project_folder,
-                    city=city,
-                    state=state,
-                    start_date=start or None,
-                    end_date=end or None,
-                    term=term,
-                    time_bin_unit=time_bin_unit,
-                    geojson_path=geo_path,
-                    json_path=None,
-                    ignore_bin=ignore_bin,
-                    write_by_time=write_by_time,
-                    drop_terms=parent.collocation_drop_terms,
-                    term_groups=getattr(parent, 'collocation_term_groups', []),
-                    window_left=window_left,
-                    window_right=window_right,
-                    metadata_enabled=metadata_enabled,
-                    **opts_bool,
-                )
-        except Exception as e:
-            QMessageBox.critical(self, 'Error', str(e))
-            return
+                    return
+            source_kwargs = {'json_path': None, 'geojson_path': geo_path}
 
-        metrics_path = result.get('metrics')
-        if metrics_path and os.path.exists(metrics_path):
-            self.raise_()
-            self.activateWindow()
-            preview = CSVPreviewDialog(metrics_path, parent=self, max_rows=150)
-            preview.resize(1000, 620)
-            preview.show()
-            preview.raise_()
-            preview.activateWindow()
-            preview.setFocus()
-            self._register_preview(preview)
+        def task(*, cancel_event: Optional[threading.Event]):
+            return run_collocation(
+                parent.project_folder,
+                city=city,
+                state=state,
+                start_date=start or None,
+                end_date=end or None,
+                term=term,
+                time_bin_unit=time_bin_unit,
+                ignore_bin=ignore_bin,
+                write_by_time=write_by_time,
+                drop_terms=parent.collocation_drop_terms,
+                term_groups=getattr(parent, 'collocation_term_groups', []),
+                window_left=window_left,
+                window_right=window_right,
+                metadata_enabled=metadata_enabled,
+                cancel_event=cancel_event,
+                **source_kwargs,
+                **opts_bool,
+            )
 
-        self._last_output_paths = result
-        self._update_select_terms_enabled()
-        self._save_state()
-        mode_label = 'GeoJSON' if self.mode_geo.isChecked() else 'JSON'
-        self._log_collocation_run(
-            mode_label,
-            term,
-            start or 'all',
-            end or 'all',
-            city or 'All',
-            state or 'All',
-            time_bin_unit,
-            ignore_bin,
-            options_with_context,
-            result,
+        def handle_success(result: Any):
+            if not isinstance(result, dict):
+                QMessageBox.information(self, 'Collocation', 'Collocation completed with no outputs.')
+                return
+            metrics_path = result.get('metrics')
+            if metrics_path and os.path.exists(metrics_path):
+                self.raise_()
+                self.activateWindow()
+                preview = CSVPreviewDialog(metrics_path, parent=self, max_rows=150)
+                preview.resize(1000, 620)
+                preview.show()
+                preview.raise_()
+                preview.activateWindow()
+                preview.setFocus()
+                self._register_preview(preview)
+
+            self._last_output_paths = result
+            self._update_select_terms_enabled()
+            self._save_state()
+            mode_label = 'GeoJSON' if self.mode_geo.isChecked() else 'JSON'
+            self._log_collocation_run(
+                mode_label,
+                term,
+                start or 'all',
+                end or 'all',
+                city or 'All',
+                state or 'All',
+                time_bin_unit,
+                ignore_bin,
+                options_with_context,
+                result,
+            )
+            self._set_clear_notice('')
+
+        def handle_error(exc: Exception):
+            QMessageBox.critical(self, 'Error', str(exc))
+
+        def handle_cancel():
+            self._set_clear_notice('Collocation analysis cancelled.')
+
+        self._start_operation(
+            'Running collocation analysis…',
+            task,
+            on_success=handle_success,
+            on_error=handle_error,
+            on_cancel=handle_cancel,
+            context='collocation',
         )
-        self._set_clear_notice('')
 
     def run_topic_model_action(self):
         term = self.term_input.text().strip()
@@ -5673,9 +5972,8 @@ class CollocationDialog(QDialog):
         time_bin_unit = self._current_time_bin_unit()
         metadata_enabled = getattr(parent, 'metadata_enabled', True)
 
-        try:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            result = run_topic_model(
+        def task(*, cancel_event: Optional[threading.Event]):
+            return run_topic_model(
                 parent.project_folder,
                 term=term,
                 city=city,
@@ -5689,35 +5987,48 @@ class CollocationDialog(QDialog):
                 term_groups=self._get_parent_term_groups(),
                 selected_terms=effective_selected,
                 metadata_enabled=metadata_enabled,
+                cancel_event=cancel_event,
                 **source_kwargs,
             )
-        except RuntimeError as exc:
+
+        def handle_success(result: Any):
+            if not isinstance(result, dict):
+                QMessageBox.information(self, 'Topic Modeling', 'Topic modeling completed with no outputs.')
+                return
+            self._last_topic_paths = result
+            topics_path = result.get('topics')
+            if topics_path and os.path.exists(topics_path):
+                preview = CSVPreviewDialog(topics_path, parent=self, max_rows=150)
+                preview.resize(1000, 620)
+                preview.show()
+                preview.raise_()
+                preview.activateWindow()
+                preview.setFocus()
+                self._register_preview(preview)
+
+            start_display = start or 'all'
+            end_display = end or 'all'
+            city_display = city or 'All'
+            state_display = state or 'All'
+            self._log_topic_model_run(term, start_display, end_display, city_display, state_display, params, result)
+            self._set_clear_notice('')
+            self._save_state()
+
+        def handle_error(exc: Exception):
             QMessageBox.critical(self, 'Topic Modeling Error', str(exc))
-            return
-        except Exception as exc:
-            QMessageBox.critical(self, 'Topic Modeling Error', f'Unexpected error:\n{exc}')
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
 
-        self._last_topic_paths = result
-        topics_path = (result or {}).get('topics')
-        if topics_path and os.path.exists(topics_path):
-            preview = CSVPreviewDialog(topics_path, parent=self, max_rows=150)
-            preview.resize(1000, 620)
-            preview.show()
-            preview.raise_()
-            preview.activateWindow()
-            preview.setFocus()
-            self._register_preview(preview)
+        def handle_cancel():
+            self._set_clear_notice('Topic modeling cancelled.')
 
-        start_display = start or 'all'
-        end_display = end or 'all'
-        city_display = city or 'All'
-        state_display = state or 'All'
-        self._log_topic_model_run(term, start_display, end_display, city_display, state_display, params, result)
-        self._set_clear_notice('')
-        self._save_state()
+        self._start_operation(
+            'Running topic modeling…',
+            task,
+            on_success=handle_success,
+            on_error=handle_error,
+            on_cancel=handle_cancel,
+            context='topic-model',
+            cancel_requested_message='Topic modeling cancellation requested. The current iteration may take additional time to finish.',
+        )
 
     def show_bar(self):
         term = self.term_input.text().strip()
@@ -5786,6 +6097,210 @@ class CollocationDialog(QDialog):
         if fig is not None:
             fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
 
+    def _display_rank_chart_from_path(
+        self,
+        file_path: str,
+        *,
+        settings: dict,
+        log_scale: bool,
+        drop_terms_set: Set[str],
+        term: str,
+        city_text: str,
+        state_text: str,
+        start_value: str,
+        end_value: str,
+        time_bin_unit: Optional[str],
+    ) -> None:
+        try:
+            df = pd.read_csv(file_path)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Error', f'Could not read by-time data:\n{exc}')
+            return
+        self._render_rank_chart_dataframe(
+            df,
+            file_path=file_path,
+            settings=settings,
+            log_scale=log_scale,
+            drop_terms_set=drop_terms_set,
+            term=term,
+            city_text=city_text,
+            state_text=state_text,
+            start_value=start_value,
+            end_value=end_value,
+            time_bin_unit=time_bin_unit,
+        )
+
+    def _render_rank_chart_dataframe(
+        self,
+        df: pd.DataFrame,
+        *,
+        file_path: Optional[str],
+        settings: dict,
+        log_scale: bool,
+        drop_terms_set: Set[str],
+        term: str,
+        city_text: str,
+        state_text: str,
+        start_value: str,
+        end_value: str,
+        time_bin_unit: Optional[str],
+    ) -> None:
+        if df is None or df.empty:
+            QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available for the selected parameters.')
+            return
+        df_local = df.copy()
+        if drop_terms_set:
+            df_local = df_local[~df_local['collocate_term'].isin(drop_terms_set)].reset_index(drop=True)
+        required_cols = {'time_bin', 'collocate_term', 'ordinal_rank'}
+        if not required_cols.issubset(df_local.columns):
+            QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available for the selected parameters.')
+            return
+        if df_local.empty:
+            QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available for the selected parameters.')
+            return
+        try:
+            bins_ordered = sorted(
+                df_local['time_bin'].dropna().unique(),
+                key=lambda x: pd.to_datetime(str(x), errors='coerce'),
+            )
+        except Exception:
+            bins_ordered = sorted(df_local['time_bin'].dropna().unique())
+        if not bins_ordered:
+            bins_ordered = self._derive_time_bins_from_inputs()
+            if not bins_ordered:
+                QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available for the selected parameters.')
+                return
+        unique_terms = df_local['collocate_term'].dropna().astype(str).unique().tolist()
+        if not unique_terms:
+            QMessageBox.information(self, 'No Rank Data', 'No collocate terms available to plot.')
+            return
+
+        top_n = settings.get('top_n', 10)
+        use_global = bool(settings.get('use_global'))
+        show_labels = bool(settings.get('show_labels'))
+        home_idx = int(settings.get('home_bin_index', 0))
+        home_idx = max(0, min(home_idx, len(bins_ordered) - 1))
+        use_selected_terms = bool(settings.get('use_selected_terms'))
+
+        unique_term_set = set(unique_terms)
+        manual_terms = [term for term in self._rank_selected_terms if term in unique_term_set]
+        missing_manual = [term for term in self._rank_selected_terms if term not in unique_term_set]
+        manual_mode = use_selected_terms and bool(manual_terms)
+        if manual_mode and missing_manual:
+            missing_preview = ', '.join(missing_manual[:5])
+            if len(missing_manual) > 5:
+                missing_preview += ', …'
+            QMessageBox.information(
+                self,
+                'Terms Not Found',
+                'The following selected terms are not available for the current filters and will be skipped:\n' + missing_preview,
+            )
+        elif use_selected_terms and not manual_mode and self._rank_selected_terms:
+            QMessageBox.information(
+                self,
+                'Terms Not Found',
+                'None of the manually selected terms are available for the current filters. The chart will use the Top N terms instead.',
+            )
+
+        home_label_value = bins_ordered[home_idx] if bins_ordered else None
+
+        if manual_mode:
+            top_terms = manual_terms
+            legend_order = manual_terms
+        elif use_global:
+            if 'frequency' in df_local.columns:
+                try:
+                    freq_series = df_local.groupby('collocate_term')['frequency'].sum(min_count=1)
+                except TypeError:
+                    freq_series = df_local.groupby('collocate_term')['frequency'].sum()
+            else:
+                freq_series = None
+            if freq_series is None or freq_series.empty:
+                freq_series = df_local.groupby('collocate_term').size()
+            if freq_series.empty:
+                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+                return
+            summary = freq_series.reset_index()
+            if summary.shape[1] >= 2:
+                summary.columns = ['collocate_term', 'total_frequency'] + list(summary.columns[2:])
+            else:
+                summary.columns = ['collocate_term', 'total_frequency']
+            summary['term_key'] = summary['collocate_term'].astype(str).str.lower()
+            summary = summary.sort_values(['total_frequency', 'term_key'], ascending=[False, True])
+            top_terms = summary.head(top_n)['collocate_term'].tolist()
+            if not top_terms:
+                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+                return
+            legend_order = top_terms
+        else:
+            df_home = df_local[df_local['time_bin'] == home_label_value].dropna(subset=['ordinal_rank'])
+            if df_home.empty:
+                QMessageBox.information(self, 'No Data', 'The selected bin contains no collocates.')
+                return
+            if 'frequency' in df_home.columns:
+                freq_home = df_home.groupby('collocate_term')['frequency'].sum()
+            else:
+                freq_home = df_home.groupby('collocate_term').size()
+            freq_home = freq_home.sort_values(ascending=False)
+            top_terms = freq_home.head(top_n).index.tolist()
+            if not top_terms:
+                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+                return
+            legend_order = top_terms
+
+        if manual_mode and not top_terms:
+            QMessageBox.information(self, 'No Data', 'None of the selected terms are available for the current filters.')
+            return
+
+        df_top = df_local[df_local['collocate_term'].isin(top_terms)].copy()
+        if df_top.empty:
+            QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+            return
+
+        if use_global:
+            home_label_display = 'All time (global)'
+        else:
+            try:
+                home_label_display = str(home_label_value)
+            except Exception:
+                home_label_display = 'Selected bin'
+
+        city_display = city_text or 'All Cities'
+        state_display = state_text or 'All States'
+        start_display = start_value or 'All dates'
+        end_display = end_value or 'All dates'
+        if self.ignore_bin.isChecked() or not time_bin_unit:
+            time_unit_display = 'Time Bin: none'
+        else:
+            time_unit_display = f"Time Bin: {time_bin_unit}"
+
+        settings_text = self._build_rank_chart_summary(
+            term_count=len(top_terms),
+            home_label=home_label_display,
+            city_label=city_display,
+            state_label=state_display,
+            start_label=start_display,
+            end_label=end_display,
+            time_unit=time_unit_display,
+            keyword=term,
+        )
+
+        try:
+            plot_rank_changes = _import_plot_rank_changes()
+            fig = plot_rank_changes(
+                df_top,
+                legend_order=legend_order,
+                show_term_labels=show_labels,
+                settings_text=settings_text,
+                use_log_scale=log_scale,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, 'Plot Error', str(exc))
+            return
+
+        if fig is not None:
+            fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
+            self._set_clear_notice('')
     def show_topic_trends(self):
         if self.ignore_bin.isChecked():
             QMessageBox.information(self, 'Time Bins Required', 'Enable time binning to plot topic trends.')
@@ -5991,7 +6506,7 @@ class CollocationDialog(QDialog):
                     f'<div style="max-height:220px; overflow-y:auto;"><ul>{"".join(group_items)}</ul></div>'
                 )
 
-        parent.append_project_log('Collocation Analysis', lines)
+        parent.append_project_log('Text Analysis', lines)
 
     def closeEvent(self, event):
         self._save_state()
@@ -6099,177 +6614,84 @@ class CollocationDialog(QDialog):
         self._rank_log_scale = log_scale
         self._save_state()
         regen_on_accept = bool(drop_terms_set) or not csv_exists or df is None
-        if regen_on_accept:
-            built_path, error = self._generate_by_time_csv(
-                city=city,
-                state=state,
-                start_value=start_value or None,
-                end_value=end_value or None,
+
+        def render_from_path(path: str) -> None:
+            self._display_rank_chart_from_path(
+                path,
+                settings=settings,
+                log_scale=log_scale,
+                drop_terms_set=drop_terms_set,
                 term=term,
+                city_text=city_text,
+                state_text=state_text,
+                start_value=start_value,
+                end_value=end_value,
                 time_bin_unit=time_bin_unit,
-                drop_terms=drop_terms,
-                options_runtime=opts_bool,
-                options_hash=options_with_context,
-                window_left=window_left,
-                window_right=window_right,
-                metadata_enabled=metadata_enabled,
-                prefer_geo=prefer_geo,
             )
-            if not built_path:
-                QMessageBox.critical(self, 'Error', error or 'Unable to build by-time data.')
-                return
-            file_path = built_path
-            try:
-                df = pd.read_csv(file_path)
-            except Exception as exc:
-                QMessageBox.critical(self, 'Error', f'Could not read by-time data: {exc}')
-                return
-            if drop_terms_set:
-                df = df[~df['collocate_term'].isin(drop_terms_set)].reset_index(drop=True)
-            if df.empty or 'time_bin' not in df.columns or 'collocate_term' not in df.columns or 'ordinal_rank' not in df.columns:
-                QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available for the selected parameters.')
-                return
-            try:
-                bins_ordered = sorted(df['time_bin'].unique(), key=lambda x: pd.to_datetime(str(x), errors='coerce'))
-            except Exception:
-                bins_ordered = sorted(df['time_bin'].unique())
-            if not bins_ordered:
-                bins_ordered = self._derive_time_bins_from_inputs()
-                if not bins_ordered:
-                    QMessageBox.information(self, 'No Rank Data', 'No collocate rank data available.')
+
+        if regen_on_accept:
+            def task(*, cancel_event: Optional[threading.Event]):
+                return self._generate_by_time_csv(
+                    city=city,
+                    state=state,
+                    start_value=start_value or None,
+                    end_value=end_value or None,
+                    term=term,
+                    time_bin_unit=time_bin_unit,
+                    drop_terms=drop_terms,
+                    options_runtime=opts_bool,
+                    options_hash=options_with_context,
+                    window_left=window_left,
+                    window_right=window_right,
+                    metadata_enabled=metadata_enabled,
+                    prefer_geo=prefer_geo,
+                    cancel_event=cancel_event,
+                )
+
+            def handle_success(result: Tuple[Optional[str], Optional[str]]):
+                built_path, error = result
+                if not built_path:
+                    QMessageBox.critical(self, 'Error', error or 'Unable to build by-time data.')
                     return
-            unique_terms = df['collocate_term'].dropna().unique().tolist()
-            if not unique_terms:
-                QMessageBox.information(self, 'No Rank Data', 'No collocate terms available to plot.')
-                return
+                render_from_path(built_path)
 
-        top_n = settings['top_n']
-        use_global = settings['use_global']
-        show_labels = settings['show_labels']
-        home_idx = settings['home_bin_index']
-        home_idx = max(0, min(home_idx, len(bins_ordered) - 1))
-        use_selected_terms = bool(settings.get('use_selected_terms'))
+            def handle_error(exc: Exception):
+                QMessageBox.critical(self, 'Error', str(exc))
 
-        unique_term_set = set(unique_terms)
-        manual_terms = [term for term in self._rank_selected_terms if term in unique_term_set]
-        missing_manual = [term for term in self._rank_selected_terms if term not in unique_term_set]
-        manual_mode = use_selected_terms and bool(manual_terms)
-        if manual_mode and missing_manual:
-            missing_preview = ', '.join(missing_manual[:5])
-            if len(missing_manual) > 5:
-                missing_preview += ', …'
-            QMessageBox.information(
-                self,
-                'Terms Not Found',
-                'The following selected terms are not available for the current filters and will be skipped:\n' + missing_preview,
+            def handle_cancel():
+                self._set_clear_notice('Rank changes build cancelled.')
+
+            started = self._start_operation(
+                'Building rank changes…',
+                task,
+                on_success=handle_success,
+                on_error=handle_error,
+                on_cancel=handle_cancel,
+                context='rank-changes',
             )
-        elif use_selected_terms and not manual_mode and self._rank_selected_terms:
-            QMessageBox.information(
-                self,
-                'Terms Not Found',
-                'None of the manually selected terms are available for the current filters. The chart will use the Top N terms instead.',
-            )
-
-        legend_order: List[str]
-        home_label_value = None
-
-        home_label_value = bins_ordered[home_idx] if bins_ordered else None
-
-        if manual_mode:
-            top_terms = manual_terms
-            legend_order = manual_terms
-        elif use_global:
-            if 'frequency' in df.columns:
-                try:
-                    freq_series = df.groupby('collocate_term')['frequency'].sum(min_count=1)
-                except TypeError:
-                    freq_series = df.groupby('collocate_term')['frequency'].sum()
-            else:
-                freq_series = None
-            if freq_series is None or freq_series.empty:
-                freq_series = df.groupby('collocate_term').size()
-            if freq_series.empty:
-                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
+            if started:
                 return
-            summary = freq_series.reset_index()
-            if summary.shape[1] >= 2:
-                summary.columns = ['collocate_term', 'total_frequency'] + list(summary.columns[2:])
-            else:
-                summary.columns = ['collocate_term', 'total_frequency']
-            summary['term_key'] = summary['collocate_term'].astype(str).str.lower()
-            summary = summary.sort_values(['total_frequency', 'term_key'], ascending=[False, True])
-            top_terms = summary.head(top_n)['collocate_term'].tolist()
-            if not top_terms:
-                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
-                return
-            legend_order = top_terms
-        else:
-            df_home = df[df['time_bin'] == home_label_value].dropna(subset=['ordinal_rank'])
-            if df_home.empty:
-                QMessageBox.information(self, 'No Data', 'The selected bin contains no collocates.')
-                return
-            if 'frequency' in df_home.columns:
-                freq_home = df_home.groupby('collocate_term')['frequency'].sum()
-            else:
-                freq_home = df_home.groupby('collocate_term').size()
-            freq_home = freq_home.sort_values(ascending=False)
-            top_terms = freq_home.head(top_n).index.tolist()
-            if not top_terms:
-                QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
-                return
-            legend_order = top_terms
-
-        if manual_mode and not top_terms:
-            QMessageBox.information(self, 'No Data', 'None of the selected terms are available for the current filters.')
             return
-
-        df_top = df[df['collocate_term'].isin(top_terms)].copy()
-        if df_top.empty:
-            QMessageBox.information(self, 'No Data', 'No data available for the selected terms.')
-            return
-
-        if use_global:
-            home_label_display = 'All time (global)'
         else:
-            try:
-                home_label_display = str(home_label_value)
-            except Exception:
-                home_label_display = 'Selected bin'
-
-        city_display = city_text if city else 'All Cities'
-        state_display = state_text if state else 'All States'
-        start_display = start_value or 'All dates'
-        end_display = end_value or 'All dates'
-        if self.ignore_bin.isChecked():
-            time_unit_display = 'Time Bin: none'
-        else:
-            bin_size = self.bin_size.text().strip() or '1'
-            unit_text = self.bin_unit.currentText().strip() or 'unit'
-            time_unit_display = f"Time Bin: {bin_size} {unit_text}".strip()
-        settings_text = self._build_rank_chart_summary(
-            term_count=len(top_terms),
-            home_label=home_label_display,
-            city_label=city_display,
-            state_label=state_display,
-            start_label=start_display,
-            end_label=end_display,
-            time_unit=time_unit_display,
-            keyword=term,
-        )
-
-        try:
-            plot_rank_changes = _import_plot_rank_changes()
-            fig = plot_rank_changes(
-                df_top,
-                legend_order=legend_order,
-                show_term_labels=show_labels,
-                settings_text=settings_text,
-                use_log_scale=log_scale,
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, 'Plot Error', str(exc))
-            return
-        fig.canvas.mpl_connect('close_event', lambda event: self._refocus_collocation())
+            if df is not None:
+                self._render_rank_chart_dataframe(
+                    df,
+                    file_path=file_path,
+                    settings=settings,
+                    log_scale=log_scale,
+                    drop_terms_set=drop_terms_set,
+                    term=term,
+                    city_text=city_text,
+                    state_text=state_text,
+                    start_value=start_value,
+                    end_value=end_value,
+                    time_bin_unit=time_bin_unit,
+                )
+                return
+            if file_path and os.path.exists(file_path):
+                render_from_path(file_path)
+                return
+            QMessageBox.information(self, 'By-time Not Found', 'Run the collocation analysis with time bins before viewing rank changes.')
 
     def _build_rank_chart_summary(
         self,
