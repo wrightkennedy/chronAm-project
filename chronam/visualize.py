@@ -8,7 +8,8 @@ Plotting utilities for collocation analysis.
 These functions are GUI-agnostic and can be called from PyQt handlers.
 """
 
-from typing import Optional, Union, List, Dict
+from typing import Optional, Union, List, Dict, Tuple
+from pathlib import Path
 import textwrap
 import pandas as pd
 import numpy as np
@@ -200,6 +201,58 @@ def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
         return fig
 
 
+def _load_topic_terms_from_path(path_str: str) -> Dict[int, str]:
+    """Best-effort load of topic-term strings located next to a by-time CSV."""
+    terms: Dict[int, str] = {}
+    try:
+        path = Path(path_str)
+    except (TypeError, ValueError):
+        return terms
+    if not path.exists():
+        return terms
+    name = path.name
+    candidates: List[Path] = []
+    if "topics_by_time" in name:
+        candidates.append(path.with_name(name.replace("topics_by_time", "topics", 1)))
+    if name.startswith("topics_by_time_"):
+        candidates.append(path.with_name(name.replace("topics_by_time_", "topics_", 1)))
+    if not candidates:
+        candidates.append(path.with_name(name.replace("_by_time", "")))
+    seen: set = set()
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        candidate_key = str(candidate.resolve())
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        try:
+            df_topics = pd.read_csv(candidate)
+        except Exception:
+            continue
+        required = {"topic_id", "top_terms"}
+        if not required.issubset(df_topics.columns):
+            continue
+        for row in df_topics.itertuples(index=False):
+            raw_topic_id = getattr(row, "topic_id", None)
+            if pd.isna(raw_topic_id):
+                continue
+            try:
+                topic_id = int(raw_topic_id)
+            except Exception:
+                continue
+            raw_terms = getattr(row, "top_terms", "")
+            if isinstance(raw_terms, str):
+                terms[topic_id] = raw_terms
+            elif isinstance(raw_terms, (list, tuple)):
+                terms[topic_id] = ", ".join(str(part) for part in raw_terms)
+            else:
+                terms[topic_id] = str(raw_terms)
+        if terms:
+            break
+    return terms
+
+
 def plot_topics_over_time(
     df_or_path: Union[str, pd.DataFrame],
     output_path: Optional[str] = None,
@@ -208,6 +261,8 @@ def plot_topics_over_time(
     show_legend: bool = True,
     label_points: bool = False,
     log_scale: bool = False,
+    enable_hover: bool = True,
+    settings_text: Optional[str] = None,
 ):
     """Plot topic statistics across time bins."""
     plt = _ensure_pyplot()
@@ -264,7 +319,7 @@ def plot_topics_over_time(
     except Exception:
         bins_ordered = list(df["time_bin"].dropna().unique())
     if not bins_ordered:
-        bins_ordered = list(df["time_bin"].unique())
+       bins_ordered = list(df["time_bin"].unique())
 
     df = df[df["time_bin"].isin(bins_ordered)].copy()
     if df.empty:
@@ -275,6 +330,18 @@ def plot_topics_over_time(
         if not text:
             return ""
         return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+    topic_terms_map: Dict[int, str] = {}
+    if isinstance(df_or_path, str):
+        topic_terms_map = _load_topic_terms_from_path(df_or_path)
+    if "topic_terms" in df.columns:
+        series_terms = df.dropna(subset=["topic_terms"]).groupby("topic_id")["topic_terms"].first()
+        for tid, terms_val in series_terms.items():
+            try:
+                tid_int = int(tid)
+            except Exception:
+                continue
+            topic_terms_map[tid_int] = str(terms_val)
 
     grouped = df.groupby(["topic_id", "topic_label"], as_index=False)[metric_field]
     if metric == "ordinal_rank":
@@ -312,6 +379,8 @@ def plot_topics_over_time(
     positions = np.arange(len(bins_ordered))
     handles: List = []
     legend_labels: List[str] = []
+    legend_topic_ids: List[int] = []
+    scatter_points: List[Tuple[int, np.ndarray, np.ndarray, List[str]]] = []
 
     for topic_id in ordered_topics:
         series = pivot[topic_id].to_numpy(dtype=float)
@@ -320,12 +389,17 @@ def plot_topics_over_time(
             continue
         xs = positions[mask]
         ys = series[mask]
+        bin_idx = np.flatnonzero(mask)
+        bin_labels = [str(bins_ordered[idx]) for idx in bin_idx]
         line, = ax.plot(positions, series, marker="o")
         topic_label = label_map.get(topic_id) or f"Topic {topic_id}"
         legend_label = f"{topic_id}: {_shorten(topic_label, 20) or f'Topic {topic_id}'}"
         if show_legend:
             handles.append(line)
             legend_labels.append(legend_label)
+            legend_topic_ids.append(topic_id)
+        if enable_hover:
+            scatter_points.append((topic_id, xs, ys, bin_labels))
         if label_points and xs.size:
             final_x = xs[-1]
             final_y = ys[-1]
@@ -343,10 +417,116 @@ def plot_topics_over_time(
     ax.set_title(metric_info["title"])
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
 
+    legend = None
+    legend_text_entries: List[Tuple] = []
+    legend_handle_entries: List[Tuple] = []
+    legend_hover_display = None
     if show_legend and handles:
-        ax.legend(handles, legend_labels, title="Topic", bbox_to_anchor=(1.02, 1), loc="upper left")
+        legend = ax.legend(handles, legend_labels, title="Topic", bbox_to_anchor=(1.02, 1), loc="upper left")
+        legend_text_entries = list(zip(legend.get_texts(), legend_topic_ids))
+        legend_handles_candidate = getattr(legend, "legendHandles", None)
+        if legend_handles_candidate is None:
+            legend_handles_candidate = getattr(legend, "legend_handles", None)
+        legend_handles_list = list(legend_handles_candidate) if legend_handles_candidate is not None else []
+        legend_handle_entries = list(zip(legend_handles_list, legend_topic_ids))
+        legend_hover_display = fig.text(0.5, 0.01, "", ha="center", va="bottom", fontsize=9, color="dimgray")
 
-    plt.tight_layout()
+    top_margin = 0.0
+    bottom_margin = 0.0
+    if settings_text:
+        wrapped = "\n".join(textwrap.fill(str(part), 110) for part in str(settings_text).splitlines())
+        fig.text(0.5, 0.98, wrapped, ha="center", va="top", fontsize=10)
+        top_margin = max(top_margin, 0.1)
+    if legend_hover_display is not None:
+        bottom_margin = max(bottom_margin, 0.08)
+    if top_margin or bottom_margin:
+        plt.tight_layout(rect=[0, bottom_margin, 1, 1 - top_margin])
+    else:
+        plt.tight_layout()
+
+    if enable_hover and scatter_points:
+        annot = ax.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(12, 12),
+            textcoords="offset points",
+            bbox=dict(boxstyle="round", fc="w", alpha=0.8),
+            arrowprops=dict(arrowstyle="->"),
+        )
+        annot.set_visible(False)
+
+        current_legend_topic = {"value": None}
+
+        def _topic_terms(tid: int) -> str:
+            base = topic_terms_map.get(tid) or label_map.get(tid) or f"Topic {tid}"
+            return str(base)
+
+        def _format_value(val: float) -> str:
+            if metric == "ordinal_rank":
+                return f"{int(round(val))}"
+            if metric == "doc_count":
+                return f"{int(round(val)):,}"
+            return f"{val:,.3f}".rstrip("0").rstrip(".")
+
+        def update_annot(topic_id: int, x_val: float, y_val: float, date_label: str):
+            annot.xy = (x_val, y_val)
+            terms_preview = _shorten(_topic_terms(topic_id), 20)
+            annot.set_text(
+                f"Value: {_format_value(y_val)}\nDate: {date_label}\nWords: {terms_preview}"
+            )
+            annot.get_bbox_patch().set_alpha(0.85)
+
+        def update_legend_hover(topic_id: Optional[int]):
+            if legend_hover_display is None:
+                return
+            if current_legend_topic["value"] == topic_id:
+                return
+            current_legend_topic["value"] = topic_id
+            if topic_id is None:
+                if legend_hover_display.get_text():
+                    legend_hover_display.set_text("")
+                    fig.canvas.draw_idle()
+                return
+            terms_full = _topic_terms(topic_id)
+            legend_hover_display.set_text(textwrap.fill(f"Topic {topic_id}: {terms_full}", 110))
+            fig.canvas.draw_idle()
+
+        def hover(event):
+            point_shown = False
+            if event.inaxes == ax and event.xdata is not None and event.ydata is not None:
+                tolerance = 0.35
+                for topic_id, xs_vals, ys_vals, labels in scatter_points:
+                    if len(xs_vals) == 0:
+                        continue
+                    distances = np.hypot(xs_vals - event.xdata, ys_vals - event.ydata)
+                    idx = distances.argmin()
+                    if distances[idx] <= tolerance:
+                        update_annot(topic_id, xs_vals[idx], ys_vals[idx], labels[idx])
+                        if not annot.get_visible():
+                            annot.set_visible(True)
+                        fig.canvas.draw_idle()
+                        point_shown = True
+                        update_legend_hover(None)
+                        break
+            if not point_shown and annot.get_visible():
+                annot.set_visible(False)
+                fig.canvas.draw_idle()
+
+            hovered_topic = None
+            for text_obj, tid in legend_text_entries:
+                contains, _ = text_obj.contains(event)
+                if contains:
+                    hovered_topic = tid
+                    break
+            if hovered_topic is None:
+                for handle_obj, tid in legend_handle_entries:
+                    contains, _ = handle_obj.contains(event)
+                    if contains:
+                        hovered_topic = tid
+                        break
+            update_legend_hover(hovered_topic)
+
+        fig.canvas.mpl_connect("motion_notify_event", hover)
 
     if output_path:
         fig.savefig(output_path, dpi=150)

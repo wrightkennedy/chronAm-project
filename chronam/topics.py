@@ -53,10 +53,13 @@ class TopicModelParameters:
     random_state: int = 0
     drop_stopwords: bool = False
     restrict_to_selected_terms: bool = False
+    require_selected_collocate: bool = False
     exclude_drop_term_documents: bool = False
     remove_drop_terms_from_tokens: bool = True
     min_topic_weight: float = 0.05
     max_topics_per_document: int = 3
+    collocate_window_left: int = 5
+    collocate_window_right: int = 5
 
     def as_payload(self) -> Dict[str, Any]:
         payload = self.__dict__.copy()
@@ -64,6 +67,9 @@ class TopicModelParameters:
         payload["min_topic_weight"] = float(self.min_topic_weight)
         payload["max_df"] = float(self.max_df)
         payload["min_df"] = float(self.min_df)
+        payload["require_selected_collocate"] = bool(self.require_selected_collocate)
+        payload["collocate_window_left"] = int(self.collocate_window_left)
+        payload["collocate_window_right"] = int(self.collocate_window_right)
         return payload
 
 
@@ -110,6 +116,33 @@ def _document_contains(tokens: List[str], phrases: List[List[str]]) -> bool:
     return False
 
 
+def _has_collocated_selected(
+    search_positions: Sequence[int],
+    search_length: int,
+    selected_positions: Sequence[Tuple[Sequence[str], Sequence[int]]],
+    *,
+    window_left: int,
+    window_right: int,
+) -> bool:
+    if not search_positions or not selected_positions:
+        return False
+    window_left = max(0, int(window_left))
+    window_right = max(0, int(window_right))
+    for search_start in search_positions:
+        left_bound = search_start - window_left
+        right_bound = search_start + search_length - 1 + window_right
+        for phrase_tokens, starts in selected_positions:
+            phrase_len = len(phrase_tokens)
+            if phrase_len == 0:
+                continue
+            for pos in starts:
+                if pos < left_bound:
+                    continue
+                if pos + phrase_len - 1 <= right_bound:
+                    return True
+    return False
+
+
 def _remove_drop_tokens(tokens: List[str], drop_terms: Sequence[str]) -> List[str]:
     if not drop_terms:
         return tokens
@@ -130,10 +163,21 @@ def _preprocess_documents(
     params: TopicModelParameters,
     drop_terms: Sequence[str],
     selected_terms: Sequence[str],
+    search_term: Optional[str],
+    require_collocated_selected: bool,
+    window_left: int,
+    window_right: int,
     cancel_event: Optional[threading.Event] = None,
 ) -> pd.DataFrame:
     drop_phrases = _prepare_phrases(drop_terms)
     selected_phrases = _prepare_phrases(selected_terms)
+    search_phrase_tokens = _prepare_phrases([search_term] if search_term else [])
+    if not search_phrase_tokens:
+        search_tokens: List[str] = []
+    else:
+        search_tokens = search_phrase_tokens[0]
+    if not selected_phrases:
+        require_collocated_selected = False
 
     rows = []
     for _, row in df.iterrows():
@@ -146,12 +190,33 @@ def _preprocess_documents(
             tokens = [tok for tok in tokens if tok not in STOPWORDS]
 
         drop_hit = _document_contains(tokens, drop_phrases)
-        select_hit = _document_contains(tokens, selected_phrases)
+        selected_positions: List[Tuple[List[str], List[int]]] = []
+        if selected_phrases:
+            for phrase in selected_phrases:
+                positions = _find_phrase_positions(tokens, phrase)
+                if positions:
+                    selected_positions.append((phrase, positions))
+        select_hit = bool(selected_positions)
 
         if params.exclude_drop_term_documents and drop_hit:
             continue
         if params.restrict_to_selected_terms and selected_phrases and not select_hit:
             continue
+
+        if require_collocated_selected:
+            if not search_tokens:
+                continue
+            search_positions = _find_phrase_positions(tokens, search_tokens)
+            if not _has_collocated_selected(
+                search_positions,
+                len(search_tokens),
+                selected_positions,
+                window_left=window_left,
+                window_right=window_right,
+            ):
+                continue
+            # When collocation is required, ensure select_hit reflects satisfaction for downstream logic.
+            select_hit = True
 
         if params.remove_drop_terms_from_tokens and drop_terms:
             tokens = _remove_drop_tokens(tokens, drop_terms)
@@ -422,6 +487,8 @@ def run_topic_model(
     selected_terms: Optional[Sequence[str]] = None,
     metadata_enabled: bool = True,
     include_article_url: bool = False,
+    window_left: Optional[int] = None,
+    window_right: Optional[int] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Optional[str]]:
     if not json_path and not geojson_path:
@@ -430,6 +497,16 @@ def run_topic_model(
         raise ValueError("Search term is required to run topic modeling.")
 
     params = params or TopicModelParameters()
+    if window_left is not None:
+        try:
+            params.collocate_window_left = int(window_left)
+        except (TypeError, ValueError):
+            pass
+    if window_right is not None:
+        try:
+            params.collocate_window_right = int(window_right)
+        except (TypeError, ValueError):
+            pass
     drop_terms = [str(term).strip() for term in drop_terms or [] if str(term).strip()]
     selected_terms = [str(term).strip() for term in selected_terms or [] if str(term).strip()]
     normalized_groups = _normalize_term_groups(term_groups)
@@ -444,6 +521,18 @@ def run_topic_model(
 
     df_filtered = _filter_df(df_raw, start_date, end_date, city, state, is_geo=is_geo)
     _check_cancel(cancel_event)
+
+    try:
+        window_left_val = max(0, int(params.collocate_window_left))
+    except (TypeError, ValueError):
+        window_left_val = 5
+    try:
+        window_right_val = max(0, int(params.collocate_window_right))
+    except (TypeError, ValueError):
+        window_right_val = 5
+
+    params.collocate_window_left = window_left_val
+    params.collocate_window_right = window_right_val
 
     metadata_common = {
         "tool": "topic_model",
@@ -462,6 +551,9 @@ def run_topic_model(
                 {"name": group["name"], "terms": list(group["terms"])} for group in normalized_groups
             ],
             "include_article_url": bool(include_article_url),
+            "require_selected_collocate": bool(params.require_selected_collocate),
+            "collocate_window_left": int(window_left_val),
+            "collocate_window_right": int(window_right_val),
         },
         "inputs": {
             "json_path": json_path,
@@ -492,6 +584,10 @@ def run_topic_model(
         params=params,
         drop_terms=drop_terms,
         selected_terms=selected_terms,
+        search_term=term,
+        require_collocated_selected=params.require_selected_collocate,
+        window_left=window_left_val,
+        window_right=window_right_val,
         cancel_event=cancel_event,
     )
     if df_prepared.empty:

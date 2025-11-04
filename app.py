@@ -2207,6 +2207,18 @@ class UpdateLocationsDialog(QDialog):
             return
         append_geojson_project_log(parent, out_paths)
 
+class SortableTableWidgetItem(QTableWidgetItem):
+    """Table item that prefers numeric sort using UserRole."""
+
+    def __lt__(self, other: 'SortableTableWidgetItem') -> bool:  # type: ignore[override]
+        if isinstance(other, QTableWidgetItem):
+            self_val = self.data(Qt.UserRole)
+            other_val = other.data(Qt.UserRole)
+            if isinstance(self_val, (int, float)) and isinstance(other_val, (int, float)):
+                return self_val < other_val
+        return super().__lt__(other)
+
+
 class CSVPreviewDialog(QDialog):
     def __init__(self, csv_path, parent=None, max_rows=100):
         super().__init__(parent)
@@ -2224,11 +2236,21 @@ class CSVPreviewDialog(QDialog):
             idx for idx, col in enumerate(df.columns) if self._is_hyperlink_column(col)
         }
 
+        topic_columns = {
+            idx
+            for idx, name in enumerate(df.columns)
+            if isinstance(name, str) and name.strip().lower() in {'topic_score', 'topic_weight'}
+        }
+
         for i, row in df.iterrows():
             for j, val in enumerate(row):
-                display = '' if pd.isna(val) else str(val)
-                item = QTableWidgetItem(display)
-                item.setData(Qt.UserRole, None if pd.isna(val) else val)
+                is_topic_metric = j in topic_columns
+                display, sort_value = self._render_value(val, numeric=is_topic_metric)
+                item = SortableTableWidgetItem(display)
+                if sort_value is not None:
+                    item.setData(Qt.UserRole, sort_value)
+                else:
+                    item.setData(Qt.UserRole, None)
                 if j in self._hyperlink_columns and display:
                     font = QFont(item.font())
                     font.setUnderline(True)
@@ -2242,6 +2264,7 @@ class CSVPreviewDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(tbl)
         tbl.setFocus()
+        tbl.setSortingEnabled(True)
         self.table = tbl
         self._dataframe = df
 
@@ -2271,6 +2294,18 @@ class CSVPreviewDialog(QDialog):
         if not qurl.isValid():
             return
         QDesktopServices.openUrl(qurl)
+
+    @staticmethod
+    def _render_value(value: Any, *, numeric: bool) -> Tuple[str, Optional[float]]:
+        if pd.isna(value):
+            return '', None
+        if not numeric:
+            return str(value), None
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return str(value), None
+        return f"{numeric_value:,.0f}", numeric_value
 
 
 class CollocationRankSettingsDialog(QDialog):
@@ -4042,7 +4077,6 @@ class CollocationDialog(QDialog):
         for button in (btn_run, btn_bar, btn_rank, btn_map_collocate):
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             collocation_buttons_layout.addWidget(button)
-        left_column.addWidget(collocation_buttons_container)
 
         drop_column = QVBoxLayout()
         drop_column.setContentsMargins(0, 0, 0, 0)
@@ -4268,6 +4302,10 @@ class CollocationDialog(QDialog):
 
         self.topic_restrict_selected_check = QCheckBox('Only include articles containing selected terms')
         self.topic_restrict_selected_check.setToolTip('Only analyze documents that contain the manually selected terms.')
+        self.topic_require_selected_collocate_check = QCheckBox('Only include articles containing collocated selected term')
+        self.topic_require_selected_collocate_check.setToolTip(
+            'Keep only documents where the search term appears within the context window of at least one selected collocate.'
+        )
         self.topic_exclude_drop_docs_check = QCheckBox('Exclude articles containing drop terms')
         self.topic_exclude_drop_docs_check.setToolTip('Skip documents that contain any drop terms.')
         self.topic_remove_drop_tokens_check = QCheckBox('Remove drop terms from tokenization')
@@ -4281,7 +4319,13 @@ class CollocationDialog(QDialog):
         topic_options_group.setAlignment(Qt.AlignLeft)
         topic_options_layout = QVBoxLayout(topic_options_group)
         topic_options_layout.setContentsMargins(12, 12, 12, 12)
-        for cb in (self.topic_restrict_selected_check, self.topic_exclude_drop_docs_check, self.topic_remove_drop_tokens_check, self.topic_include_url_check):
+        for cb in (
+            self.topic_restrict_selected_check,
+            self.topic_require_selected_collocate_check,
+            self.topic_exclude_drop_docs_check,
+            self.topic_remove_drop_tokens_check,
+            self.topic_include_url_check,
+        ):
             topic_options_layout.addWidget(cb)
         topic_options_layout.addStretch(1)
         topic_content_layout.addWidget(topic_options_group)
@@ -4313,13 +4357,23 @@ class CollocationDialog(QDialog):
         topic_column.setSpacing(12)
         topic_column.addWidget(topic_section)
         topic_column.addStretch(1)
-        topic_column.addWidget(topic_buttons_container)
 
         columns_layout.addLayout(left_column, 3)
         columns_layout.addLayout(middle_column, 3)
         columns_layout.addLayout(topic_column, 4)
         content_layout.addLayout(columns_layout)
         content_layout.addStretch(1)
+
+        collocation_buttons_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        topic_buttons_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        buttons_panel = QWidget()
+        buttons_layout = QHBoxLayout(buttons_panel)
+        buttons_layout.setContentsMargins(0, 8, 0, 0)
+        buttons_layout.setSpacing(24)
+        buttons_layout.addWidget(collocation_buttons_container, 0, Qt.AlignLeft | Qt.AlignTop)
+        buttons_layout.addStretch(1)
+        buttons_layout.addWidget(topic_buttons_container, 0, Qt.AlignRight | Qt.AlignTop)
+        layout.addWidget(buttons_panel, 0)
 
         btn_run.clicked.connect(self.run_collocate)
         btn_bar.clicked.connect(self.show_bar)
@@ -4365,7 +4419,8 @@ class CollocationDialog(QDialog):
         self.topic_max_docs_spin.valueChanged.connect(lambda *_: self._save_state())
         self.topic_min_weight_spin.valueChanged.connect(lambda *_: self._save_state())
         self.topic_doc_topics_spin.valueChanged.connect(lambda *_: self._save_state())
-        self.topic_restrict_selected_check.stateChanged.connect(lambda *_: self._save_state())
+        self.topic_restrict_selected_check.toggled.connect(self._handle_topic_restrict_selected_toggled)
+        self.topic_require_selected_collocate_check.toggled.connect(self._handle_topic_require_collocate_toggled)
         self.topic_exclude_drop_docs_check.stateChanged.connect(lambda *_: self._save_state())
         self.topic_remove_drop_tokens_check.stateChanged.connect(lambda *_: self._save_state())
         self.topic_include_url_check.stateChanged.connect(lambda *_: self._save_state())
@@ -4966,9 +5021,12 @@ class CollocationDialog(QDialog):
             'min_topic_weight': round(self.topic_min_weight_spin.value(), 2),
             'max_topics_per_document': self.topic_doc_topics_spin.value(),
             'restrict_selected': self.topic_restrict_selected_check.isChecked(),
+            'require_selected_collocate': self.topic_require_selected_collocate_check.isChecked(),
             'exclude_drop_docs': self.topic_exclude_drop_docs_check.isChecked(),
             'remove_drop_tokens': self.topic_remove_drop_tokens_check.isChecked(),
             'include_article_url': self.topic_include_url_check.isChecked(),
+            'collocate_window_left': self.context_left_spin.value(),
+            'collocate_window_right': self.context_right_spin.value(),
         }
 
 
@@ -4996,6 +5054,18 @@ class CollocationDialog(QDialog):
             max_df_numeric = 0.05
         if max_df_numeric > 1.0:
             max_df_numeric = 1.0
+        left_default = self.context_left_spin.value() if hasattr(self, 'context_left_spin') else 5
+        right_default = self.context_right_spin.value() if hasattr(self, 'context_right_spin') else 5
+
+        def _safe_window(value: Any, default: int) -> int:
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                return max(0, int(default))
+
+        window_left_val = _safe_window(settings.get('collocate_window_left'), left_default)
+        window_right_val = _safe_window(settings.get('collocate_window_right'), right_default)
+
         params = TopicModelParameters(
             model=str(settings.get('model', 'lda') or 'lda'),
             n_topics=int(settings.get('n_topics', 10)),
@@ -5006,10 +5076,17 @@ class CollocationDialog(QDialog):
             max_documents=max_docs_val if max_docs_val > 0 else None,
             drop_stopwords=drop_stopwords,
             restrict_to_selected_terms=bool(settings.get('restrict_selected') and selected_terms),
+            require_selected_collocate=bool(
+                settings.get('require_selected_collocate')
+                and settings.get('restrict_selected')
+                and selected_terms
+            ),
             exclude_drop_term_documents=bool(settings.get('exclude_drop_docs') and drop_terms),
             remove_drop_terms_from_tokens=bool(settings.get('remove_drop_tokens') and drop_terms),
             min_topic_weight=float(settings.get('min_topic_weight', 0.05)),
             max_topics_per_document=int(settings.get('max_topics_per_document', 3)),
+            collocate_window_left=window_left_val,
+            collocate_window_right=window_right_val,
         )
         return params
 
@@ -5080,6 +5157,7 @@ class CollocationDialog(QDialog):
         _set_int_spin(self.topic_doc_topics_spin, settings.get('max_topics_per_document'))
 
         self.topic_restrict_selected_check.setChecked(bool(settings.get('restrict_selected')))
+        self.topic_require_selected_collocate_check.setChecked(bool(settings.get('require_selected_collocate')))
         self.topic_exclude_drop_docs_check.setChecked(bool(settings.get('exclude_drop_docs')))
         self.topic_remove_drop_tokens_check.setChecked(bool(settings.get('remove_drop_tokens', True)))
         self.topic_include_url_check.setChecked(bool(settings.get('include_article_url', True)))
@@ -5092,6 +5170,13 @@ class CollocationDialog(QDialog):
             self.topic_restrict_selected_check.setChecked(False)
             self.topic_restrict_selected_check.blockSignals(False)
         self.topic_restrict_selected_check.setEnabled(has_selected)
+
+        allow_collocate_filter = has_selected and self.topic_restrict_selected_check.isChecked()
+        if not allow_collocate_filter and self.topic_require_selected_collocate_check.isChecked():
+            self.topic_require_selected_collocate_check.blockSignals(True)
+            self.topic_require_selected_collocate_check.setChecked(False)
+            self.topic_require_selected_collocate_check.blockSignals(False)
+        self.topic_require_selected_collocate_check.setEnabled(allow_collocate_filter)
 
         has_drop = bool(self._get_parent_drop_terms())
         if not has_drop and self.topic_exclude_drop_docs_check.isChecked():
@@ -5107,6 +5192,22 @@ class CollocationDialog(QDialog):
             self.topic_remove_drop_tokens_check.setEnabled(False)
         else:
             self.topic_remove_drop_tokens_check.setEnabled(True)
+
+    def _handle_topic_restrict_selected_toggled(self, checked: bool):
+        if not checked and self.topic_require_selected_collocate_check.isChecked():
+            self.topic_require_selected_collocate_check.blockSignals(True)
+            self.topic_require_selected_collocate_check.setChecked(False)
+            self.topic_require_selected_collocate_check.blockSignals(False)
+        self._update_topic_toggle_states()
+        self._save_state()
+
+    def _handle_topic_require_collocate_toggled(self, checked: bool):
+        if checked and not self.topic_restrict_selected_check.isChecked():
+            self.topic_restrict_selected_check.blockSignals(True)
+            self.topic_restrict_selected_check.setChecked(True)
+            self.topic_restrict_selected_check.blockSignals(False)
+        self._update_topic_toggle_states()
+        self._save_state()
 
     def _handle_topic_section_toggle(self, checked: bool):
         if not self._base_height:
@@ -5437,6 +5538,7 @@ class CollocationDialog(QDialog):
             self.drop_terms_view.setHtml(body)
         else:
             self.drop_terms_view.setHtml('<span style="color:#777777;">(none)</span>')
+        self._set_section_badge(self._drop_section_button, count)
         if count > 0 and self._drop_terms_prev_count == 0:
             if not self.topic_remove_drop_tokens_check.isChecked():
                 self.topic_remove_drop_tokens_check.blockSignals(True)
@@ -5462,6 +5564,7 @@ class CollocationDialog(QDialog):
             self.selected_summary_label.setText('No terms selected.')
             self.selected_terms_view.setHtml('<span style="color:#777777;">(none)</span>')
             self.clear_selected_btn.setEnabled(False)
+        self._set_section_badge(self._selected_section_button, count)
         if count == 0:
             if self._selected_section_button is not None and self._selected_section_button.isChecked():
                 self._selected_section_button.setChecked(False)
@@ -5506,6 +5609,8 @@ class CollocationDialog(QDialog):
         else:
             body = '<span style="color:#777777;">(none)</span>'
         self.group_terms_view.setHtml(body)
+        badge_count = term_total if term_total > 0 else count
+        self._set_section_badge(self._group_section_button, badge_count)
         if count == 0:
             if self._group_section_button is not None and self._group_section_button.isChecked():
                 self._group_section_button.setChecked(False)
@@ -5518,7 +5623,7 @@ class CollocationDialog(QDialog):
             return []
         terms: List[str] = []
         seen: Set[str] = set()
-        for piece in re.split(r'[;,\\n]', raw):
+        for piece in re.split(r'[;,\r\n\t]+', raw):
             term = piece.strip()
             if not term:
                 continue
@@ -5920,7 +6025,8 @@ class CollocationDialog(QDialog):
         section_layout.setSpacing(0)
 
         toggle = QToolButton(section)
-        toggle.setText(title)
+        toggle._base_title = title  # type: ignore[attr-defined]
+        self._set_section_badge(toggle, 0)
         toggle.setCheckable(True)
         toggle.setChecked(expanded)
         toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -5945,6 +6051,15 @@ class CollocationDialog(QDialog):
 
         toggle.toggled.connect(handle_toggle)
         return section, toggle
+
+    def _set_section_badge(self, toggle: Optional[QToolButton], count: int):
+        if toggle is None:
+            return
+        base_title = str(getattr(toggle, '_base_title', toggle.text()))
+        if count > 0:
+            toggle.setText(f'{base_title} ({count})')
+        else:
+            toggle.setText(base_title)
 
     def _confirm_overwrite_if_needed(self, paths: dict) -> bool:
         existing = [p for p in (paths.get('metrics'), paths.get('occurrences')) if p and os.path.exists(p)]
@@ -6292,6 +6407,8 @@ class CollocationDialog(QDialog):
 
         time_bin_unit = self._current_time_bin_unit()
         metadata_enabled = getattr(parent, 'metadata_enabled', True)
+        window_left = self.context_left_spin.value()
+        window_right = self.context_right_spin.value()
 
         def task(*, cancel_event: Optional[threading.Event]):
             return run_topic_model(
@@ -6310,6 +6427,8 @@ class CollocationDialog(QDialog):
                 include_article_url=include_urls,
                 metadata_enabled=metadata_enabled,
                 cancel_event=cancel_event,
+                window_left=window_left,
+                window_right=window_right,
                 **source_kwargs,
             )
 
@@ -6654,6 +6773,8 @@ class CollocationDialog(QDialog):
         if not time_bin_unit:
             QMessageBox.warning(self, 'Invalid Bin Size', 'Enter a valid bin size and time unit to plot topic trends.')
             return
+        start_value = self.start_input.text().strip()
+        end_value = self.end_input.text().strip()
         city_text = self.city_combo.currentText()
         state_text = self.state_combo.currentText()
         city = None if not city_text or city_text == 'All Cities' else city_text.strip()
@@ -6673,8 +6794,8 @@ class CollocationDialog(QDialog):
         if not target_path:
             paths = self._build_topic_output_paths_topic(
                 term,
-                self.start_input.text().strip() or None,
-                self.end_input.text().strip() or None,
+                start_value or None,
+                end_value or None,
                 city,
                 state,
                 params,
@@ -6709,6 +6830,30 @@ class CollocationDialog(QDialog):
         }
         self._save_state()
 
+        metric_messages = {
+            'weight_sum': 'Topic Weight',
+            'ordinal_rank': 'Average Topic Rank',
+            'doc_count': 'Article Count',
+        }
+        metric_label = metric_messages.get(metric_choice, metric_choice)
+        city_display = city_text.strip() if city_text and city_text.strip() and city_text.strip() != 'All Cities' else 'All Cities'
+        state_display = state_text.strip() if state_text and state_text.strip() and state_text.strip() != 'All States' else 'All States'
+        start_display = start_value or 'All dates'
+        end_display = end_value or 'All dates'
+        time_unit_display = f"Time Bin: {time_bin_unit}"
+        settings_text = self._build_topic_trend_summary(
+            keyword=term,
+            model_label=params.model.upper(),
+            trained_topics=params.n_topics,
+            top_topics=top_topics,
+            metric_label=metric_label,
+            city_label=city_display,
+            state_label=state_display,
+            start_label=start_display,
+            end_label=end_display,
+            time_unit=time_unit_display,
+        )
+
         try:
             plot_topics = _import_plot_topics_over_time()
             fig = plot_topics(
@@ -6718,6 +6863,7 @@ class CollocationDialog(QDialog):
                 show_legend=legend_topics,
                 label_points=label_points,
                 log_scale=log_scale,
+                settings_text=settings_text,
             )
         except Exception as exc:
             QMessageBox.critical(self, 'Plot Error', str(exc))
@@ -7082,6 +7228,29 @@ class CollocationDialog(QDialog):
         line2 = f"City filter: {city_label} | State filter: {state_label}"
         line3 = f"Dates: {start_label} – {end_label} | {time_unit or 'Time Bin: n/a'}"
         return '\n'.join([line1, line2, line3])
+
+    def _build_topic_trend_summary(
+        self,
+        *,
+        keyword: str,
+        model_label: str,
+        trained_topics: int,
+        top_topics: int,
+        metric_label: str,
+        city_label: str,
+        state_label: str,
+        start_label: str,
+        end_label: str,
+        time_unit: str,
+    ) -> str:
+        keyword_display = keyword or '(none)'
+        parts = [
+            f"Keyword: {keyword_display} | Model: {model_label} | Topics trained: {trained_topics}",
+            f"Top topics plotted: {top_topics} | Metric: {metric_label}",
+            f"City filter: {city_label} | State filter: {state_label}",
+            f"Dates: {start_label} – {end_label} | {time_unit}",
+        ]
+        return '\n'.join(parts)
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
