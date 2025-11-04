@@ -456,7 +456,7 @@ class MainWindow(QMainWindow):
         self.search_log_history = []
         self.project_log_entries = []
         self.project_file = None
-        self.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}}
+        self.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}, 'topic_trend_settings': {}}
         self.collocation_drop_terms = []
         self.collocation_term_groups: List[dict] = []
         self.map_settings = _default_map_settings()
@@ -761,7 +761,7 @@ class MainWindow(QMainWindow):
         self.locations_csv_path = None
         self.search_log_history.clear()
         self.project_log_entries.clear()
-        self.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}}
+        self.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}, 'topic_trend_settings': {}}
         self.collocation_drop_terms = []
         self.collocation_term_groups = []
         self.map_settings = _default_map_settings()
@@ -1322,7 +1322,7 @@ class DownloadDialog(QDialog):
             parent.geojson_file = out_paths[-1]
             if parent.locations_csv_path and not os.path.samefile(parent.locations_csv_path, csv_path):
                 parent.locations_csv_path = csv_path
-            parent.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}}
+            parent.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}, 'topic_trend_settings': {}}
             parent.collocation_drop_terms = []
             parent._update_loaded_file_labels()
         return out_paths
@@ -1910,7 +1910,7 @@ class DownloadDialog(QDialog):
             p = self.parent()
             p.json_file = last_json
             p._update_loaded_file_labels()
-            p.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}}
+            p.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}, 'topic_trend_settings': {}}
             p.collocation_drop_terms = []
 
         total_articles = 0
@@ -2435,12 +2435,97 @@ class CollocationRankSettingsDialog(QDialog):
         preview = ', '.join(self._drop_terms[:3])
         if len(self._drop_terms) > 3:
             preview += ', …'
-        count = len(self._drop_terms)
-        self.drop_terms_label.setText(
-            f'Drop terms active ({count}): {html.escape(preview)}. The chart applies these after you click OK.'
-        )
+        self.drop_terms_label.setText(f'Drop terms active ({len(self._drop_terms)}): {html.escape(preview)}')
 
 
+class TopicTrendsSettingsDialog(QDialog):
+    METRIC_OPTIONS = [
+        ('Topic Weight (sum)', 'weight_sum'),
+        ('Topic Rank (by weight)', 'ordinal_rank'),
+        ('Article Count', 'doc_count'),
+    ]
+
+    def __init__(self, parent, *, defaults: Optional[dict], max_topics: int):
+        super().__init__(parent)
+        self.setWindowTitle('Topic Trend Settings')
+        layout = QVBoxLayout(self)
+
+        defaults = dict(defaults or {})
+        max_topics = max(1, int(max_topics or 1))
+        default_top = int(defaults.get('top_topics') or min(12, max_topics))
+        default_top = max(1, min(default_top, max_topics))
+        default_metric = str(defaults.get('metric') or 'weight_sum')
+        default_log = bool(defaults.get('log_scale')) if 'log_scale' in defaults else (default_metric == 'ordinal_rank')
+        default_legend = bool(defaults.get('legend_topics', True))
+        default_labels = bool(defaults.get('label_points', True))
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft)
+        form.setFormAlignment(Qt.AlignLeft)
+        form.setSpacing(6)
+
+        self.topics_spin = QSpinBox()
+        self.topics_spin.setRange(1, max_topics)
+        self.topics_spin.setValue(default_top)
+        form.addRow('Topics to display:', self.topics_spin)
+
+        self.metric_combo = QComboBox()
+        for label, value in self.METRIC_OPTIONS:
+            self.metric_combo.addItem(label, value)
+        metric_index = next((idx for idx, (_, val) in enumerate(self.METRIC_OPTIONS) if val == default_metric), 0)
+        self.metric_combo.setCurrentIndex(metric_index)
+        form.addRow('Metric to plot:', self.metric_combo)
+
+        self.log_scale_check = QCheckBox('Use log scale')
+        self.log_scale_check.setChecked(default_log)
+        form.addRow('', self.log_scale_check)
+
+        layout.addLayout(form)
+
+        self.legend_check = QCheckBox('Show legend with topic names')
+        self.legend_check.setChecked(default_legend)
+        layout.addWidget(self.legend_check)
+
+        self.label_points_check = QCheckBox('Label final points with topic text')
+        self.label_points_check.setChecked(default_labels)
+        layout.addWidget(self.label_points_check)
+
+        layout.addStretch(1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._log_scale_user_changed = 'log_scale' in defaults
+        self.metric_combo.currentIndexChanged.connect(self._handle_metric_change)
+        self.log_scale_check.stateChanged.connect(self._handle_log_scale_changed)
+        self._handle_metric_change()
+
+    def _handle_metric_change(self):
+        metric = self.metric_combo.currentData()
+        if metric == 'ordinal_rank':
+            if not self._log_scale_user_changed:
+                self.log_scale_check.blockSignals(True)
+                self.log_scale_check.setChecked(True)
+                self.log_scale_check.blockSignals(False)
+        else:
+            if not self._log_scale_user_changed:
+                self.log_scale_check.blockSignals(True)
+                self.log_scale_check.setChecked(False)
+                self.log_scale_check.blockSignals(False)
+
+    def _handle_log_scale_changed(self, _state: int):
+        self._log_scale_user_changed = True
+
+    def values(self) -> dict:
+        return {
+            'top_topics': self.topics_spin.value(),
+            'metric': self.metric_combo.currentData(),
+            'log_scale': self.log_scale_check.isChecked(),
+            'legend_topics': self.legend_check.isChecked(),
+            'label_points': self.label_points_check.isChecked(),
+        }
 
 class CollocateMapSettingsDialog(QDialog):
     def __init__(
@@ -3781,6 +3866,7 @@ class CollocationDialog(QDialog):
         self._operation_context: Optional[str] = None
         self._operation_cancel_message: Optional[str] = None
         self._base_height: int = 0
+        self._topic_trend_settings: Dict[str, Any] = {}
 
         mode_row = QHBoxLayout()
         mode_row.setContentsMargins(0, 0, 0, 0)
@@ -3946,7 +4032,7 @@ class CollocationDialog(QDialog):
 
         btn_run = QPushButton('Run Collocation')
         btn_bar = QPushButton('Show Bar Chart')
-        btn_rank = QPushButton('Plot Rank Trends')
+        btn_rank = QPushButton('Plot Collocate Rank Trends')
         btn_map_collocate = QPushButton('Create Collocate‑Rank Map')
 
         collocation_buttons_container = QWidget()
@@ -4534,6 +4620,7 @@ class CollocationDialog(QDialog):
                 collocate_rank_colorize=bool(map_settings.get('colorize')),
                 collocate_time_slider=enable_time_slider,
                 collocate_map_variant=map_type,
+                collocate_search_term=term,
                 metadata_enabled=getattr(parent, 'metadata_enabled', True),
                 project_dir=parent.project_folder if parent else None,
                 time_start_override=start_value or None,
@@ -4607,7 +4694,7 @@ class CollocationDialog(QDialog):
         # Update source label text
         self.source_label.setText(self._source_text())
         if parent is not None:
-                parent.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}}
+                parent.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}, 'topic_trend_settings': {}}
         self._last_output_paths = None
         self._rank_selected_terms = []
         self._update_selected_terms_summary()
@@ -4761,6 +4848,11 @@ class CollocationDialog(QDialog):
             self._apply_topic_state(topic_settings)
         else:
             self._update_topic_toggle_states()
+        trend_settings = state.get('topic_trend_settings')
+        if isinstance(trend_settings, dict):
+            self._topic_trend_settings = dict(trend_settings)
+        else:
+            self._topic_trend_settings = {}
 
     def _prefill_from_current_source(self, reset_state: bool = False):
         parent = self.parent()
@@ -5943,6 +6035,7 @@ class CollocationDialog(QDialog):
             'rank_selected_terms': list(self._rank_selected_terms),
             'rank_log_scale': bool(getattr(self, '_rank_log_scale', True)),
             'topic_settings': self._collect_topic_settings(),
+            'topic_trend_settings': dict(self._topic_trend_settings or {}),
         }
         parent.collocation_state = state
 
@@ -6595,10 +6688,37 @@ class CollocationDialog(QDialog):
             QMessageBox.information(self, 'Data Not Found', 'Run the topic model with time binning to generate trends first.')
             return
 
+        defaults = dict(self._topic_trend_settings or {})
+        max_topics_available = max(1, params.n_topics)
+        dialog = TopicTrendsSettingsDialog(self, defaults=defaults, max_topics=max_topics_available)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        trend_settings = dialog.values()
+        top_topics = int(trend_settings.get('top_topics') or max_topics_available)
+        top_topics = max(1, min(top_topics, max_topics_available))
+        metric_choice = str(trend_settings.get('metric') or 'weight_sum')
+        legend_topics = bool(trend_settings.get('legend_topics', True))
+        label_points = bool(trend_settings.get('label_points', True))
+        log_scale = bool(trend_settings.get('log_scale'))
+        self._topic_trend_settings = {
+            'top_topics': top_topics,
+            'metric': metric_choice,
+            'legend_topics': legend_topics,
+            'label_points': label_points,
+            'log_scale': log_scale,
+        }
+        self._save_state()
+
         try:
             plot_topics = _import_plot_topics_over_time()
-            top_n = min(max(1, params.n_topics), 12)
-            fig = plot_topics(target_path, top_n=top_n)
+            fig = plot_topics(
+                target_path,
+                top_n=top_topics,
+                metric=metric_choice,
+                show_legend=legend_topics,
+                label_points=label_points,
+                log_scale=log_scale,
+            )
         except Exception as exc:
             QMessageBox.critical(self, 'Plot Error', str(exc))
             return

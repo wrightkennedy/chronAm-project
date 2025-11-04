@@ -200,31 +200,54 @@ def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
         return fig
 
 
-def plot_topics_over_time(df_or_path: Union[str, pd.DataFrame],
-                          output_path: Optional[str] = None,
-                          top_n: Optional[int] = 10,
-                          weight_field: str = "weight_sum"):
-    """
-    Plot topic weight trajectories across time bins.
-
-    Parameters
-    ----------
-    df_or_path : str or DataFrame
-        Expected columns: time_bin, topic_id, weight_sum (default) and optional topic_label.
-    output_path : str, optional
-        If provided, chart is saved to this path instead of shown.
-    top_n : int, optional
-        Limit to the top-N topics by aggregate weight. If None, plot all topics.
-    weight_field : str
-        Column representing topic weight per time bin. Defaults to 'weight_sum'.
-    """
+def plot_topics_over_time(
+    df_or_path: Union[str, pd.DataFrame],
+    output_path: Optional[str] = None,
+    top_n: Optional[int] = 10,
+    metric: str = "weight_sum",
+    show_legend: bool = True,
+    label_points: bool = False,
+    log_scale: bool = False,
+):
+    """Plot topic statistics across time bins."""
     plt = _ensure_pyplot()
     df = _load_df(df_or_path)
-    required = {"time_bin", "topic_id", weight_field}
-    if not required.issubset(df.columns):
-        raise ValueError(f"Data must contain columns: {', '.join(sorted(required))}")
     if df.empty:
         raise ValueError("No topic data to plot.")
+
+    metric = (metric or "weight_sum").strip().lower()
+    metric_map = {
+        "weight_sum": {
+            "column": "weight_sum",
+            "label": "Topic Weight",
+            "title": "Topic Weight over Time",
+            "ascending": False,
+            "invert": False,
+        },
+        "ordinal_rank": {
+            "column": "ordinal_rank",
+            "label": "Topic Rank (1 = top)",
+            "title": "Topic Rank over Time",
+            "ascending": True,
+            "invert": True,
+        },
+        "doc_count": {
+            "column": "doc_count",
+            "label": "Article Count",
+            "title": "Topic Article Counts over Time",
+            "ascending": False,
+            "invert": False,
+        },
+    }
+    if metric not in metric_map:
+        valid = ", ".join(metric_map.keys())
+        raise ValueError(f"Unsupported metric '{metric}'. Choose from: {valid}")
+    metric_info = metric_map[metric]
+    metric_field = metric_info["column"]
+
+    required = {"time_bin", "topic_id", metric_field}
+    if not required.issubset(df.columns):
+        raise ValueError(f"Data must contain columns: {', '.join(sorted(required))}")
 
     df = df.copy()
     df["topic_id"] = df["topic_id"].astype(int)
@@ -233,12 +256,13 @@ def plot_topics_over_time(df_or_path: Union[str, pd.DataFrame],
     else:
         df["topic_label"] = df["topic_id"].map(lambda tid: f"Topic {tid}")
 
-    # Determine time bin order
     try:
-        bins_ordered = sorted(df["time_bin"].dropna().unique(), key=lambda x: pd.to_datetime(str(x), errors="coerce"))
+        bins_ordered = sorted(
+            df["time_bin"].dropna().unique(),
+            key=lambda x: pd.to_datetime(str(x), errors="coerce"),
+        )
     except Exception:
         bins_ordered = list(df["time_bin"].dropna().unique())
-
     if not bins_ordered:
         bins_ordered = list(df["time_bin"].unique())
 
@@ -246,30 +270,82 @@ def plot_topics_over_time(df_or_path: Union[str, pd.DataFrame],
     if df.empty:
         raise ValueError("Time bin data is empty after filtering.")
 
-    # Limit to top topics if requested
-    if top_n is not None and top_n > 0:
-        totals = (
-            df.groupby(["topic_id", "topic_label"], as_index=False)[weight_field]
-            .sum()
-            .sort_values(weight_field, ascending=False)
-        )
-        top_topics = totals.head(top_n)["topic_id"].tolist()
-        df = df[df["topic_id"].isin(top_topics)]
+    def _shorten(text: str, limit: int) -> str:
+        text = (text or "").strip()
+        if not text:
+            return ""
+        return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
-    pivot = df.pivot_table(index="time_bin", columns="topic_label", values=weight_field, aggfunc="sum").fillna(0.0)
-    pivot = pivot.reindex(bins_ordered).fillna(0.0)
+    grouped = df.groupby(["topic_id", "topic_label"], as_index=False)[metric_field]
+    if metric == "ordinal_rank":
+        totals = grouped.mean().sort_values(metric_field, ascending=True)
+    else:
+        totals = grouped.sum().sort_values(metric_field, ascending=metric_info["ascending"])
+
+    if top_n is not None and top_n > 0:
+        top_topics = totals.head(top_n)["topic_id"].tolist()
+    else:
+        top_topics = totals["topic_id"].tolist()
+
+    df = df[df["topic_id"].isin(top_topics)]
+    if df.empty:
+        raise ValueError("No topic data remains after filtering top topics.")
+
+    label_map = df.groupby("topic_id")["topic_label"].first().to_dict()
+
+    pivot = df.pivot_table(
+        index="time_bin",
+        columns="topic_id",
+        values=metric_field,
+        aggfunc="first",
+    ).reindex(bins_ordered)
+    if metric in ("weight_sum", "doc_count"):
+        pivot = pivot.fillna(0.0)
+
+    ordered_topics = [tid for tid in top_topics if tid in pivot.columns]
+    if not ordered_topics:
+        ordered_topics = [col for col in pivot.columns if col in totals["topic_id"].tolist()]
+    if not ordered_topics:
+        raise ValueError("No topics available to plot.")
 
     fig, ax = plt.subplots()
-    x = np.arange(len(pivot.index))
-    for idx, column in enumerate(pivot.columns, start=1):
-        ax.plot(x, pivot[column], marker="o", label=column)
+    positions = np.arange(len(bins_ordered))
+    handles: List = []
+    legend_labels: List[str] = []
 
-    ax.set_xticks(x)
-    ax.set_xticklabels([str(b) for b in pivot.index], rotation=45 if len(pivot.index) > 6 else 0)
-    ax.set_ylabel("Topic Weight")
+    for topic_id in ordered_topics:
+        series = pivot[topic_id].to_numpy(dtype=float)
+        mask = ~np.isnan(series)
+        if not mask.any():
+            continue
+        xs = positions[mask]
+        ys = series[mask]
+        line, = ax.plot(positions, series, marker="o")
+        topic_label = label_map.get(topic_id) or f"Topic {topic_id}"
+        legend_label = f"{topic_id}: {_shorten(topic_label, 20) or f'Topic {topic_id}'}"
+        if show_legend:
+            handles.append(line)
+            legend_labels.append(legend_label)
+        if label_points and xs.size:
+            final_x = xs[-1]
+            final_y = ys[-1]
+            point_label = _shorten(topic_label, 12) or f"Topic {topic_id}"
+            ax.text(final_x + 0.1, final_y, point_label, fontsize=8, ha="left", va="bottom")
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels([str(b) for b in bins_ordered], rotation=45 if len(bins_ordered) > 6 else 0)
+    if log_scale:
+        ax.set_yscale("log")
+    if metric_info["invert"]:
+        ax.invert_yaxis()
     ax.set_xlabel("Time Bin")
-    ax.set_title("Topic Weights over Time")
-    ax.legend(title="Topic", bbox_to_anchor=(1.02, 1), loc="upper left")
+    ax.set_ylabel(metric_info["label"])
+    ax.set_title(metric_info["title"])
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
+
+    if show_legend and handles:
+        ax.legend(handles, legend_labels, title="Topic", bbox_to_anchor=(1.02, 1), loc="upper left")
+
     plt.tight_layout()
 
     if output_path:

@@ -1554,6 +1554,7 @@ def create_map(
     collocate_time_slider: bool = False,
     collocate_rank_terms: Optional[List[str]] = None,
     collocate_map_variant: str = 'rank',
+    collocate_search_term: Optional[str] = None,
     metadata_enabled: bool = False,
     project_dir: Optional[str] = None,
     time_start_override: Optional[str] = None,
@@ -1639,7 +1640,8 @@ def create_map(
         entry['_popup_row_id'] = _sanitize_element_id(f'feature-row-{idx}')
     groups = _group_points(pts, cancel_event=cancel_event)
     _check_cancel(cancel_event)
-    search_term = _detect_search_term(geojson_path, data)
+    override_term = (collocate_search_term or '').strip()
+    search_term = override_term or _detect_search_term(geojson_path, data)
 
     start_override = (time_start_override or '').strip()
     end_override = (time_end_override or '').strip()

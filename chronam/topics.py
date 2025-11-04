@@ -263,7 +263,7 @@ def _write_empty_outputs(
             metadata_paths["doc_topics"] = meta_path
     if by_time_path:
         os.makedirs(os.path.dirname(by_time_path), exist_ok=True)
-        pd.DataFrame(columns=["time_bin", "topic_id", "weight_sum", "doc_count", "ordinal_rank"]).to_csv(by_time_path, index=False)
+        pd.DataFrame(columns=["time_bin", "topic_id", "weight_sum", "doc_count", "ordinal_rank", "topic_label"]).to_csv(by_time_path, index=False)
         meta = dict(metadata_common)
         meta.update({"output_type": "topics_by_time_csv", "row_count": 0})
         meta_path = write_metadata_file(project_dir, by_time_path, meta, enabled=metadata_enabled)
@@ -387,7 +387,11 @@ def _build_topics_by_time(doc_topics: pd.DataFrame, cancel_event: Optional[threa
 
     grouped = (
         working.groupby(["time_bin", "topic_id"], as_index=False)
-        .agg(weight_sum=("weight", "sum"), doc_count=("article_id", "nunique"))
+        .agg(
+            weight_sum=("weight", "sum"),
+            doc_count=("article_id", "nunique"),
+            topic_label=("topic_label", "first"),
+        )
     )
     _check_cancel(cancel_event)
     grouped["ordinal_rank"] = (
@@ -396,6 +400,7 @@ def _build_topics_by_time(doc_topics: pd.DataFrame, cancel_event: Optional[threa
         .cumcount()
         + 1
     )
+    grouped["topic_label"] = grouped["topic_label"].fillna("").astype(str)
     return grouped
 
 
