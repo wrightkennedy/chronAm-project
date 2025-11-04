@@ -23,7 +23,7 @@ from PyQt5.QtCore import (
     pyqtSignal,
     QSize,
 )
-from PyQt5.QtGui import QDesktopServices, QIntValidator, QKeySequence, QPainter, QPen, QTextCursor
+from PyQt5.QtGui import QDesktopServices, QIntValidator, QKeySequence, QPainter, QPen, QTextCursor, QColor, QFont
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -34,6 +34,7 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox,
     QDockWidget,
     QDoubleSpinBox,
+    QAbstractItemView,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -49,6 +50,7 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSizePolicy,
     QStyle,
     QToolButton,
@@ -2213,13 +2215,62 @@ class CSVPreviewDialog(QDialog):
         df = pd.read_csv(csv_path).head(max_rows)
         tbl = QTableWidget(df.shape[0], df.shape[1], self)
         tbl.setHorizontalHeaderLabels(list(df.columns))
+        tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        tbl.setSelectionMode(QAbstractItemView.SingleSelection)
+        tbl.setAlternatingRowColors(True)
+
+        self._hyperlink_columns = {
+            idx for idx, col in enumerate(df.columns) if self._is_hyperlink_column(col)
+        }
+
         for i, row in df.iterrows():
             for j, val in enumerate(row):
-                tbl.setItem(i, j, QTableWidgetItem(str(val)))
+                display = '' if pd.isna(val) else str(val)
+                item = QTableWidgetItem(display)
+                item.setData(Qt.UserRole, None if pd.isna(val) else val)
+                if j in self._hyperlink_columns and display:
+                    font = QFont(item.font())
+                    font.setUnderline(True)
+                    item.setFont(font)
+                    item.setForeground(QColor(17, 85, 204))
+                    item.setToolTip('Open link in browser')
+                tbl.setItem(i, j, item)
+
+        if self._hyperlink_columns:
+            tbl.cellActivated.connect(self._handle_link_activation)
         layout = QVBoxLayout(self)
         layout.addWidget(tbl)
         tbl.setFocus()
         self.table = tbl
+        self._dataframe = df
+
+    @staticmethod
+    def _is_hyperlink_column(name: str) -> bool:
+        if not name:
+            return False
+        lowered = str(name).strip().lower()
+        tokens = {'url', 'link', 'href'}
+        return any(token in lowered for token in tokens)
+
+    def _handle_link_activation(self, row: int, column: int):
+        if column not in self._hyperlink_columns:
+            return
+        item = self.table.item(row, column)
+        if item is None:
+            return
+        raw = item.data(Qt.UserRole)
+        if not raw:
+            return
+        url = str(raw).strip()
+        if not url:
+            return
+        if not re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', url):
+            url = 'https://' + url
+        qurl = QUrl(url)
+        if not qurl.isValid():
+            return
+        QDesktopServices.openUrl(qurl)
 
 
 class CollocationRankSettingsDialog(QDialog):
@@ -3706,8 +3757,12 @@ class CollocationDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Text Analysis')
-        self.setMinimumSize(620, 580)
+        self.setMinimumSize(960, 720)
+        self.resize(1200, 820)
+        self.setSizeGripEnabled(True)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
         self._last_output_paths = None
         self._last_topic_paths = None
         self._preview_windows = []
@@ -3727,8 +3782,9 @@ class CollocationDialog(QDialog):
         self._operation_cancel_message: Optional[str] = None
         self._base_height: int = 0
 
-        # --- Source selection & status line ---
         mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        mode_row.setSpacing(8)
         self.mode_json = QRadioButton('Use JSON results')
         self.mode_geo = QRadioButton('Use GeoJSON')
         self.mode_group = QButtonGroup(self)
@@ -3740,7 +3796,6 @@ class CollocationDialog(QDialog):
         info_icon.setPixmap(self.style().standardIcon(QStyle.SP_MessageBoxInformation).pixmap(16, 16))
         mode_row.addWidget(info_icon, 0, Qt.AlignVCenter)
 
-        # Default selection based on loaded files (prefer JSON for speed)
         json_available = getattr(parent, 'json_file', None)
         geo_available = getattr(parent, 'geojson_file', None)
         if json_available:
@@ -3755,49 +3810,61 @@ class CollocationDialog(QDialog):
 
         self.choose_btn = QPushButton('Choose File…')
         mode_row.addWidget(self.choose_btn)
-        layout.addLayout(mode_row)
+
+        top_controls = QWidget()
+        top_controls_layout = QVBoxLayout(top_controls)
+        top_controls_layout.setContentsMargins(0, 0, 0, 0)
+        top_controls_layout.setSpacing(6)
+        top_controls_layout.addLayout(mode_row)
 
         self.source_label = QLabel(self._source_text())
-        self.source_label.setStyleSheet("font-weight: 600;")
-        layout.addWidget(self.source_label)
+        self.source_label.setStyleSheet('font-weight: 600;')
+        top_controls_layout.addWidget(self.source_label)
+        layout.addWidget(top_controls)
 
-        # Connect mode toggles and file chooser
         self.mode_geo.toggled.connect(lambda _: self.source_label.setText(self._source_text()))
         self.mode_json.toggled.connect(lambda _: self.source_label.setText(self._source_text()))
         self.mode_geo.toggled.connect(self.on_mode_toggle)
         self.mode_json.toggled.connect(self.on_mode_toggle)
         self.choose_btn.clicked.connect(self.choose_source_file)
 
-        # 2) Parameter form layout
-        form = QFormLayout()
+        scroll_area = QScrollArea()
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        layout.addWidget(scroll_area, 1)
 
-        # City filter (dropdown)
+        content_widget = QWidget()
+        scroll_area.setWidget(content_widget)
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(18)
+
+        form = QFormLayout()
         self.city_combo = QComboBox()
         self.city_combo.addItem('All Cities')
-        city_row = QWidget(); city_layout = QHBoxLayout(city_row)
+        city_row = QWidget()
+        city_layout = QHBoxLayout(city_row)
         city_layout.setContentsMargins(0, 0, 0, 0)
         city_layout.addWidget(self.city_combo)
         form.addRow('City:', city_row)
 
-        # State filter (dropdown)
         self.state_combo = QComboBox()
         self.state_combo.addItem('All States')
-        state_row = QWidget(); state_layout = QHBoxLayout(state_row)
+        state_row = QWidget()
+        state_layout = QHBoxLayout(state_row)
         state_layout.setContentsMargins(0, 0, 0, 0)
         state_layout.addWidget(self.state_combo)
         form.addRow('State:', state_row)
 
-        # Date range inputs
         self.start_input = QLineEdit()
         self.end_input = QLineEdit()
         form.addRow('Start Date:', self.start_input)
         form.addRow('End Date:', self.end_input)
 
-        # Search term input
         self.term_input = QLineEdit()
         form.addRow('Search Term:', self.term_input)
 
-        # Time bin controls
         self.bin_size = QLineEdit('1')
         self.bin_size.setValidator(QIntValidator(1, 1000, self))
         self.bin_size.setMaximumWidth(60)
@@ -3810,7 +3877,6 @@ class CollocationDialog(QDialog):
         self.ignore_bin.setChecked(True)
         form.addRow(self.ignore_bin)
 
-        # Additional collocation options (checkboxes) added lower in layout
         self._checkbox_order = [
             'include_page_count',
             'include_first_last_date',
@@ -3833,136 +3899,23 @@ class CollocationDialog(QDialog):
         form_widget = QWidget()
         form_widget.setLayout(form)
 
-        main_columns = QHBoxLayout()
-        main_columns.setContentsMargins(0, 0, 0, 0)
+        columns_layout = QHBoxLayout()
+        columns_layout.setContentsMargins(0, 0, 0, 0)
+        columns_layout.setSpacing(18)
 
         left_column = QVBoxLayout()
         left_column.setContentsMargins(0, 0, 0, 0)
-        left_column.addWidget(form_widget, 1)
-
-        drop_column = QVBoxLayout()
-        drop_column.setContentsMargins(0, 0, 0, 0)
-        drop_column.setSpacing(6)
-        self.select_drop_terms_btn = QPushButton('Drop Terms')
-        self.select_drop_terms_btn.clicked.connect(self.open_drop_terms_dialog)
-        drop_column.addWidget(self.select_drop_terms_btn)
-
-        drop_summary_row = QHBoxLayout()
-        drop_summary_row.setContentsMargins(0, 0, 0, 0)
-        self.drop_summary_label = QLabel()
-        self.drop_summary_label.setWordWrap(True)
-        self.drop_summary_label.setStyleSheet('color: #555555; font-size: 11px;')
-        drop_summary_row.addWidget(self.drop_summary_label, 1)
-        self.clear_drop_btn = QPushButton('Clear')
-        self.clear_drop_btn.setFixedHeight(22)
-        self.clear_drop_btn.setMaximumWidth(70)
-        self.clear_drop_btn.clicked.connect(self.clear_dropped_terms)
-        drop_summary_row.addWidget(self.clear_drop_btn, 0)
-        drop_column.addLayout(drop_summary_row)
-
-        self.drop_terms_view = QTextBrowser()
-        self.drop_terms_view.setReadOnly(True)
-        self.drop_terms_view.setMinimumHeight(120)
-        self.drop_terms_view.setStyleSheet('font-size: 11px;')
-        drop_column.addWidget(self.drop_terms_view)
-
-        self.clear_notice_label = QLabel()
-        self.clear_notice_label.setStyleSheet('color: #c05621; font-size: 11px;')
-        self.clear_notice_label.hide()
-        drop_column.addWidget(self.clear_notice_label)
-        drop_column.addStretch(1)
-
-        drop_content = QWidget()
-        drop_content.setLayout(drop_column)
-        drop_section, drop_toggle = self._create_collapsible_section('Drop Terms', drop_content, expanded=False)
-        drop_section.setMaximumWidth(260)
-        self._drop_section_button = drop_toggle
-
-        group_column = QVBoxLayout()
-        group_column.setContentsMargins(0, 0, 0, 0)
-        group_column.setSpacing(6)
-        self.group_terms_btn = QPushButton('Group Terms')
-        self.group_terms_btn.clicked.connect(self.open_group_terms_dialog)
-        self.group_terms_btn.setEnabled(False)
-        group_column.addWidget(self.group_terms_btn)
-
-        group_summary_row = QHBoxLayout()
-        group_summary_row.setContentsMargins(0, 0, 0, 0)
-        self.group_summary_label = QLabel()
-        self.group_summary_label.setWordWrap(True)
-        self.group_summary_label.setStyleSheet('color: #555555; font-size: 11px;')
-        group_summary_row.addWidget(self.group_summary_label, 1)
-        self.clear_groups_btn = QPushButton('Clear')
-        self.clear_groups_btn.setFixedHeight(22)
-        self.clear_groups_btn.setMaximumWidth(70)
-        self.clear_groups_btn.clicked.connect(self.clear_group_terms)
-        group_summary_row.addWidget(self.clear_groups_btn, 0)
-        group_column.addLayout(group_summary_row)
-
-        self.group_terms_view = QTextBrowser()
-        self.group_terms_view.setReadOnly(True)
-        self.group_terms_view.setMinimumHeight(120)
-        self.group_terms_view.setStyleSheet('font-size: 11px;')
-        group_column.addWidget(self.group_terms_view)
-        group_column.addStretch(1)
-
-        group_content = QWidget()
-        group_content.setLayout(group_column)
-        group_section, group_toggle = self._create_collapsible_section('Group Terms', group_content, expanded=False)
-        group_section.setMaximumWidth(260)
-        self._group_section_button = group_toggle
-
-        select_column = QVBoxLayout()
-        select_column.setContentsMargins(0, 0, 0, 0)
-        select_column.setSpacing(6)
-        self.select_terms_btn = QPushButton('Select Terms')
-        self.select_terms_btn.clicked.connect(self.open_select_terms_dialog)
-        self.select_terms_btn.setEnabled(False)
-        select_column.addWidget(self.select_terms_btn)
-
-        select_summary_row = QHBoxLayout()
-        select_summary_row.setContentsMargins(0, 0, 0, 0)
-        self.selected_summary_label = QLabel()
-        self.selected_summary_label.setWordWrap(True)
-        self.selected_summary_label.setStyleSheet('color: #555555; font-size: 11px;')
-        select_summary_row.addWidget(self.selected_summary_label, 1)
-        self.clear_selected_btn = QPushButton('Clear')
-        self.clear_selected_btn.setFixedHeight(22)
-        self.clear_selected_btn.setMaximumWidth(70)
-        self.clear_selected_btn.clicked.connect(self.clear_selected_terms)
-        select_summary_row.addWidget(self.clear_selected_btn, 0)
-        select_column.addLayout(select_summary_row)
-
-        self.selected_terms_view = QTextBrowser()
-        self.selected_terms_view.setReadOnly(True)
-        self.selected_terms_view.setMinimumHeight(120)
-        self.selected_terms_view.setStyleSheet('font-size: 11px;')
-        select_column.addWidget(self.selected_terms_view)
-        select_column.addStretch(1)
-
-        selected_content = QWidget()
-        selected_content.setLayout(select_column)
-        selected_section, selected_toggle = self._create_collapsible_section('Selected Terms', selected_content, expanded=False)
-        selected_section.setMaximumWidth(260)
-        self._selected_section_button = selected_toggle
-
-        right_column = QVBoxLayout()
-        right_column.setContentsMargins(0, 0, 0, 0)
-        right_column.setSpacing(12)
-        right_column.addWidget(drop_section)
-        right_column.addWidget(group_section)
-        right_column.addWidget(selected_section)
+        left_column.setSpacing(12)
+        left_column.addWidget(form_widget)
 
         options_group = QGroupBox('Collocation Options')
         options_group.setAlignment(Qt.AlignLeft)
         options_group_layout = QVBoxLayout(options_group)
         options_group_layout.setContentsMargins(12, 12, 12, 12)
         for opt in self._checkbox_order:
-            cb = self.checks[opt]
-            options_group_layout.addWidget(cb)
+            options_group_layout.addWidget(self.checks[opt])
         options_group_layout.addStretch(1)
         left_column.addWidget(options_group)
-        left_column.addStretch(1)
 
         context_group = QGroupBox('Context Window (words)')
         context_group.setAlignment(Qt.AlignLeft)
@@ -3978,7 +3931,7 @@ class CollocationDialog(QDialog):
         context_layout.addWidget(self.context_left_spin)
         self.keyword_label = QLabel('<keyword>')
         self.keyword_label.setTextFormat(Qt.PlainText)
-        self.keyword_label.setMinimumWidth(110)
+        self.keyword_label.setMinimumWidth(120)
         self.keyword_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         context_layout.addWidget(self.keyword_label, 1)
         self.context_right_spin = QSpinBox()
@@ -3987,19 +3940,161 @@ class CollocationDialog(QDialog):
         self.context_right_spin.setFixedWidth(46)
         context_layout.addWidget(self.context_right_spin)
         context_layout.addStretch(1)
-        context_group.setMaximumWidth(260)
-        right_column.addWidget(context_group)
-        right_column.addStretch(1)
+        left_column.addWidget(context_group)
 
-        main_columns.addLayout(left_column, 0)
-        main_columns.addLayout(right_column, 1)
-        layout.addLayout(main_columns)
+        left_column.addStretch(1)
+
+        btn_run = QPushButton('Run Collocation')
+        btn_bar = QPushButton('Show Bar Chart')
+        btn_rank = QPushButton('Plot Rank Trends')
+        btn_map_collocate = QPushButton('Create Collocate‑Rank Map')
+
+        collocation_buttons_container = QWidget()
+        collocation_buttons_layout = QVBoxLayout(collocation_buttons_container)
+        collocation_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        collocation_buttons_layout.setSpacing(8)
+        for button in (btn_run, btn_bar, btn_rank, btn_map_collocate):
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            collocation_buttons_layout.addWidget(button)
+        left_column.addWidget(collocation_buttons_container)
+
+        drop_column = QVBoxLayout()
+        drop_column.setContentsMargins(0, 0, 0, 0)
+        drop_column.setSpacing(6)
+        drop_buttons_row = QHBoxLayout()
+        drop_buttons_row.setContentsMargins(0, 0, 0, 0)
+        drop_buttons_row.setSpacing(6)
+        self.select_drop_terms_btn = QPushButton('Drop Terms')
+        self.select_drop_terms_btn.clicked.connect(self.open_drop_terms_dialog)
+        self.select_drop_terms_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.add_custom_drop_btn = QPushButton('Add Custom…')
+        self.add_custom_drop_btn.clicked.connect(self.add_custom_drop_terms)
+        self.add_custom_drop_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        drop_buttons_row.addWidget(self.select_drop_terms_btn)
+        drop_buttons_row.addWidget(self.add_custom_drop_btn)
+        drop_column.addLayout(drop_buttons_row)
+
+        drop_summary_row = QHBoxLayout()
+        drop_summary_row.setContentsMargins(0, 0, 0, 0)
+        self.drop_summary_label = QLabel()
+        self.drop_summary_label.setWordWrap(True)
+        self.drop_summary_label.setStyleSheet('color: #555555; font-size: 11px;')
+        drop_summary_row.addWidget(self.drop_summary_label, 1)
+        self.clear_drop_btn = QPushButton('Clear')
+        self.clear_drop_btn.setFixedHeight(22)
+        self.clear_drop_btn.setMaximumWidth(80)
+        self.clear_drop_btn.clicked.connect(self.clear_dropped_terms)
+        drop_summary_row.addWidget(self.clear_drop_btn, 0)
+        drop_column.addLayout(drop_summary_row)
+
+        self.drop_terms_view = QTextBrowser()
+        self.drop_terms_view.setReadOnly(True)
+        self.drop_terms_view.setMinimumHeight(140)
+        self.drop_terms_view.setStyleSheet('font-size: 11px;')
+        drop_column.addWidget(self.drop_terms_view)
+
+        self.clear_notice_label = QLabel()
+        self.clear_notice_label.setStyleSheet('color: #c05621; font-size: 11px;')
+        self.clear_notice_label.hide()
+        drop_column.addWidget(self.clear_notice_label)
+        drop_column.addStretch(1)
+
+        drop_content = QWidget()
+        drop_content.setLayout(drop_column)
+        drop_section, drop_toggle = self._create_collapsible_section('Drop Terms', drop_content, expanded=False)
+        drop_section.setMaximumWidth(340)
+        self._drop_section_button = drop_toggle
+
+        group_column = QVBoxLayout()
+        group_column.setContentsMargins(0, 0, 0, 0)
+        group_column.setSpacing(6)
+        self.group_terms_btn = QPushButton('Group Terms')
+        self.group_terms_btn.clicked.connect(self.open_group_terms_dialog)
+        self.group_terms_btn.setEnabled(False)
+        self.group_terms_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        group_column.addWidget(self.group_terms_btn)
+
+        group_summary_row = QHBoxLayout()
+        group_summary_row.setContentsMargins(0, 0, 0, 0)
+        self.group_summary_label = QLabel()
+        self.group_summary_label.setWordWrap(True)
+        self.group_summary_label.setStyleSheet('color: #555555; font-size: 11px;')
+        group_summary_row.addWidget(self.group_summary_label, 1)
+        self.clear_groups_btn = QPushButton('Clear')
+        self.clear_groups_btn.setFixedHeight(22)
+        self.clear_groups_btn.setMaximumWidth(80)
+        self.clear_groups_btn.clicked.connect(self.clear_group_terms)
+        group_summary_row.addWidget(self.clear_groups_btn, 0)
+        group_column.addLayout(group_summary_row)
+
+        self.group_terms_view = QTextBrowser()
+        self.group_terms_view.setReadOnly(True)
+        self.group_terms_view.setMinimumHeight(140)
+        self.group_terms_view.setStyleSheet('font-size: 11px;')
+        group_column.addWidget(self.group_terms_view)
+        group_column.addStretch(1)
+
+        group_content = QWidget()
+        group_content.setLayout(group_column)
+        group_section, group_toggle = self._create_collapsible_section('Group Terms', group_content, expanded=False)
+        group_section.setMaximumWidth(340)
+        self._group_section_button = group_toggle
+
+        select_column = QVBoxLayout()
+        select_column.setContentsMargins(0, 0, 0, 0)
+        select_column.setSpacing(6)
+        select_buttons_row = QHBoxLayout()
+        select_buttons_row.setContentsMargins(0, 0, 0, 0)
+        select_buttons_row.setSpacing(6)
+        self.select_terms_btn = QPushButton('Select Terms')
+        self.select_terms_btn.clicked.connect(self.open_select_terms_dialog)
+        self.select_terms_btn.setEnabled(False)
+        self.select_terms_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.add_custom_selected_btn = QPushButton('Add Custom…')
+        self.add_custom_selected_btn.clicked.connect(self.add_custom_selected_terms)
+        self.add_custom_selected_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        select_buttons_row.addWidget(self.select_terms_btn)
+        select_buttons_row.addWidget(self.add_custom_selected_btn)
+        select_column.addLayout(select_buttons_row)
+
+        select_summary_row = QHBoxLayout()
+        select_summary_row.setContentsMargins(0, 0, 0, 0)
+        self.selected_summary_label = QLabel()
+        self.selected_summary_label.setWordWrap(True)
+        self.selected_summary_label.setStyleSheet('color: #555555; font-size: 11px;')
+        select_summary_row.addWidget(self.selected_summary_label, 1)
+        self.clear_selected_btn = QPushButton('Clear')
+        self.clear_selected_btn.setFixedHeight(22)
+        self.clear_selected_btn.setMaximumWidth(80)
+        self.clear_selected_btn.clicked.connect(self.clear_selected_terms)
+        select_summary_row.addWidget(self.clear_selected_btn, 0)
+        select_column.addLayout(select_summary_row)
+
+        self.selected_terms_view = QTextBrowser()
+        self.selected_terms_view.setReadOnly(True)
+        self.selected_terms_view.setMinimumHeight(140)
+        self.selected_terms_view.setStyleSheet('font-size: 11px;')
+        select_column.addWidget(self.selected_terms_view)
+        select_column.addStretch(1)
+
+        selected_content = QWidget()
+        selected_content.setLayout(select_column)
+        selected_section, selected_toggle = self._create_collapsible_section('Selected Terms', selected_content, expanded=False)
+        selected_section.setMaximumWidth(340)
+        self._selected_section_button = selected_toggle
+
+        middle_column = QVBoxLayout()
+        middle_column.setContentsMargins(0, 0, 0, 0)
+        middle_column.setSpacing(12)
+        middle_column.addWidget(drop_section)
+        middle_column.addWidget(group_section)
+        middle_column.addWidget(selected_section)
+        middle_column.addStretch(1)
 
         topic_content = QWidget()
-        topic_layout = QGridLayout(topic_content)
-        topic_layout.setContentsMargins(12, 12, 12, 12)
-        topic_layout.setHorizontalSpacing(10)
-        topic_layout.setVerticalSpacing(6)
+        topic_content_layout = QVBoxLayout(topic_content)
+        topic_content_layout.setContentsMargins(12, 12, 12, 12)
+        topic_content_layout.setSpacing(12)
 
         info_row_widget = QWidget(topic_content)
         info_row_layout = QHBoxLayout(info_row_widget)
@@ -4016,113 +4111,95 @@ class CollocationDialog(QDialog):
         topic_info_btn.setToolTip('Topic modeling takes a long time on large corpora, and cancellation requests can take additional time to finish the current iteration.')
         info_row_layout.addWidget(topic_info_btn)
         info_row_layout.addStretch(1)
-        topic_layout.addWidget(info_row_widget, 0, 0, 1, 6)
+        topic_content_layout.addWidget(info_row_widget)
 
-        topic_row = 1
-        model_label = QLabel('Model:')
-        model_label.setToolTip('Choose the topic modeling algorithm (LDA or NMF).')
-        topic_layout.addWidget(model_label, topic_row, 0)
+        topic_settings_form = QFormLayout()
+        topic_settings_form.setLabelAlignment(Qt.AlignLeft)
+        topic_settings_form.setFormAlignment(Qt.AlignLeft)
+        topic_settings_form.setSpacing(6)
+
         self.topic_model_combo = QComboBox()
         self.topic_model_combo.addItems(['LDA', 'NMF'])
         self.topic_model_combo.setToolTip('Choose the topic modeling algorithm (LDA or NMF).')
-        topic_layout.addWidget(self.topic_model_combo, topic_row, 1)
+        topic_settings_form.addRow('Model:', self.topic_model_combo)
 
-        topics_label = QLabel('Topics:')
-        topics_label.setToolTip('Number of latent topics to estimate.')
-        topic_layout.addWidget(topics_label, topic_row, 2)
         self.topic_topic_count_spin = QSpinBox()
         self.topic_topic_count_spin.setRange(2, 50)
         self.topic_topic_count_spin.setValue(10)
         self.topic_topic_count_spin.setToolTip('Number of latent topics to estimate.')
-        topic_layout.addWidget(self.topic_topic_count_spin, topic_row, 3)
+        topic_settings_form.addRow('Topics:', self.topic_topic_count_spin)
 
-        topwords_label = QLabel('Top words:')
-        topwords_label.setToolTip('How many of the most probable words to list for each topic.')
-        topic_layout.addWidget(topwords_label, topic_row, 4)
         self.topic_top_words_spin = QSpinBox()
         self.topic_top_words_spin.setRange(5, 50)
         self.topic_top_words_spin.setValue(12)
         self.topic_top_words_spin.setToolTip('How many of the most probable words to list for each topic.')
-        topic_layout.addWidget(self.topic_top_words_spin, topic_row, 5)
+        topic_settings_form.addRow('Top words:', self.topic_top_words_spin)
 
-        topic_row += 1
-        maxfeat_label = QLabel('Max features:')
-        maxfeat_label.setToolTip('Maximum vocabulary size for the vectorizer.')
-        topic_layout.addWidget(maxfeat_label, topic_row, 0)
         self.topic_max_features_spin = QSpinBox()
         self.topic_max_features_spin.setRange(500, 50000)
         self.topic_max_features_spin.setSingleStep(500)
         self.topic_max_features_spin.setValue(3000)
         self.topic_max_features_spin.setToolTip('Maximum vocabulary size for the vectorizer.')
-        topic_layout.addWidget(self.topic_max_features_spin, topic_row, 1)
+        topic_settings_form.addRow('Max features:', self.topic_max_features_spin)
 
-        mindoc_label = QLabel('Min doc freq:')
-        mindoc_label.setToolTip('Ignore tokens that appear in fewer documents than this threshold.')
-        topic_layout.addWidget(mindoc_label, topic_row, 2)
         self.topic_min_df_spin = QSpinBox()
         self.topic_min_df_spin.setRange(1, 100)
         self.topic_min_df_spin.setValue(5)
         self.topic_min_df_spin.setToolTip('Ignore tokens that appear in fewer documents than this threshold.')
-        topic_layout.addWidget(self.topic_min_df_spin, topic_row, 3)
+        topic_settings_form.addRow('Min doc freq:', self.topic_min_df_spin)
 
-        maxdoc_label = QLabel('Max doc freq:')
-        maxdoc_label.setToolTip('Ignore tokens that appear in more than this fraction of documents.')
-        topic_layout.addWidget(maxdoc_label, topic_row, 4)
         self.topic_max_df_spin = QDoubleSpinBox()
         self.topic_max_df_spin.setRange(0.05, 1.0)
         self.topic_max_df_spin.setSingleStep(0.05)
         self.topic_max_df_spin.setDecimals(2)
         self.topic_max_df_spin.setValue(0.5)
         self.topic_max_df_spin.setToolTip('Ignore tokens that appear in more than this fraction of documents.')
-        topic_layout.addWidget(self.topic_max_df_spin, topic_row, 5)
+        topic_settings_form.addRow('Max doc freq:', self.topic_max_df_spin)
 
-        topic_row += 1
-        maxdocs_label = QLabel('Max documents:')
-        maxdocs_label.setToolTip('Optional cap on the number of documents used for modeling.')
-        topic_layout.addWidget(maxdocs_label, topic_row, 0)
         self.topic_max_docs_spin = QSpinBox()
         self.topic_max_docs_spin.setRange(0, 100000)
         self.topic_max_docs_spin.setSingleStep(1000)
         self.topic_max_docs_spin.setSpecialValueText('All')
         self.topic_max_docs_spin.setValue(0)
         self.topic_max_docs_spin.setToolTip('Optional cap on the number of documents used for modeling.')
-        topic_layout.addWidget(self.topic_max_docs_spin, topic_row, 1)
+        topic_settings_form.addRow('Max documents:', self.topic_max_docs_spin)
 
-        minweight_label = QLabel('Min topic weight:')
-        minweight_label.setToolTip('Only keep topic assignments with at least this weight in each document.')
-        topic_layout.addWidget(minweight_label, topic_row, 2)
         self.topic_min_weight_spin = QDoubleSpinBox()
         self.topic_min_weight_spin.setRange(0.0, 1.0)
         self.topic_min_weight_spin.setSingleStep(0.05)
         self.topic_min_weight_spin.setDecimals(2)
         self.topic_min_weight_spin.setValue(0.05)
         self.topic_min_weight_spin.setToolTip('Only keep topic assignments with at least this weight in each document.')
-        topic_layout.addWidget(self.topic_min_weight_spin, topic_row, 3)
+        topic_settings_form.addRow('Min topic weight:', self.topic_min_weight_spin)
 
-        topicsper_label = QLabel('Topics per article:')
-        topicsper_label.setToolTip('Limit how many topics are recorded for each document.')
-        topic_layout.addWidget(topicsper_label, topic_row, 4)
         self.topic_doc_topics_spin = QSpinBox()
         self.topic_doc_topics_spin.setRange(1, 10)
         self.topic_doc_topics_spin.setValue(3)
         self.topic_doc_topics_spin.setToolTip('Limit how many topics are recorded for each document.')
-        topic_layout.addWidget(self.topic_doc_topics_spin, topic_row, 5)
+        topic_settings_form.addRow('Topics per article:', self.topic_doc_topics_spin)
 
-        topic_row += 1
+        topic_content_layout.addLayout(topic_settings_form)
+
         self.topic_restrict_selected_check = QCheckBox('Only include articles containing selected terms')
         self.topic_restrict_selected_check.setToolTip('Only analyze documents that contain the manually selected terms.')
-        topic_layout.addWidget(self.topic_restrict_selected_check, topic_row, 0, 1, 3)
         self.topic_exclude_drop_docs_check = QCheckBox('Exclude articles containing drop terms')
         self.topic_exclude_drop_docs_check.setToolTip('Skip documents that contain any drop terms.')
-        topic_layout.addWidget(self.topic_exclude_drop_docs_check, topic_row, 3, 1, 3)
-
-        topic_row += 1
         self.topic_remove_drop_tokens_check = QCheckBox('Remove drop terms from tokenization')
         self.topic_remove_drop_tokens_check.setChecked(True)
         self.topic_remove_drop_tokens_check.setToolTip('Remove drop terms from the token list before modeling.')
-        topic_layout.addWidget(self.topic_remove_drop_tokens_check, topic_row, 0, 1, 3)
+        self.topic_include_url_check = QCheckBox('Include article URLs in topic documents CSV')
+        self.topic_include_url_check.setToolTip('Add a column with article URLs to the topic_documents output CSV.')
+        self.topic_include_url_check.setChecked(True)
 
-        topic_layout.setColumnStretch(5, 1)
+        topic_options_group = QGroupBox('Topic Modeling Options')
+        topic_options_group.setAlignment(Qt.AlignLeft)
+        topic_options_layout = QVBoxLayout(topic_options_group)
+        topic_options_layout.setContentsMargins(12, 12, 12, 12)
+        for cb in (self.topic_restrict_selected_check, self.topic_exclude_drop_docs_check, self.topic_remove_drop_tokens_check, self.topic_include_url_check):
+            topic_options_layout.addWidget(cb)
+        topic_options_layout.addStretch(1)
+        topic_content_layout.addWidget(topic_options_group)
+        topic_content_layout.addStretch(1)
 
         topic_section, topic_toggle = self._create_collapsible_section(
             'Topic Modeling (beta)',
@@ -4130,8 +4207,41 @@ class CollocationDialog(QDialog):
             expanded=False,
             on_toggle=self._handle_topic_section_toggle,
         )
-        layout.addWidget(topic_section)
         self._topic_section_button = topic_toggle
+
+        btn_topic = QPushButton('Run Topic Model')
+        btn_topic_trends = QPushButton('Plot Topic Trends')
+        self.btn_open_topic_docs = QPushButton('Open Topic Documents CSV')
+        self.btn_open_topic_docs.setEnabled(False)
+
+        topic_buttons_container = QWidget()
+        topic_buttons_layout = QVBoxLayout(topic_buttons_container)
+        topic_buttons_layout.setContentsMargins(0, 12, 0, 0)
+        topic_buttons_layout.setSpacing(8)
+        for button in (btn_topic, btn_topic_trends, self.btn_open_topic_docs):
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            topic_buttons_layout.addWidget(button)
+
+        topic_column = QVBoxLayout()
+        topic_column.setContentsMargins(0, 0, 0, 0)
+        topic_column.setSpacing(12)
+        topic_column.addWidget(topic_section)
+        topic_column.addStretch(1)
+        topic_column.addWidget(topic_buttons_container)
+
+        columns_layout.addLayout(left_column, 3)
+        columns_layout.addLayout(middle_column, 3)
+        columns_layout.addLayout(topic_column, 4)
+        content_layout.addLayout(columns_layout)
+        content_layout.addStretch(1)
+
+        btn_run.clicked.connect(self.run_collocate)
+        btn_bar.clicked.connect(self.show_bar)
+        btn_rank.clicked.connect(self.show_rank)
+        btn_map_collocate.clicked.connect(self.create_collocate_rank_map)
+        btn_topic.clicked.connect(self.run_topic_model_action)
+        btn_topic_trends.clicked.connect(self.show_topic_trends)
+        self.btn_open_topic_docs.clicked.connect(self.open_topic_documents_csv)
 
         self._update_selected_terms_summary()
 
@@ -4144,6 +4254,7 @@ class CollocationDialog(QDialog):
         self._update_context_keyword_label()
         self._set_clear_notice('')
         self._update_select_terms_enabled()
+        self._update_topic_documents_button()
 
         self.bin_size.textEdited.connect(self._handle_bin_control_change)
         self.bin_unit.currentIndexChanged.connect(self._handle_bin_control_change)
@@ -4171,26 +4282,11 @@ class CollocationDialog(QDialog):
         self.topic_restrict_selected_check.stateChanged.connect(lambda *_: self._save_state())
         self.topic_exclude_drop_docs_check.stateChanged.connect(lambda *_: self._save_state())
         self.topic_remove_drop_tokens_check.stateChanged.connect(lambda *_: self._save_state())
+        self.topic_include_url_check.stateChanged.connect(lambda *_: self._save_state())
 
         if not self._base_height:
             self._base_height = self.sizeHint().height()
         self.setMinimumHeight(self._base_height)
-
-        # Action buttons
-        btn_run = QPushButton('Run Collocation')
-        btn_bar = QPushButton('Show Bar Chart')
-        btn_rank = QPushButton('Show Rank Changes')
-        btn_map_collocate = QPushButton('Create Collocate‑Rank Map')
-        btn_topic = QPushButton('Run Topic Model')
-        btn_topic_trends = QPushButton('Plot Topic Trends')
-        btn_run.clicked.connect(self.run_collocate)
-        btn_bar.clicked.connect(self.show_bar)
-        btn_rank.clicked.connect(self.show_rank)
-        btn_map_collocate.clicked.connect(self.create_collocate_rank_map)
-        btn_topic.clicked.connect(self.run_topic_model_action)
-        btn_topic_trends.clicked.connect(self.show_topic_trends)
-        for b in (btn_run, btn_bar, btn_rank, btn_map_collocate, btn_topic, btn_topic_trends):
-            layout.addWidget(b)
 
     def _source_text(self):
         if self.mode_geo.isChecked():
@@ -4780,10 +4876,13 @@ class CollocationDialog(QDialog):
             'restrict_selected': self.topic_restrict_selected_check.isChecked(),
             'exclude_drop_docs': self.topic_exclude_drop_docs_check.isChecked(),
             'remove_drop_tokens': self.topic_remove_drop_tokens_check.isChecked(),
+            'include_article_url': self.topic_include_url_check.isChecked(),
         }
 
-    def _topic_parameters(self, drop_terms: Sequence[str], selected_terms: Sequence[str]) -> TopicModelParameters:
-        settings = self._collect_topic_settings()
+
+    def _topic_parameters(self, drop_terms: Sequence[str], selected_terms: Sequence[str], *, settings: Optional[dict] = None) -> TopicModelParameters:
+        if settings is None:
+            settings = self._collect_topic_settings()
         max_docs_val = int(settings.get('max_documents') or 0)
         drop_stopwords = bool(self.checks.get('drop_stopwords') and self.checks['drop_stopwords'].isChecked())
         raw_min_df = settings.get('min_df', 5)
@@ -4891,6 +4990,7 @@ class CollocationDialog(QDialog):
         self.topic_restrict_selected_check.setChecked(bool(settings.get('restrict_selected')))
         self.topic_exclude_drop_docs_check.setChecked(bool(settings.get('exclude_drop_docs')))
         self.topic_remove_drop_tokens_check.setChecked(bool(settings.get('remove_drop_tokens', True)))
+        self.topic_include_url_check.setChecked(bool(settings.get('include_article_url', True)))
         self._update_topic_toggle_states()
 
     def _update_topic_toggle_states(self):
@@ -4918,13 +5018,9 @@ class CollocationDialog(QDialog):
 
     def _handle_topic_section_toggle(self, checked: bool):
         if not self._base_height:
-            self._base_height = self.sizeHint().height()
-        if checked:
-            new_min = max(self._base_height, self.sizeHint().height())
-        else:
-            new_min = self._base_height
-        self.setMinimumHeight(new_min)
-        self.resize(self.width(), max(new_min, self.sizeHint().height()))
+            self._base_height = self.minimumHeight() or self.sizeHint().height()
+        if not checked:
+            self.setMinimumHeight(self._base_height)
 
     def _start_operation(
         self,
@@ -5249,6 +5345,11 @@ class CollocationDialog(QDialog):
             self.drop_terms_view.setHtml(body)
         else:
             self.drop_terms_view.setHtml('<span style="color:#777777;">(none)</span>')
+        if count > 0 and self._drop_terms_prev_count == 0:
+            if not self.topic_remove_drop_tokens_check.isChecked():
+                self.topic_remove_drop_tokens_check.blockSignals(True)
+                self.topic_remove_drop_tokens_check.setChecked(True)
+                self.topic_remove_drop_tokens_check.blockSignals(False)
         if count == 0:
             if self._drop_section_button is not None and self._drop_section_button.isChecked():
                 self._drop_section_button.setChecked(False)
@@ -5320,6 +5421,22 @@ class CollocationDialog(QDialog):
             self._group_section_button.setChecked(True)
         self._group_terms_prev_count = count
 
+    def _parse_manual_terms(self, raw: str) -> List[str]:
+        if not raw:
+            return []
+        terms: List[str] = []
+        seen: Set[str] = set()
+        for piece in re.split(r'[;,\\n]', raw):
+            term = piece.strip()
+            if not term:
+                continue
+            lowered = term.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            terms.append(term)
+        return terms
+
     def _set_dropped_terms(self, terms: List[str], *, log_change: bool, show_notice: bool = False):
         parent = self.parent()
         if parent is None:
@@ -5368,10 +5485,61 @@ class CollocationDialog(QDialog):
             self.clear_notice_label.clear()
             self.clear_notice_label.hide()
 
+    def add_custom_drop_terms(self):
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            'Add Custom Drop Terms',
+            'Enter drop terms (one per line or separated by commas):',
+        )
+        if not ok:
+            return
+        terms = self._parse_manual_terms(text)
+        if not terms:
+            return
+        current = self._get_parent_drop_terms()
+        seen = {term.lower() for term in current}
+        updated = list(current)
+        added = False
+        for term in terms:
+            lowered = term.lower()
+            if lowered not in seen:
+                seen.add(lowered)
+                updated.append(term)
+                added = True
+        if not added:
+            return
+        self._set_dropped_terms(updated, log_change=True, show_notice=True)
+
     def clear_dropped_terms(self):
         if not self._get_parent_drop_terms():
             return
         self._set_dropped_terms([], log_change=True, show_notice=True)
+
+    def add_custom_selected_terms(self):
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            'Add Custom Selected Terms',
+            'Enter selected terms (one per line or separated by commas):',
+        )
+        if not ok:
+            return
+        terms = self._parse_manual_terms(text)
+        if not terms:
+            return
+        existing = list(dict.fromkeys(self._rank_selected_terms))
+        seen = {term.lower() for term in existing}
+        added = False
+        for term in terms:
+            lowered = term.lower()
+            if lowered not in seen:
+                existing.append(term)
+                seen.add(lowered)
+                added = True
+        if not added:
+            return
+        self._rank_selected_terms = existing
+        self._update_selected_terms_summary()
+        self._save_state()
 
     def clear_selected_terms(self):
         if not self._rank_selected_terms:
@@ -5392,6 +5560,16 @@ class CollocationDialog(QDialog):
         enabled = bool(metrics_path and os.path.exists(metrics_path))
         self.select_terms_btn.setEnabled(enabled)
         self.group_terms_btn.setEnabled(enabled)
+
+    def _update_topic_documents_button(self):
+        if not hasattr(self, 'btn_open_topic_docs'):
+            return
+        path = None
+        if isinstance(self._last_topic_paths, dict):
+            path = self._last_topic_paths.get('doc_topics')
+        enabled = bool(path and os.path.exists(path))
+        self.btn_open_topic_docs.setEnabled(enabled)
+
 
     def _fetch_metric_term_infos(self, metrics_path: str) -> List[dict]:
         try:
@@ -5707,6 +5885,40 @@ class CollocationDialog(QDialog):
             return False
         return False
 
+    def _confirm_topic_overwrite_if_needed(self, paths: dict) -> bool:
+        existing = [p for p in (paths.get('topics'), paths.get('doc_topics'), paths.get('by_time')) if p and os.path.exists(p)]
+        if not existing:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle('Overwrite Existing Topic Model?')
+        box.setText('Topic modeling outputs already exist for these parameters.')
+        box.setInformativeText('\n'.join(existing))
+        overwrite_btn = box.addButton('Overwrite', QMessageBox.AcceptRole)
+        open_btn = box.addButton('Open Existing', QMessageBox.ActionRole)
+        cancel_btn = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(overwrite_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked == overwrite_btn:
+            return True
+        if clicked == open_btn:
+            topics_path = paths.get('topics')
+            if topics_path and os.path.exists(topics_path):
+                preview = CSVPreviewDialog(topics_path, parent=self, max_rows=150)
+                preview.resize(1000, 620)
+                preview.show()
+                preview.raise_()
+                preview.activateWindow()
+                preview.setFocus()
+                self._register_preview(preview)
+            self._last_topic_paths = dict(paths)
+            self._update_topic_documents_button()
+            return False
+        return False
+
+
     def _save_state(self):
         if self._loading_defaults:
             return
@@ -5948,8 +6160,24 @@ class CollocationDialog(QDialog):
 
         drop_terms = self._get_parent_drop_terms()
         selected_terms = list(dict.fromkeys(self._rank_selected_terms))
-        params = self._topic_parameters(drop_terms, selected_terms)
+        topic_settings = self._collect_topic_settings()
+        params = self._topic_parameters(drop_terms, selected_terms, settings=topic_settings)
+        include_urls = bool(topic_settings.get('include_article_url'))
         effective_selected = selected_terms if params.restrict_to_selected_terms else []
+
+        predicted_paths = self._build_topic_output_paths_topic(
+            term,
+            start or None,
+            end or None,
+            city,
+            state,
+            params,
+            effective_selected,
+        )
+        if not self._confirm_topic_overwrite_if_needed(predicted_paths):
+            return
+        self._last_topic_paths = dict(predicted_paths)
+        self._update_topic_documents_button()
 
         json_path = getattr(parent, 'json_file', None)
         geo_path = getattr(parent, 'geojson_file', None)
@@ -5986,6 +6214,7 @@ class CollocationDialog(QDialog):
                 drop_terms=drop_terms,
                 term_groups=self._get_parent_term_groups(),
                 selected_terms=effective_selected,
+                include_article_url=include_urls,
                 metadata_enabled=metadata_enabled,
                 cancel_event=cancel_event,
                 **source_kwargs,
@@ -5996,6 +6225,7 @@ class CollocationDialog(QDialog):
                 QMessageBox.information(self, 'Topic Modeling', 'Topic modeling completed with no outputs.')
                 return
             self._last_topic_paths = result
+            self._update_topic_documents_button()
             topics_path = result.get('topics')
             if topics_path and os.path.exists(topics_path):
                 preview = CSVPreviewDialog(topics_path, parent=self, max_rows=150)
@@ -6010,15 +6240,17 @@ class CollocationDialog(QDialog):
             end_display = end or 'all'
             city_display = city or 'All'
             state_display = state or 'All'
-            self._log_topic_model_run(term, start_display, end_display, city_display, state_display, params, result)
+            self._log_topic_model_run(term, start_display, end_display, city_display, state_display, params, result, include_urls)
             self._set_clear_notice('')
             self._save_state()
 
         def handle_error(exc: Exception):
             QMessageBox.critical(self, 'Topic Modeling Error', str(exc))
+            self._update_topic_documents_button()
 
         def handle_cancel():
             self._set_clear_notice('Topic modeling cancelled.')
+            self._update_topic_documents_button()
 
         self._start_operation(
             'Running topic modeling…',
@@ -6029,6 +6261,22 @@ class CollocationDialog(QDialog):
             context='topic-model',
             cancel_requested_message='Topic modeling cancellation requested. The current iteration may take additional time to finish.',
         )
+
+    def open_topic_documents_csv(self):
+        path = None
+        if isinstance(self._last_topic_paths, dict):
+            path = self._last_topic_paths.get('doc_topics')
+        if not path or not os.path.exists(path):
+            QMessageBox.information(self, 'File Not Found', 'Run topic modeling to create the topic_documents CSV before opening it.')
+            return
+        preview = CSVPreviewDialog(path, parent=self, max_rows=150)
+        preview.resize(1000, 620)
+        preview.show()
+        preview.raise_()
+        preview.activateWindow()
+        preview.setFocus()
+        self._register_preview(preview)
+
 
     def show_bar(self):
         term = self.term_input.text().strip()
@@ -6320,7 +6568,8 @@ class CollocationDialog(QDialog):
 
         drop_terms = self._get_parent_drop_terms()
         selected_terms = list(dict.fromkeys(self._rank_selected_terms))
-        params = self._topic_parameters(drop_terms, selected_terms)
+        topic_settings = self._collect_topic_settings()
+        params = self._topic_parameters(drop_terms, selected_terms, settings=topic_settings)
         effective_selected = selected_terms if params.restrict_to_selected_terms else []
 
         target_path = None
@@ -6365,6 +6614,7 @@ class CollocationDialog(QDialog):
         state: str,
         params: TopicModelParameters,
         paths: Optional[dict],
+        include_urls: bool,
     ):
         parent = self.parent()
         if parent is None or not hasattr(parent, 'append_project_log'):
@@ -6381,6 +6631,8 @@ class CollocationDialog(QDialog):
             options.append('selected-term filter')
         if params.max_documents:
             options.append(f'max docs {params.max_documents}')
+        if include_urls:
+            options.append('include article URLs')
 
         lines = [
             f'<div>Term: {html.escape(term or "(none)")}</div>',

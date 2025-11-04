@@ -165,6 +165,7 @@ def _preprocess_documents(
                 "lccn": row.get("lccn") or row.get("SN"),
                 "newspaper_name": row.get("newspaper_name"),
                 "date": row.get("date"),
+                "url": row.get("url"),
                 "tokens": tokens,
                 "text": " ".join(tokens),
             }
@@ -234,6 +235,7 @@ def _write_empty_outputs(
     project_dir: str,
     metadata_common: Dict[str, Any],
     metadata_enabled: bool,
+    include_article_url: bool,
 ) -> Dict[str, Optional[str]]:
     metadata_paths: Dict[str, str] = {}
     topics_path = output_paths.get("topics")
@@ -250,7 +252,10 @@ def _write_empty_outputs(
             metadata_paths["topics"] = meta_path
     if doc_topics_path:
         os.makedirs(os.path.dirname(doc_topics_path), exist_ok=True)
-        pd.DataFrame(columns=["article_id", "topic_id", "weight"]).to_csv(doc_topics_path, index=False)
+        doc_columns = ["article_id", "topic_id", "weight", "rank", "date", "time_bin", "lccn", "newspaper_name", "topic_label"]
+        if include_article_url:
+            doc_columns.append("url")
+        pd.DataFrame(columns=doc_columns).to_csv(doc_topics_path, index=False)
         meta = dict(metadata_common)
         meta.update({"output_type": "topic_documents_csv", "row_count": 0})
         meta_path = write_metadata_file(project_dir, doc_topics_path, meta, enabled=metadata_enabled)
@@ -323,6 +328,7 @@ def _melt_doc_topics(
     *,
     params: TopicModelParameters,
     topic_labels: Dict[int, str],
+    include_url: bool = False,
     cancel_event: Optional[threading.Event] = None,
 ) -> pd.DataFrame:
     if matrix.size == 0:
@@ -352,19 +358,20 @@ def _melt_doc_topics(
                     pass
                 else:
                     continue
-            records.append(
-                {
-                    "article_id": article_id,
-                    "topic_id": topic_id,
-                    "weight": weight,
-                    "rank": rank + 1,
-                    "date": date_val,
-                    "time_bin": time_bin,
-                    "lccn": lccn,
-                    "newspaper_name": newspaper,
-                    "topic_label": topic_labels.get(topic_id),
-                }
-            )
+            record = {
+                "article_id": article_id,
+                "topic_id": topic_id,
+                "weight": weight,
+                "rank": rank + 1,
+                "date": date_val,
+                "time_bin": time_bin,
+                "lccn": lccn,
+                "newspaper_name": newspaper,
+                "topic_label": topic_labels.get(topic_id),
+            }
+            if include_url:
+                record["url"] = doc_row.get("url")
+            records.append(record)
     if not records:
         return pd.DataFrame(columns=["article_id", "topic_id", "weight"])
     return pd.DataFrame(records)
@@ -409,6 +416,7 @@ def run_topic_model(
     term_groups: Optional[List[dict]] = None,
     selected_terms: Optional[Sequence[str]] = None,
     metadata_enabled: bool = True,
+    include_article_url: bool = False,
     cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Optional[str]]:
     if not json_path and not geojson_path:
@@ -448,6 +456,7 @@ def run_topic_model(
             "term_groups": [
                 {"name": group["name"], "terms": list(group["terms"])} for group in normalized_groups
             ],
+            "include_article_url": bool(include_article_url),
         },
         "inputs": {
             "json_path": json_path,
@@ -471,7 +480,7 @@ def run_topic_model(
     )
 
     if df_filtered.empty:
-        return _write_empty_outputs(output_paths, project_dir, metadata_common, metadata_enabled)
+        return _write_empty_outputs(output_paths, project_dir, metadata_common, metadata_enabled, include_article_url)
 
     df_prepared = _preprocess_documents(
         df_filtered,
@@ -481,7 +490,7 @@ def run_topic_model(
         cancel_event=cancel_event,
     )
     if df_prepared.empty:
-        return _write_empty_outputs(output_paths, project_dir, metadata_common, metadata_enabled)
+        return _write_empty_outputs(output_paths, project_dir, metadata_common, metadata_enabled, include_article_url)
 
     df_prepared = _limit_documents(df_prepared, params.max_documents, params.random_state)
     _check_cancel(cancel_event)
@@ -521,7 +530,7 @@ def run_topic_model(
     feature_names = vectorizer.get_feature_names_out()
 
     if matrix.shape[0] == 0 or matrix.shape[1] == 0:
-        return _write_empty_outputs(output_paths, project_dir, metadata_common, metadata_enabled)
+        return _write_empty_outputs(output_paths, project_dir, metadata_common, metadata_enabled, include_article_url)
 
     if params.model == "lda":
         model = ModelClass(
@@ -549,11 +558,27 @@ def run_topic_model(
         df_prepared.reset_index(drop=True),
         params=params,
         topic_labels=topic_labels,
+        include_url=include_article_url,
         cancel_event=cancel_event,
     )
 
     if doc_topics.empty:
-        return _write_empty_outputs(output_paths, project_dir, metadata_common, metadata_enabled)
+        return _write_empty_outputs(output_paths, project_dir, metadata_common, metadata_enabled, include_article_url)
+
+    doc_columns = [
+        "article_id",
+        "topic_id",
+        "weight",
+        "rank",
+        "date",
+        "time_bin",
+        "lccn",
+        "newspaper_name",
+        "topic_label",
+    ]
+    if include_article_url:
+        doc_columns.append("url")
+    doc_topics = doc_topics.reindex(columns=doc_columns, fill_value=None)
 
     topics_df = pd.DataFrame(topics)
     topics_df["top_terms"] = topics_df["top_terms"].apply(lambda terms: ", ".join(terms))
@@ -587,6 +612,7 @@ def run_topic_model(
         {
             "output_type": "topic_documents_csv",
             "row_count": int(len(doc_topics)),
+            "include_article_url": bool(include_article_url),
         }
     )
     meta_path = write_metadata_file(project_dir, output_paths["doc_topics"], doc_topics_meta, enabled=metadata_enabled)
