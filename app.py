@@ -65,7 +65,7 @@ from PyQt5.QtWidgets import (
 
 from chronam import download_data
 from chronam.config import DEFAULT_CSV_FILENAME, default_csv_path
-from chronam.map_create import create_map, _build_time_index, _parse_date
+from chronam.map_create import create_map, _build_time_index, _parse_date, create_topic_map, _load_newspapers_xy
 from chronam.collocate import run_collocation, build_collocation_output_paths
 from chronam.topics import (
     TopicModelParameters,
@@ -2224,6 +2224,7 @@ class CSVPreviewDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(os.path.basename(csv_path))
         self.setMinimumSize(900, 600)
+        self._csv_path = csv_path
         df = pd.read_csv(csv_path).head(max_rows)
         tbl = QTableWidget(df.shape[0], df.shape[1], self)
         tbl.setHorizontalHeaderLabels(list(df.columns))
@@ -2236,16 +2237,39 @@ class CSVPreviewDialog(QDialog):
             idx for idx, col in enumerate(df.columns) if self._is_hyperlink_column(col)
         }
 
-        topic_columns = {
-            idx
-            for idx, name in enumerate(df.columns)
-            if isinstance(name, str) and name.strip().lower() in {'topic_score', 'topic_weight'}
+        # Determine numeric columns for accurate sorting
+        numeric_names = {
+            'topic_id', 'doc_count', 'total_documents', 'weight', 'topic_weight', 'ordinal_rank', 'rank'
         }
+        numeric_columns = set()
+        top_scores_index = None
+        weight_index = None
+        for idx, name in enumerate(df.columns):
+            lname = str(name).strip().lower()
+            # dtype-aware detection
+            try:
+                if pd.api.types.is_numeric_dtype(df[name]):
+                    numeric_columns.add(idx)
+            except Exception:
+                pass
+            if lname in numeric_names:
+                numeric_columns.add(idx)
+            if lname == 'top_scores':
+                top_scores_index = idx
+            if lname == 'weight':
+                weight_index = idx
 
         for i, row in df.iterrows():
             for j, val in enumerate(row):
-                is_topic_metric = j in topic_columns
-                display, sort_value = self._render_value(val, numeric=is_topic_metric)
+                # Special handling: top_scores -> sort by first numeric value
+                if top_scores_index is not None and j == top_scores_index:
+                    text = '' if pd.isna(val) else str(val)
+                    sort_value = self._parse_first_float(text)
+                    display = text
+                else:
+                    # Use higher precision for 'weight' in Topic Documents
+                    decimals = 6 if (weight_index is not None and j == weight_index and self._looks_like_topic_documents(df)) else None
+                    display, sort_value = self._render_value(val, numeric=(j in numeric_columns), decimals=decimals)
                 item = SortableTableWidgetItem(display)
                 if sort_value is not None:
                     item.setData(Qt.UserRole, sort_value)
@@ -2262,6 +2286,27 @@ class CSVPreviewDialog(QDialog):
         if self._hyperlink_columns:
             tbl.cellActivated.connect(self._handle_link_activation)
         layout = QVBoxLayout(self)
+
+        # Top bar with an action to reveal the CSV in its folder
+        top_bar = QHBoxLayout()
+        open_btn = QPushButton('Show in Folder')
+        open_btn.setToolTip('Reveal this CSV in your file manager')
+        open_btn.clicked.connect(lambda: reveal_in_file_manager(self._csv_path))
+        top_bar.addWidget(open_btn)
+        top_bar.addStretch(1)
+        layout.addLayout(top_bar)
+
+        # Show sampling note for Topic Documents CSVs
+        try:
+            total_rows = self._count_csv_rows(csv_path)
+        except Exception:
+            total_rows = None
+        is_topic_docs = self._looks_like_topic_documents(df)
+        if is_topic_docs and total_rows and total_rows > max_rows:
+            note = QLabel(f'Showing first {max_rows} rows of {total_rows:,} total in Topic Documents.')
+            note.setStyleSheet('color: #555555; font-size: 11px;')
+            layout.addWidget(note)
+
         layout.addWidget(tbl)
         tbl.setFocus()
         tbl.setSortingEnabled(True)
@@ -2296,7 +2341,7 @@ class CSVPreviewDialog(QDialog):
         QDesktopServices.openUrl(qurl)
 
     @staticmethod
-    def _render_value(value: Any, *, numeric: bool) -> Tuple[str, Optional[float]]:
+    def _render_value(value: Any, *, numeric: bool, decimals: Optional[int] = None) -> Tuple[str, Optional[float]]:
         if pd.isna(value):
             return '', None
         if not numeric:
@@ -2305,7 +2350,38 @@ class CSVPreviewDialog(QDialog):
             numeric_value = float(value)
         except (TypeError, ValueError):
             return str(value), None
+        if isinstance(decimals, int):
+            try:
+                return f"{numeric_value:.{decimals}f}", numeric_value
+            except Exception:
+                return str(value), numeric_value
         return f"{numeric_value:,.0f}", numeric_value
+
+    @staticmethod
+    def _parse_first_float(text: str) -> Optional[float]:
+        try:
+            import re as _re
+            m = _re.search(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', text or '')
+            if m:
+                return float(m.group(0))
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _count_csv_rows(path: str) -> Optional[int]:
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
+                # subtract header
+                return max(0, sum(1 for _ in fh) - 1)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _looks_like_topic_documents(df: pd.DataFrame) -> bool:
+        cols = {str(c).strip().lower() for c in df.columns}
+        required = {'topic_id', 'weight', 'rank'}
+        return required.issubset(cols)
 
 
 class CollocationRankSettingsDialog(QDialog):
@@ -2811,6 +2887,131 @@ class CollocateMapSettingsDialog(QDialog):
             'location_label': location_label,
             'enable_time_slider': self.enable_time_slider.isEnabled() and self.enable_time_slider.isChecked(),
             'use_selected_terms': self.use_selected_terms_check.isChecked(),
+            'export_csv': self.export_csv_check.isChecked(),
+        }
+
+
+class TopicMapSettingsDialog(QDialog):
+    def __init__(
+        self,
+        parent,
+        *,
+        time_bins: List[Tuple[str, str]],
+        cities: List[Tuple[str, str]],
+        states: List[str],
+        default_top_n: int = 10,
+        max_top_n: int = 150,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle('Topic Map Settings')
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+
+        self.map_type_combo = QComboBox()
+        self.map_type_combo.addItem('Select Topic Rank Map', 'rank')
+        self.map_type_combo.addItem('Top Ranked Topic by Location', 'top_term')
+        form.addRow('Map type:', self.map_type_combo)
+
+        self.top_spin = QSpinBox()
+        self.top_spin.setRange(1, max_top_n)
+        self.top_spin.setValue(max(1, min(default_top_n, max_top_n)))
+        form.addRow('Top N topics:', self.top_spin)
+
+        self.lightweight_check = QCheckBox('Lightweight mode (trim popup payloads)')
+        self.lightweight_check.setChecked(True)
+        form.addRow(self.lightweight_check)
+
+        self.export_csv_check = QCheckBox('Export topic CSV with XY')
+        self.export_csv_check.setToolTip('Writes a CSV summarizing topics with coordinates for further analysis.')
+        form.addRow(self.export_csv_check)
+
+        time_row = QWidget()
+        time_layout = QHBoxLayout(time_row)
+        time_layout.setContentsMargins(0, 0, 0, 0)
+        time_layout.setSpacing(6)
+        self.enable_time_slider = QCheckBox('Enable time slider')
+        self.enable_time_slider.setEnabled(bool(time_bins))
+        if time_bins:
+            self.enable_time_slider.setChecked(True)
+        time_layout.addWidget(self.enable_time_slider)
+        time_layout.addStretch(1)
+        form.addRow('Time controls:', time_row)
+
+        layout.addLayout(form)
+
+        # Scope box (no per-time-scoped topic selection for now)
+        location_box = QGroupBox('Location weighting')
+        location_layout = QVBoxLayout(location_box)
+        self.loc_all_radio = QRadioButton('All cities')
+        self.loc_city_radio = QRadioButton('Specific city')
+        self.loc_state_radio = QRadioButton('Specific state')
+        self.loc_all_radio.setChecked(True)
+        location_layout.addWidget(self.loc_all_radio)
+        location_layout.addWidget(self.loc_city_radio)
+        self.city_combo = QComboBox()
+        for city, state in cities:
+            label = city or ''
+            if state:
+                label = f'{label}, {state}' if label else state
+            self.city_combo.addItem(label, (city or '', state or ''))
+        self.city_combo.setEnabled(False)
+        if not cities:
+            self.loc_city_radio.setEnabled(False)
+        location_layout.addWidget(self.city_combo)
+        location_layout.addWidget(self.loc_state_radio)
+        self.state_combo = QComboBox()
+        for state in states:
+            self.state_combo.addItem(state)
+        self.state_combo.setEnabled(False)
+        if not states:
+            self.loc_state_radio.setEnabled(False)
+        location_layout.addWidget(self.state_combo)
+        layout.addWidget(location_box)
+
+        def _update_location_controls():
+            self.city_combo.setEnabled(
+                self.loc_city_radio.isEnabled()
+                and self.loc_city_radio.isChecked()
+                and self.city_combo.count() > 0
+            )
+            self.state_combo.setEnabled(
+                self.loc_state_radio.isEnabled()
+                and self.loc_state_radio.isChecked()
+                and self.state_combo.count() > 0
+            )
+
+        self.loc_all_radio.toggled.connect(lambda _checked: _update_location_controls())
+        self.loc_city_radio.toggled.connect(lambda _checked: _update_location_controls())
+        self.loc_state_radio.toggled.connect(lambda _checked: _update_location_controls())
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        _update_location_controls()
+
+    def values(self) -> dict:
+        location_scope = 'all'
+        city_val = ''
+        state_val = ''
+        if self.loc_city_radio.isChecked() and self.city_combo.count() > 0:
+            data = self.city_combo.currentData()
+            if isinstance(data, tuple):
+                city_val, state_val = data
+            location_scope = 'city'
+        elif self.loc_state_radio.isChecked() and self.state_combo.count() > 0:
+            location_scope = 'state'
+            state_val = str(self.state_combo.currentText() or '').strip()
+        return {
+            'map_type': self.map_type_combo.currentData(),
+            'top_n': self.top_spin.value(),
+            'location_scope': location_scope,
+            'location_city': str(city_val or ''),
+            'location_state': str(state_val or ''),
+            'lightweight': self.lightweight_check.isChecked(),
+            'enable_time_slider': self.enable_time_slider.isEnabled() and self.enable_time_slider.isChecked(),
             'export_csv': self.export_csv_check.isChecked(),
         }
 
@@ -4341,6 +4542,7 @@ class CollocationDialog(QDialog):
 
         btn_topic = QPushButton('Run Topic Model')
         btn_topic_trends = QPushButton('Plot Topic Trends')
+        btn_topic_map = QPushButton('Create Topic Model Map')
         self.btn_open_topic_docs = QPushButton('Open Topic Documents CSV')
         self.btn_open_topic_docs.setEnabled(False)
 
@@ -4348,7 +4550,7 @@ class CollocationDialog(QDialog):
         topic_buttons_layout = QVBoxLayout(topic_buttons_container)
         topic_buttons_layout.setContentsMargins(0, 12, 0, 0)
         topic_buttons_layout.setSpacing(8)
-        for button in (btn_topic, btn_topic_trends, self.btn_open_topic_docs):
+        for button in (btn_topic, btn_topic_trends, btn_topic_map, self.btn_open_topic_docs):
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             topic_buttons_layout.addWidget(button)
 
@@ -4381,6 +4583,7 @@ class CollocationDialog(QDialog):
         btn_map_collocate.clicked.connect(self.create_collocate_rank_map)
         btn_topic.clicked.connect(self.run_topic_model_action)
         btn_topic_trends.clicked.connect(self.show_topic_trends)
+        btn_topic_map.clicked.connect(self.create_topic_model_map)
         self.btn_open_topic_docs.clicked.connect(self.open_topic_documents_csv)
 
         self._update_selected_terms_summary()
@@ -6481,13 +6684,157 @@ class CollocationDialog(QDialog):
         if not path or not os.path.exists(path):
             QMessageBox.information(self, 'File Not Found', 'Run topic modeling to create the topic_documents CSV before opening it.')
             return
-        preview = CSVPreviewDialog(path, parent=self, max_rows=150)
+        preview = CSVPreviewDialog(path, parent=self, max_rows=250)
         preview.resize(1000, 620)
         preview.show()
         preview.raise_()
         preview.activateWindow()
         preview.setFocus()
         self._register_preview(preview)
+
+    def create_topic_model_map(self):
+        parent = self.parent()
+        if parent is None:
+            QMessageBox.warning(self, 'Unavailable', 'Parent window not available.')
+            return
+        # Require topic_documents CSV
+        doc_topics_path = None
+        if isinstance(self._last_topic_paths, dict):
+            doc_topics_path = self._last_topic_paths.get('doc_topics')
+        if not doc_topics_path or not os.path.exists(doc_topics_path):
+            p, _ = QFileDialog.getOpenFileName(self, 'Select Topic Documents CSV', parent.project_folder or os.getcwd(), 'CSV Files (*.csv)')
+            if p:
+                doc_topics_path = p
+        if not doc_topics_path or not os.path.exists(doc_topics_path):
+            QMessageBox.information(self, 'Topic Documents Required', 'Run topic modeling first or select the topic_documents CSV.')
+            return
+
+        # Time slider options from main controls
+        ignore_bin = self.ignore_bin.isChecked()
+        size_text = self.bin_size.text().strip()
+        bin_unit = self.bin_unit.currentText().lower()
+        if not ignore_bin and (not size_text or not size_text.isdigit()):
+            QMessageBox.warning(self, 'Invalid Bin Size', 'Please enter an integer ≥ 1.')
+            return
+        time_unit = bin_unit if not ignore_bin else 'month'
+        time_step = int(size_text) if (not ignore_bin and size_text.isdigit()) else 1
+
+        # Load doc_topics to derive cities/states and time bins
+        try:
+            df = pd.read_csv(doc_topics_path)
+        except Exception as exc:
+            QMessageBox.critical(self, 'CSV Error', f'Unable to read topic_documents CSV:\n{exc}')
+            return
+        # Join XY to get city/state for dialog options
+        try:
+            xy = _load_newspapers_xy()
+        except Exception:
+            xy = None
+        cities: Set[Tuple[str, str]] = set()
+        states: Set[str] = set()
+        if xy is not None:
+            work = df.copy()
+            work['SN_norm'] = work.get('lccn').map(lambda v: re.sub(r'\D+', '', str(v or ''))[-8:].zfill(8) if str(v or '').strip() else '')
+            if 'SN' in work.columns:
+                mask = work['SN_norm'] == ''
+                work.loc[mask, 'SN_norm'] = work.loc[mask, 'SN'].map(lambda v: re.sub(r'\D+', '', str(v or ''))[-8:].zfill(8) if str(v or '').strip() else '')
+            joined = work.merge(xy[['SN_norm', 'City', 'State']], on='SN_norm', how='left')
+            for _, row in joined.iterrows():
+                city_val = str(row.get('City') or '').strip()
+                state_val = str(row.get('State') or '').strip()
+                if city_val:
+                    cities.add((city_val, state_val))
+                if state_val:
+                    states.add(state_val)
+        else:
+            # Fallback to CSV columns if present
+            for _, row in df.iterrows():
+                city_val = str(row.get('City') or '').strip()
+                state_val = str(row.get('State') or '').strip()
+                if city_val:
+                    cities.add((city_val, state_val))
+                if state_val:
+                    states.add(state_val)
+
+        time_bins_pairs: List[Tuple[str, str]] = []
+        if not ignore_bin and 'time_bin' in df.columns and df['time_bin'].notna().any():
+            labels = sorted(df['time_bin'].dropna().astype(str).unique())
+            for idx, label in enumerate(labels, start=1):
+                time_bins_pairs.append((str(idx), label))
+
+        sorted_cities = sorted([pair for pair in cities if pair[0]], key=lambda p: (p[0].lower(), p[1].lower()))
+        sorted_states = sorted(states, key=lambda s: s.lower())
+
+        settings_dialog = TopicMapSettingsDialog(
+            self,
+            time_bins=time_bins_pairs,
+            cities=sorted_cities,
+            states=sorted_states,
+            default_top_n=10,
+            max_top_n=150,
+        )
+        if settings_dialog.exec_() != QDialog.Accepted:
+            return
+        s = settings_dialog.values()
+
+        start_value = self.start_input.text().strip()
+        end_value = self.end_input.text().strip()
+
+        def task(*, cancel_event: Optional[threading.Event]):
+            return create_topic_map(
+                doc_topics_path,
+                mode='points',
+                time_unit=time_unit,
+                time_step=time_step,
+                disable_time=not bool(s.get('enable_time_slider')),
+                lightweight=bool(s.get('lightweight', True)),
+                table_mode='minimal',
+                table_row_limit=1000,
+                topic_rank_top_n=int(s.get('top_n') or 10),
+                topic_rank_term_scope='global',
+                topic_rank_time_key=None,
+                topic_rank_focus=str(s.get('location_scope') or 'all'),
+                topic_rank_focus_city=str(s.get('location_city') or '') or None,
+                topic_rank_focus_state=str(s.get('location_state') or '') or None,
+                topic_map_variant=str(s.get('map_type') or 'rank'),
+                project_dir=parent.project_folder if parent else None,
+                time_start_override=start_value or None,
+                time_end_override=end_value or None,
+                export_csv=bool(s.get('export_csv')),
+                cancel_event=cancel_event,
+            )
+
+        def handle_success(result: Dict[str, Optional[str]]):
+            map_path = (result or {}).get('map_path')
+            if map_path and os.path.exists(map_path):
+                encoded = urllib.parse.quote(map_path)
+                log_lines = [f'<div>Created topic map: <a href="chronam-open:{encoded}">{html.escape(map_path)}</a></div>']
+                csv_path = (result or {}).get('topic_csv')
+                if csv_path and os.path.exists(csv_path):
+                    encoded_csv = urllib.parse.quote(csv_path)
+                    log_lines.append(f'<div>Topic CSV: <a href="chronam-open:{encoded_csv}">{html.escape(csv_path)}</a></div>')
+                if parent and hasattr(parent, 'append_project_log'):
+                    parent.append_project_log('Topic Model Map', log_lines)
+                QDesktopServices.openUrl(QUrl.fromLocalFile(map_path))
+            else:
+                QMessageBox.information(self, 'No Map Created', 'The topic map was not created.')
+
+        def handle_error(exc: Exception):
+            QMessageBox.critical(self, 'Map Error', str(exc))
+
+        def handle_cancel():
+            self._set_clear_notice('Topic map build cancelled.')
+
+        started = self._start_operation(
+            'Building topic map…',
+            task,
+            on_success=handle_success,
+            on_error=handle_error,
+            on_cancel=handle_cancel,
+            context='topic-map',
+        )
+        if started:
+            return
 
 
     def show_bar(self):

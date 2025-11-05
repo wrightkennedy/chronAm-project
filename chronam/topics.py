@@ -519,6 +519,16 @@ def run_topic_model(
     else:
         df_raw = _load_json(json_path)  # type: ignore[arg-type]
 
+    # Ensure newspaper_name is populated when available via Title
+    try:
+        if 'Title' in df_raw.columns:
+            if 'newspaper_name' not in df_raw.columns:
+                df_raw['newspaper_name'] = df_raw['Title']
+            else:
+                df_raw['newspaper_name'] = df_raw['newspaper_name'].fillna(df_raw['Title'])
+    except Exception:
+        pass
+
     df_filtered = _filter_df(df_raw, start_date, end_date, city, state, is_geo=is_geo)
     _check_cancel(cancel_event)
 
