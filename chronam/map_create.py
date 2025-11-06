@@ -4,6 +4,7 @@ import os
 import re
 import uuid
 import csv
+import math
 import threading
 from collections import Counter, defaultdict
 from string import Template as StrTemplate
@@ -114,6 +115,7 @@ def _build_topic_points(doc_topics: pd.DataFrame, xy_df: pd.DataFrame, cancel_ev
             'topic_id': row.get('topic_id'),
             'topic_label': _sv(row.get('topic_label')),
             'date': (dtx.strftime('%Y-%m-%d') if isinstance(dtx, datetime) else _sv(row.get('date'))),
+            'weight': row.get('weight'),
         }
         points.append({'lat': latf, 'lon': lonf, 'props': props, 'date': dtx})
     return points, dates
@@ -128,6 +130,7 @@ def _build_topic_rank_index(
     focus_mode: str,
     focus_city: Optional[str],
     focus_state: Optional[str],
+    metric_mode: str = 'article_count',
     cancel_event: Optional[threading.Event] = None,
 ) -> Tuple[List[str], Dict[str, Dict[str, Dict[str, int]]], int, Dict[str, Dict[str, Set[int]]], Dict[str, Counter]]:
     """Compute per-location topic ranks similar to collocate index.
@@ -171,13 +174,41 @@ def _build_topic_rank_index(
         if gid:
             gid_to_indexes.setdefault(gid, []).append(idx)
 
+    metric_mode = (metric_mode or 'article_count').strip().lower()
+    if metric_mode not in {'article_count', 'weight_sum', 'weight_avg'}:
+        metric_mode = 'article_count'
+    use_metric_avg = metric_mode == 'weight_avg'
+
+    def _safe_weight(value: Any) -> float:
+        try:
+            w = float(value)
+            if math.isnan(w):
+                return 0.0
+            return w
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _final_metric(sum_val: float, count_val: int) -> float:
+        if use_metric_avg:
+            return sum_val / count_val if count_val > 0 else 0.0
+        return sum_val
+
+    def _finalize_map(sum_map: Dict[str, float], count_map: Dict[str, int]) -> Dict[str, float]:
+        result: Dict[str, float] = {}
+        for term, sum_val in sum_map.items():
+            result[term] = _final_metric(sum_val, count_map.get(term, 0))
+        return result
+
     # Build counters
     rank_index: Dict[str, Dict[str, Dict[str, int]]] = {}
-    time_totals: Dict[str, Counter] = defaultdict(Counter)
+    time_totals_counter: Dict[str, Counter] = defaultdict(Counter)
     hits_by_city: Dict[str, Dict[str, Set[int]]] = defaultdict(lambda: defaultdict(set))
-    global_counts: Counter = Counter()
-    focus_counts_city: Counter = Counter()
-    focus_counts_state: Counter = Counter()
+    global_metric_sum: Dict[str, float] = defaultdict(float)
+    global_metric_count: Dict[str, int] = defaultdict(int)
+    focus_metric_sum_city: Dict[str, float] = defaultdict(float)
+    focus_metric_count_city: Dict[str, int] = defaultdict(int)
+    focus_metric_sum_state: Dict[str, float] = defaultdict(float)
+    focus_metric_count_state: Dict[str, int] = defaultdict(int)
 
     # Determine time_key variants
     # Use time_bin column if present
@@ -198,47 +229,70 @@ def _build_topic_rank_index(
             continue
         subset = topic_df.iloc[idxs]
         # By-topic counts overall and per time
-        topic_counts = Counter()
-        time_counters: Dict[str, Counter] = defaultdict(Counter)
+        topic_metric_sum: Dict[str, float] = defaultdict(float)
+        topic_metric_count: Dict[str, int] = defaultdict(int)
+        time_metric_sum: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        time_metric_count: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         for j, r in subset.iterrows():
             _check_cancel(cancel_event)
             label = str(r.get('topic_label') or f"Topic {int(r.get('topic_id')) if pd.notna(r.get('topic_id')) else ''}").strip()
             if not label:
                 continue
-            topic_counts[label] += 1
+            if metric_mode == 'article_count':
+                metric_value = 1.0
+            else:
+                metric_value = _safe_weight(r.get('weight'))
+            topic_metric_sum[label] += metric_value
+            topic_metric_count[label] += 1
             if has_time:
                 tk = str(r.get('time_bin') or '').strip()
                 if tk:
-                    time_counters[tk][label] += 1
+                    time_metric_sum[tk][label] += metric_value
+                    time_metric_count[tk][label] += 1
             # hits map for counting articles per term and filtering by time
             city_key_norm = city_key(city, state)
             hits_by_city[city_key_norm][label].add(int(j))
+            global_metric_sum[label] += metric_value
+            global_metric_count[label] += 1
+            if focus_mode == 'city' and focus_city and city_norm == focus_city.strip().lower() and (not focus_state or state_norm == focus_state.strip().lower()):
+                focus_metric_sum_city[label] += metric_value
+                focus_metric_count_city[label] += 1
+            if focus_mode == 'state' and focus_state and state_norm == focus_state.strip().lower():
+                focus_metric_sum_state[label] += metric_value
+                focus_metric_count_state[label] += 1
 
-        # aggregate for global / focus sets
-        global_counts.update(topic_counts)
-        if focus_mode == 'city' and focus_city and city_norm == focus_city.strip().lower() and (not focus_state or state_norm == focus_state.strip().lower()):
-            focus_counts_city.update(topic_counts)
-        if focus_mode == 'state' and focus_state and state_norm == focus_state.strip().lower():
-            focus_counts_state.update(topic_counts)
+        metric_final_map = _finalize_map(topic_metric_sum, topic_metric_count)
 
         # Build ranks per group
-        if topic_counts:
-            ordered = sorted(topic_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        if metric_final_map:
+            ordered = sorted(metric_final_map.items(), key=lambda kv: (-kv[1], kv[0]))
             rank_map = {term: pos + 1 for pos, (term, _c) in enumerate(ordered)}
             rank_index.setdefault(city_key(city, state), {})[''] = rank_map
-        if time_counters:
-            for key, counter in time_counters.items():
-                ordered_t = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+        if time_metric_sum:
+            for key, sum_map in time_metric_sum.items():
+                count_map = time_metric_count.get(key, {})
+                finalized_time = _finalize_map(sum_map, count_map)
+                ordered_t = sorted(finalized_time.items(), key=lambda kv: (-kv[1], kv[0]))
                 rank_map_t = {term: pos + 1 for pos, (term, _c) in enumerate(ordered_t)}
                 rank_index.setdefault(city_key(city, state), {})[key] = rank_map_t
+                if finalized_time:
+                    time_totals_counter[key].update(finalized_time)
 
     # Choose selection list of topics
-    base_counter = global_counts
-    if focus_mode == 'city' and focus_counts_city:
-        base_counter = focus_counts_city
-    elif focus_mode == 'state' and focus_counts_state:
-        base_counter = focus_counts_state
-    selected = [term for term, _f in sorted(base_counter.items(), key=lambda kv: (-kv[1], kv[0])) if term][:max(1, top_n)]
+    base_sum_map = global_metric_sum
+    base_count_map = global_metric_count
+    if focus_mode == 'city' and focus_metric_sum_city:
+        base_sum_map = focus_metric_sum_city
+        base_count_map = focus_metric_count_city
+    elif focus_mode == 'state' and focus_metric_sum_state:
+        base_sum_map = focus_metric_sum_state
+        base_count_map = focus_metric_count_state
+    base_map = _finalize_map(base_sum_map, base_count_map)
+    selected = [
+        term
+        for term, _f in sorted(base_map.items(), key=lambda kv: (-kv[1], kv[0]))
+        if term
+    ][:max(1, top_n)]
 
     # Restrict rank_max
     rank_max = 0
@@ -247,7 +301,8 @@ def _build_topic_rank_index(
             if bucket:
                 rank_max = max(rank_max, len(bucket))
 
-    return selected, rank_index, rank_max or COLLOCATE_RANK_LIMIT, hits_by_city, time_totals
+    return selected, rank_index, rank_max or COLLOCATE_RANK_LIMIT, hits_by_city, time_totals_counter
+
 
 def _export_topic_csv(
     out_path: str,
@@ -374,26 +429,119 @@ def create_topic_map(
     topic_rank_focus: str = 'all',
     topic_rank_focus_city: Optional[str] = None,
     topic_rank_focus_state: Optional[str] = None,
+    topic_rank_metric: str = 'article_count',
     topic_map_variant: str = 'rank',
     project_dir: Optional[str] = None,
     time_start_override: Optional[str] = None,
     time_end_override: Optional[str] = None,
     export_csv: bool = False,
+    include_topic_summary: bool = True,
     cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Optional[str]]:
     """Create a topic model map analogous to collocate rank maps using doc_topics CSV and XY join.
     Returns dict with 'map_path' and optional 'attribute_table' and 'topic_csv'.
     """
+
+    def _topic_id_token(raw: Any) -> str:
+        """Normalize various topic_id representations (int, float, string) to tokens like 't5'."""
+        if raw is None:
+            return ''
+        try:
+            if pd.isna(raw):
+                return ''
+        except Exception:
+            pass
+        if isinstance(raw, bool):
+            return ''
+        if isinstance(raw, (int,)):
+            return f"t{int(raw)}"
+        if isinstance(raw, float):
+            try:
+                return f"t{int(raw)}"
+            except (TypeError, ValueError):
+                pass
+        raw_str = str(raw).strip()
+        if not raw_str:
+            return ''
+        lower = raw_str.lower()
+        if lower.startswith('t') and lower[1:].isdigit():
+            try:
+                return f"t{int(lower[1:])}"
+            except (TypeError, ValueError):
+                return ''
+        match = re.search(r'\d+', raw_str)
+        if match:
+            try:
+                return f"t{int(match.group(0))}"
+            except (TypeError, ValueError):
+                return f"t{match.group(0)}"
+        return ''
+
+    metric_mode = (topic_rank_metric or 'article_count').strip().lower()
+    if metric_mode not in {'article_count', 'weight_sum', 'weight_avg'}:
+        metric_mode = 'article_count'
+    metric_label_map = {
+        'article_count': 'Article count',
+        'weight_sum': 'Topic weight (sum)',
+        'weight_avg': 'Topic weight (average)',
+    }
+    metric_label = metric_label_map.get(metric_mode, 'Article count')
+
+    def _coerce_weight(value: Any) -> float:
+        try:
+            weight_val = float(value)
+            if math.isnan(weight_val):
+                return 0.0
+            return weight_val
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _format_metric_display(value: float) -> str:
+        if metric_mode == 'article_count':
+            try:
+                return f"{int(round(value)):,}"
+            except (TypeError, ValueError):
+                return "0"
+        return f"{value:,.2f}"
+
     # Load inputs
     topic_df = pd.read_csv(doc_topics_csv)
+    if 'topic_label' in topic_df.columns:
+        topic_df['topic_label'] = topic_df['topic_label'].fillna('').astype(str).str.strip()
     xy_df = _load_newspapers_xy(xy_csv_path)
     points, dates_dt = _build_topic_points(topic_df, xy_df, cancel_event=cancel_event)
+    for idx, entry in enumerate(points):
+        if isinstance(entry, dict):
+            entry['_popup_row_id'] = _sanitize_element_id(f'topic-row-{idx}')
     # Group and build datasets similar to GeoJSON flow
     groups = _group_points(points, cancel_event=cancel_event)
 
-    # Build popup dataset and basic stats per group
+    label_topic_id_map: Dict[str, str] = {}
+    for point_entry in points:
+        props = point_entry.get('props') or {}
+        label_value = str(props.get('topic_label') or '').strip()
+        if not label_value or label_value in label_topic_id_map:
+            continue
+        token_value = _topic_id_token(props.get('topic_id'))
+        if not token_value:
+            token_value = _topic_id_token(label_value)
+        if token_value:
+            label_topic_id_map[label_value] = token_value
+
+    # Build popup dataset, stats, and per-topic hit indexes
     popup_dataset: Dict[str, Any] = {}
     values: List[float] = []
+    group_hits_map: Dict[str, Dict[str, Set[int]]] = {}
+    topic_article_counts: Counter = Counter()
+    topic_city_sets: Dict[str, Set[Tuple[str, str]]] = defaultdict(set)
+    topic_newspaper_sets: Dict[str, Set[str]] = defaultdict(set)
+    topic_selector_entries: List[Tuple[str, int, str]] = []
+    global_newspapers_set: Set[str] = set()
+    global_city_set: Set[Tuple[str, str]] = set()
+    topic_metric_global_sum: Dict[str, float] = defaultdict(float)
+    topic_metric_global_count: Dict[str, int] = defaultdict(int)
+    topic_metric_totals: Dict[str, float] = {}
+
     for group in groups:
         entries = group.get('entries', [])
         gid = group.get('id')
@@ -403,26 +551,78 @@ def create_topic_map(
         # Determine group title and stats
         stats = _compute_group_stats(entries, search_term=None)
         title, count, paper_names = _group_header(entries, stats, None)
+
+        # Resolve city/state for this group
+        first_props = entries[0].get('props', {}) if entries else {}
+        city_val = str(first_props.get('City') or '').strip()
+        state_val = str(first_props.get('State') or '').strip()
+        city_key_tuple = (city_val.lower(), state_val.lower())
+        if city_val or state_val:
+            global_city_set.add(city_key_tuple)
+
         # Build standardized entry payloads for the popup renderer
         entry_payloads: List[Dict[str, Any]] = []
+        group_term_indexes: Dict[str, Set[int]] = defaultdict(set)
         for idx_e, e in enumerate(entries):
             payload = _entry_payload(e, None, embed_article=False, lightweight=True)
             payload['full_index'] = idx_e
             entry_payloads.append(payload)
+
+            props_raw = e.get('props') or {}
+            label_raw = str(
+                props_raw.get('topic_label')
+                or (
+                    f"Topic {props_raw.get('topic_id')}"
+                    if props_raw.get('topic_id') is not None
+                    else ''
+                )
+            ).strip()
+            if label_raw:
+                group_term_indexes[label_raw].add(idx_e)
+                topic_article_counts[label_raw] += 1
+                if city_val or state_val:
+                    topic_city_sets[label_raw].add(city_key_tuple)
+                if metric_mode == 'article_count':
+                    topic_metric_global_sum[label_raw] += 1.0
+                else:
+                    topic_metric_global_sum[label_raw] += _coerce_weight(props_raw.get('weight'))
+                topic_metric_global_count[label_raw] += 1
+            newspaper_raw = str(
+                props_raw.get('Title')
+                or props_raw.get('newspaper_name')
+                or ''
+            ).strip()
+            if newspaper_raw:
+                norm_newspaper = newspaper_raw.lower()
+                global_newspapers_set.add(norm_newspaper)
+                if label_raw:
+                    topic_newspaper_sets[label_raw].add(norm_newspaper)
+
         # Dataset entry
         dataset_entry = {
             'entries': entry_payloads,
             'full_entries': entry_payloads[:],
             'full_article_count': len(entries),
+            'article_count': len(entries),
             'lat': lat,
             'lon': lon,
             'title': title,
-            'city': entries[0].get('props', {}).get('City') if entries else '',
-            'state': entries[0].get('props', {}).get('State') if entries else '',
+            'city': city_val,
+            'state': state_val,
             'place_label': '',
         }
         popup_dataset[gid] = dataset_entry
         values.append(float(len(entries)))
+
+        if group_term_indexes:
+            group_hits_map[gid] = {term_label: set(idx_set) for term_label, idx_set in group_term_indexes.items()}
+
+    for term_label, sum_val in topic_metric_global_sum.items():
+        count_val = topic_metric_global_count.get(term_label, 0)
+        if metric_mode == 'weight_avg':
+            topic_metric_totals[term_label] = sum_val / count_val if count_val > 0 else 0.0
+        else:
+            topic_metric_totals[term_label] = sum_val
 
     # Build time slider bins if possible
     min_dt = min(dates_dt) if dates_dt else None
@@ -434,6 +634,25 @@ def create_topic_map(
     end_dt_meta = _parse_date(end_meta) if end_meta else None
     range_start = start_dt_meta or min_dt
     range_end = end_dt_meta or max_dt
+    unit_key = _unit_to_keyword(time_unit)
+
+    def _align_floor(dt: datetime, unit: str) -> datetime:
+        unit = _unit_to_keyword(unit)
+        if unit == 'year':
+            return dt.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        if unit == 'month':
+            return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if unit == 'week':
+            aligned = dt - timedelta(days=dt.weekday())
+            return aligned.replace(hour=0, minute=0, second=0, microsecond=0)
+        # day or finer
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if isinstance(range_start, datetime):
+        range_start = _align_floor(range_start, unit_key)
+    if isinstance(range_end, datetime):
+        range_end = _align_floor(range_end, unit_key)
+
     time_index: List[datetime] = []
     time_labels: List[str] = []
     use_time_slider = bool(dates_dt) and not disable_time
@@ -443,6 +662,8 @@ def create_topic_map(
 
     # Prepare ranking index from topics
     topic_df_for_rank = topic_df.copy()
+    if 'topic_label' in topic_df_for_rank.columns:
+        topic_df_for_rank['topic_label'] = topic_df_for_rank['topic_label'].fillna('').astype(str).str.strip()
     # Normalize IDs for join
     if 'lccn' in topic_df_for_rank.columns:
         topic_df_for_rank['SN_norm'] = topic_df_for_rank['lccn'].map(_norm_sn)
@@ -463,30 +684,46 @@ def create_topic_map(
         focus_mode=topic_rank_focus,
         focus_city=topic_rank_focus_city,
         focus_state=topic_rank_focus_state,
+        metric_mode=metric_mode,
         cancel_event=cancel_event,
     )
 
-    # Build hits mapping aligned to each group's entry indexes for accurate counts with time bins
-    local_hits: Dict[str, Dict[str, Set[int]]] = defaultdict(lambda: defaultdict(set))
-    def _ck(c, s):
-        return f"{str(c or '').strip().lower()}||{str(s or '').strip().lower()}"
-    for group in groups:
-        gid = group.get('id')
-        if not gid:
-            continue
-        data = popup_dataset.get(gid) or {}
-        city_val = data.get('city')
-        state_val = data.get('state')
-        key = _ck(city_val, state_val)
-        for idx, entry in enumerate(data.get('entries') or []):
-            props = entry.get('props') or {}
-            label = str(props.get('topic_label') or (f"Topic {props.get('topic_id')}" if props.get('topic_id') is not None else '')).strip()
-            if not label:
-                continue
-            local_hits[key][label].add(idx)
-    # Prefer local mapping when available
-    if local_hits:
-        hits_by_city = local_hits
+    if topics_list:
+        topics_list = sorted(
+            topics_list,
+            key=lambda label: (-topic_article_counts.get(label, 0), label.lower()),
+        )
+    else:
+        topics_list = sorted(
+            topic_article_counts.keys(),
+            key=lambda label: (-topic_article_counts.get(label, 0), label.lower()),
+        )
+    for label in topics_list[:]:
+        token_val = label_topic_id_map.get(label, '')
+        if not token_val:
+            token_val = _topic_id_token(label)
+        article_count_val = int(topic_article_counts.get(label, 0))
+        metric_total_val = topic_metric_totals.get(label, 0.0)
+        topic_selector_entries.append((label, article_count_val, token_val, metric_total_val))
+
+    topic_summary_map: Dict[str, Dict[str, int]] = {}
+    topic_global_stats = {
+        'articles': len(points),
+        'newspapers': len(global_newspapers_set),
+        'cities': len(global_city_set),
+    }
+    if include_topic_summary:
+        summary_terms: Set[str] = set(topic_article_counts.keys())
+        summary_terms.update(topics_list)
+        for term in summary_terms:
+            topic_summary_map[term] = {
+                'articles': int(topic_article_counts.get(term, 0)),
+                'newspapers': len(topic_newspaper_sets.get(term, set())),
+                'cities': len(topic_city_sets.get(term, set())),
+                'metric': float(topic_metric_totals.get(term, 0.0)),
+                'metric_sum': float(topic_metric_global_sum.get(term, 0.0)),
+                'metric_count': int(topic_article_counts.get(term, 0)),
+            }
 
     # Build map
     base_name = os.path.splitext(os.path.basename(doc_topics_csv))[0]
@@ -581,53 +818,269 @@ def create_topic_map(
         popup_dataset=popup_dataset,
     )
 
-    # Header block
-    title_html = '<div style="font-weight:700; font-size:16px; margin-bottom:4px;">Top Ranked Topics</div>' if topic_map_variant != 'top_term' else '<div style="font-weight:700; font-size:16px; margin-bottom:4px;">Top Topic per Location</div>'
-    header_lines: List[str] = [title_html]
-    header_lines.append(f'<div><strong>Data Source:</strong> {html.escape(os.path.basename(doc_topics_csv))}</div>')
-    search_results_text = f"{sum(1 for g in groups for _ in (g.get('entries') or [])):,} topic-article rows | {len(groups):,} cities"
-    header_lines.append(f'<div style=\"margin-top:4px;\"><strong>Search Results:</strong> {html.escape(search_results_text)}</div>')
-    header_lines.append('<div style="height:6px;"></div>')
-    slider_placeholder = '<div id="collocateTimeSliderContainer" style="margin-top:6px;"></div>' if (use_time_slider and time_index and len(time_index) > 1) else ''
-    if topic_map_variant == 'top_term':
-        header_lines.append('<div>Markers display the top-ranked topic for each location. Circle size reflects the number of articles for that topic.</div>')
-        if slider_placeholder:
-            header_lines.append(slider_placeholder)
-        header_lines.append('<div id="collocateSummaryLine" style="color:#2d3748; margin-top:6px; position:relative; display:inline-block; min-width:320px;"></div>')
-    else:
-        if topics_list:
-            select_opts = ''.join([f'<option value="{html.escape(term)}">({i}) {html.escape(term)}</option>' for i, term in enumerate(topics_list[:200], start=1)])
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    attr_file: Optional[str] = None
+    attr_filename = f"{base_name}_topicmap_{topic_map_variant}_{timestamp}_attributes.html"
+    attr_path = os.path.join(out_dir, attr_filename)
+    table_limit = None
+    if table_row_limit is not None:
+        try:
+            table_limit = int(table_row_limit)
+        except (TypeError, ValueError):
+            table_limit = None
         else:
-            select_opts = ''
-        header_lines.append('<div style="margin-top:6px;"><label style="font-weight:600; margin-right:6px;">Topic:</label>'
-                            f'<select id="collocateTermSelect" style="min-width:220px;">{select_opts}</select></div>')
-        if slider_placeholder:
-            header_lines.append(slider_placeholder)
-        header_lines.append('<div id="collocateSummaryLine" style="color:#2d3748; margin-top:6px; position:relative; display:inline-block; min-width:320px;"></div>')
+            if table_limit <= 0:
+                table_limit = None
+    table_kwargs = {
+        'max_rows': table_limit,
+        'omit_article': True,
+    }
+    attr_file = _write_attribute_table(points, attr_path, **table_kwargs)
 
-    header_html = (
-        '<div style="position: fixed; top: 5px; left: 5px; z-index:9999;">'
-        '<div style="max-width: 560px; background: rgba(255,255,255,0.92); '
-        'padding: 8px 12px; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.2); '
-        'font-size: 13px; line-height: 1.4;">'
-        + ''.join(header_lines)
-        + '</div></div>'
+    valid_row_ids = {
+        entry.get('_popup_row_id')
+        for entry in points
+        if isinstance(entry, dict) and entry.get('_attr_in_table')
+    }
+    if not attr_file:
+        valid_row_ids = set()
+
+    if popup_dataset:
+        def _prune_attr_ids(payloads: Optional[List[Dict[str, Any]]]) -> None:
+            if not payloads:
+                return
+            for payload in payloads:
+                if not isinstance(payload, dict):
+                    continue
+                row_id = payload.get('attr_row_id')
+                if row_id and row_id not in valid_row_ids:
+                    payload['attr_row_id'] = ''
+
+        for dataset_entry in popup_dataset.values():
+            if not isinstance(dataset_entry, dict):
+                continue
+            _prune_attr_ids(dataset_entry.get('entries'))
+            _prune_attr_ids(dataset_entry.get('full_entries'))
+
+    # Header and info card
+    title_main_text = 'Top Ranked Topics' if topic_map_variant != 'top_term' else 'Top Topic per Location'
+    title_main_html = html.escape(title_main_text)
+    date_line_text = ''
+    if range_start or range_end:
+        start_text = range_start.strftime('%Y-%m-%d') if isinstance(range_start, datetime) else ''
+        end_text = range_end.strftime('%Y-%m-%d') if isinstance(range_end, datetime) else ''
+        if start_text and end_text and start_text != end_text:
+            date_line_text = f"{start_text} to {end_text}"
+        elif start_text and end_text:
+            date_line_text = start_text
+        elif start_text or end_text:
+            date_line_text = start_text or end_text
+    date_line_html = f'<div class="collocate-info-subtitle">{html.escape(date_line_text)}</div>' if date_line_text else ''
+
+    if topic_map_variant == 'top_term':
+        summary_initial = 'Top topic per location.'
+        summary_buffer_text = 'Top topic sample: 999,999 articles | 9,999 cities | Time: 1901-01-01'
+    else:
+        summary_initial = f'Topic: none selected (Metric: {metric_label})'
+        summary_buffer_text = (
+            'Topic sample: 999,999 articles | 9,999 newspapers | 9,999 cities | Time: 1901-01-01'
+        )
+    summary_color = '#2d3748' if topic_map_variant == 'top_term' else '#c53030'
+    summary_html = (
+        f'<div id="collocateSummaryLine" class="info-summary" style="color:{summary_color};">'
+        f'<span data-summary-content="1">{html.escape(summary_initial)}</span>'
+        '<span aria-hidden="true" data-summary-buffer="1">'
+        f'{html.escape(summary_buffer_text)}'
+        '</span>'
+        '</div>'
     )
-    m.get_root().html.add_child(folium.Element(header_html))
+
+    slider_placeholder = ''
+    if use_time_slider and time_index:
+        slider_placeholder = '<div id="collocateTimeSliderContainer" style="margin-top:6px;"></div>'
+
+    main_sections: List[str] = []
+    title_block = (
+        '<div class="collocate-info-title">'
+        f'<div class="collocate-info-title-main">{title_main_html}</div>'
+        f'{date_line_html}'
+        '</div>'
+    )
+    main_sections.append(title_block)
+    main_sections.append(summary_html)
+
+    select_html = ''
+    if topic_map_variant != 'top_term':
+        if topic_selector_entries:
+            select_options: List[str] = []
+            for idx, (term, article_count, topic_token, metric_value) in enumerate(topic_selector_entries[:200], start=1):
+                term_value = html.escape(term)
+                token_value = html.escape(topic_token) if topic_token else ''
+                option_parts = [f'<option value="{term_value}"']
+                if token_value:
+                    option_parts.append(f' data-topic-id="{token_value}"')
+                if article_count:
+                    option_parts.append(f' data-article-count="{int(article_count)}"')
+                option_parts.append(f' data-metric-value="{_format_metric_display(metric_value)}"')
+                option_parts.append('>')
+                display_label = f'({idx}) {term}'
+                if topic_token:
+                    display_label += f' ({topic_token})'
+                if article_count:
+                    display_label += f' — {article_count:,} articles'
+                if metric_mode != 'article_count':
+                    display_label += f' | {metric_label}: {_format_metric_display(metric_value)}'
+                option_parts.append(html.escape(display_label))
+                option_parts.append('</option>')
+                select_options.append(''.join(option_parts))
+            options_html = ''.join(select_options)
+            select_html = (
+                '<div class="collocate-info-controls">'
+                '<label for="collocateTermSelect">Topic:</label>'
+                f'<select id="collocateTermSelect">{options_html}</select>'
+                '</div>'
+            )
+        else:
+            select_html = '<div class="info-paragraph muted">No topics available for ranking.</div>'
+    if select_html:
+        main_sections.append(select_html)
+    if slider_placeholder:
+        main_sections.append(slider_placeholder)
+
+    articles_count = sum(len(group.get('entries') or []) for group in groups)
+    newspaper_ids: Set[str] = set()
+    city_set: Set[Tuple[str, str]] = set()
+    for group in groups:
+        entries = group.get('entries') or []
+        if not entries:
+            continue
+        first_props = entries[0].get('props', {}) if isinstance(entries[0], dict) else {}
+        city_val = str(first_props.get('City') or '').strip()
+        state_val = str(first_props.get('State') or '').strip()
+        if city_val or state_val:
+            city_set.add((city_val.lower(), state_val.lower()))
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            props = entry.get('props') or {}
+            ident = (
+                str(props.get('lccn') or '').strip().lower()
+                or str(props.get('SN') or '').strip().lower()
+                or str(props.get('Title') or '').strip().lower()
+            )
+            if ident:
+                newspaper_ids.add(ident)
+    search_results_text = f"{articles_count:,} articles | {len(newspaper_ids):,} newspapers | {len(city_set):,} cities"
+
+    main_html = ''.join(main_sections)
+
+    attr_link_html = ''
+    if attr_file:
+        attr_link_html = f'<div><a href="{html.escape(os.path.basename(attr_file))}" target="_blank" rel="noopener">Open attribute table</a></div>'
+    csv_link_html = ''
+    if export_csv:
+        csv_link_name = f"{base_name}_topicmap_{topic_map_variant}_{timestamp}.csv"
+        csv_link_html = f'<div><a href="{html.escape(csv_link_name)}" target="_blank" rel="noopener">Open topic metrics CSV</a></div>'
+
+    extra_sections: List[str] = []
+    extra_sections.append(f'<div><strong>Data Source:</strong> {html.escape(os.path.basename(doc_topics_csv))}</div>')
+    extra_sections.append(f'<div><strong>Search Results:</strong> {html.escape(search_results_text)}</div>')
+    if topic_map_variant == 'top_term':
+        extra_sections.append('<div class="info-paragraph">Color differentiates the top topic at each location. Circle size reflects the number of articles tied to that topic.</div>')
+    else:
+        extra_sections.append('<div class="info-paragraph">Select a topic to see how it ranks across locations. Larger circles represent higher-ranked topics (rank 1 is largest). Hover markers to view rank labels.</div>')
+        extra_sections.append(f'<div><strong>Ranking metric:</strong> {html.escape(metric_label)}</div>')
+    extra_sections.append('<div class="info-paragraph muted">Summary totals reflect all articles, newspapers, and cities for the selected topic.</div>')
+    if table_limit:
+        extra_sections.append(f'<div class="info-paragraph muted">Topic documents table includes the first {table_limit:,} records for quick preview.</div>')
+    if attr_link_html:
+        extra_sections.append(attr_link_html)
+    if csv_link_html:
+        extra_sections.append(csv_link_html)
+
+    extra_html = ''.join(extra_sections)
+
+    info_styles = """<style>
+.collocate-info-wrapper { position: fixed; top: 8px; left: 8px; z-index: 9999; max-width: 560px; }
+.collocate-info-card { background: rgba(255,255,255,0.94); border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.2); padding: 12px 14px; font-size: 13px; line-height: 1.4; display: flex; flex-direction: column; gap: 10px; }
+.collocate-info-title-main { font-weight: 700; font-size: 16px; color: #1a202c; }
+.collocate-info-subtitle { font-size: 13px; font-weight: 600; color: #2d3748; margin-top: 2px; }
+.collocate-info-main > * + * { margin-top: 6px; }
+.collocate-info-extra { border-top: 1px solid #e2e8f0; padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.collocate-info-card[data-collapsed="1"] .collocate-info-extra { display: none; }
+.collocate-info-footer { display: flex; justify-content: flex-end; }
+.collocate-info-toggle { border: none; background: none; color: #2b6cb0; cursor: pointer; font-size: 12px; font-weight: 600; padding: 0; }
+.collocate-info-toggle:focus { outline: 2px solid #4299e1; outline-offset: 2px; }
+.info-paragraph { color: #2d3748; }
+.info-paragraph.muted { color: #4a5568; font-size: 12px; }
+.info-summary { position: relative; display: inline-block; min-width: 320px; }
+.info-summary [data-summary-buffer] { visibility: hidden; pointer-events: none; white-space: nowrap; display: inline-block; }
+.collocate-info-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.collocate-info-controls label { font-weight: 600; }
+.collocate-info-controls select { min-width: 220px; }
+.collocate-time-container { margin-top: 4px; }
+.collocate-time-button { border: 1px solid #cbd5e0; background: #f7fafc; color: #2d3748; border-radius: 999px; padding: 2px 10px; font-size: 14px; line-height: 1; cursor: pointer; transition: background 0.2s ease, color 0.2s ease; }
+.collocate-time-button[data-clock-role="toggle"] { position: relative; font-size: 18px; padding: 2px 8px; }
+.collocate-time-button[data-clock-role="toggle"][data-clock-disabled="1"]::after { content: ""; position: absolute; left: 50%; top: 50%; width: 70%; height: 2px; background: #c53030; border-radius: 999px; pointer-events: none; transform: translate(-50%, -50%) rotate(45deg); }
+.collocate-time-button:hover { background: #edf2f7; color: #1a202c; }
+.collocate-time-button:disabled { opacity: 0.4; cursor: default; }
+#collocateTimeRange { accent-color: #2b6cb0; }
+</style>"""
+
+    info_card_html = (
+        '<div class="collocate-info-wrapper">'
+        '<div id="topicInfoCard" class="collocate-info-card" data-collapsed="0">'
+        '<div class="collocate-info-main">' + main_html + '</div>'
+        '<div class="collocate-info-extra">' + extra_html + '</div>'
+        '<div class="collocate-info-footer"><button type="button" class="collocate-info-toggle" data-info-toggle="1" aria-expanded="true">Show less...</button></div>'
+        '</div></div>'
+    )
+
+    toggle_script = """<script>
+(function() {
+  var card = document.getElementById('topicInfoCard');
+  if (!card) { return; }
+  var toggle = card.querySelector('[data-info-toggle]');
+  if (!toggle) { return; }
+  function update() {
+    var collapsed = card.getAttribute('data-collapsed') === '1';
+    toggle.textContent = collapsed ? 'Show more...' : 'Show less...';
+    toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  }
+  toggle.addEventListener('click', function(ev) {
+    ev.preventDefault();
+    var collapsed = card.getAttribute('data-collapsed') === '1';
+    card.setAttribute('data-collapsed', collapsed ? '0' : '1');
+    update();
+  });
+  update();
+})();
+</script>"""
+
+    m.get_root().html.add_child(folium.Element(info_styles + info_card_html + toggle_script))
 
     # Build config payload compatible with collocate JS handlers
     config_payload = {
-        'attribute_table': '',
+        'attribute_table': os.path.basename(attr_file) if attr_file else '',
         'search_term': '',
         'inline_articles': False,
         'time_labels': time_labels if use_time_slider and time_labels else [],
         'map_mode': mode,
         'click_radius_px': 12,
-        'collocate_summary': {},
-        'collocate_colorize': False,
+        'collocate_summary': topic_summary_map if topic_summary_map else {},
+        'collocate_rank_metric': metric_mode,
+        'collocate_rank_metric_label': metric_label,
+        'collocate_colorize': topic_map_variant != 'top_term',
         'initial_collocate_term': topics_list[0] if topics_list else '',
         'collocate_map_variant': topic_map_variant,
         'collocate_export_csv': bool(export_csv),
+        'summary_prefer_config': False,
+        'display_labels': {
+            'context': 'topic',
+            'term_singular': 'Topic',
+            'term_plural': 'Topics',
+            'legend_title': 'Top Topics',
+        },
     }
     if rank_index:
         config_payload['collocate_ranks'] = rank_index
@@ -644,6 +1097,8 @@ def create_topic_map(
             'time_label': '',
             'focus_label': '',
             'colorize': False,
+            'metric': metric_mode,
+            'metric_label': metric_label,
         }
         if use_time_slider and time_index:
             bins_payload = [{'key': str(idx + 1), 'label': dt.strftime('%Y-%m-%d'), 'iso': dt.strftime('%Y-%m-%dT%H:%M:%SZ')} for idx, dt in enumerate(time_index)]
@@ -689,7 +1144,7 @@ def create_topic_map(
         city = dataset_entry.get('city')
         state = dataset_entry.get('state')
         ckey = f"{str(city or '').strip().lower()}||{str(state or '').strip().lower()}"
-        term_hits = hits_by_city.get(ckey)
+        term_hits = group_hits_map.get(gid)
         if term_hits:
             dataset_entry['collocate_hits'] = {k: sorted(list(v)) for k, v in term_hits.items()}
         popup_json[gid] = dataset_entry
@@ -704,320 +1159,10 @@ def create_topic_map(
 
     # Inject lightweight interactivity: populate selector and respond to changes
     map_var = m.get_name()
-    mini_js_template = StrTemplate(r"""
-(function() {
-  var mapVarName = ${map_var};
-  var config = {{}};
-  var dataset = {{}};
-  function readJson(id) {{
-    var tag = document.getElementById(id);
-    if (!tag) return {{}};
-    try {{ return JSON.parse(tag.textContent || tag.innerText || '{{}}') || {{}}; }} catch (e) {{ return {{}}; }}
-  }}
-  function cityKey(city, state) {{
-    var c = String(city||'').trim().toLowerCase();
-    var s = String(state||'').trim().toLowerCase();
-    return c + '||' + s;
-  }}
-  function currentVariant() {{
-    var v = (config.collocate_map_variant || 'rank').toLowerCase();
-    return v === 'top_term' ? 'top_term' : 'rank';
-  }}
-  function lookupRank(ck, term) {{
-    var ranks = (config.collocate_ranks||{{}})[ck] || {{}};
-    var base = ranks[''] || {{}};
-    if (!Object.prototype.hasOwnProperty.call(base, term)) return null;
-    var val = Number(base[term]);
-    return Number.isFinite(val) ? val : null;
-  }}
-  function rankToRadius(rank) {{
-    if (!Number.isFinite(rank) || rank <= 0) return 6;
-    var rMin = 3, rMax = 18;
-    var mx = Number(config.rank_max)||150; if (!(mx>1)) mx = 2;
-    var t = 1 - ((rank - 1) / (mx - 1));
-    return Math.max(rMin, Math.min(rMax, rMin + t * (rMax - rMin)));
-  }}
-  function countToRadius(count, maxCount) {{
-    var minR = 4, maxR = 22;
-    var c = Number(count)||0, m = Number(maxCount)||0; if (m<=0) m=c||1;
-    if (c<=0) return minR;
-    var ratio = Math.min(1, Math.max(0, c / m));
-    var eased = Math.sqrt(ratio);
-    return Math.max(minR, Math.min(maxR, minR + eased * (maxR - minR)));
-  }}
-  function populateDropdown() {{
-    var sel = document.getElementById('collocateTermSelect');
-    if (!sel) return;
-    var terms = Array.isArray(config.collocate_terms) ? config.collocate_terms : [];
-    var html = '';
-    for (var i=0;i<terms.length;i++) {{ html += '<option value="'+terms[i]+'">('+(i+1)+') '+terms[i]+'</option>'; }}
-    sel.innerHTML = html;
-    var init = (typeof config.initial_collocate_term==='string') ? config.initial_collocate_term : (terms[0]||'');
-    if (init) {{ sel.value = init; }}
-    sel.addEventListener('change', function(){{ refreshSizes(); updateLegend(); }});
-  }}
-  function initTimeControls() {{
-    var host = document.getElementById('collocateTimeSliderContainer');
-    var bins = Array.isArray(config.collocate_time_bins) ? config.collocate_time_bins : [];
-    if (!host || !bins.length) return;
-    host.innerHTML = '';
-    var title = document.createElement('div');
-    title.style.display = 'flex'; title.style.alignItems = 'baseline'; title.style.gap = '6px'; title.style.fontWeight = '600';
-    var prefix = document.createElement('span'); prefix.textContent = 'Time bin:'; title.appendChild(prefix);
-    var label = document.createElement('span'); label.id = 'topicTimeLabel'; label.style.color = '#2b6cb0'; label.style.fontWeight='600'; title.appendChild(label);
-    host.appendChild(title);
-    var row = document.createElement('div'); row.style.display='flex'; row.style.alignItems='center'; row.style.gap='6px'; row.style.marginTop='4px';
-    var prev = document.createElement('button'); prev.textContent='‹'; prev.className='collocate-time-button';
-    var slider = document.createElement('input'); slider.type='range'; slider.min='1'; slider.max=String(bins.length); slider.step='1'; slider.style.width='200px';
-    var next = document.createElement('button'); next.textContent='›'; next.className='collocate-time-button';
-    row.appendChild(prev); row.appendChild(slider); row.appendChild(next); host.appendChild(row);
-    function updateLabel(){{ var i=parseInt(slider.value||'1',10); if (!(i>=1&&i<=bins.length)) i=1; label.textContent = bins[i-1].label || bins[i-1].key; }}
-    function apply(){{
-      var i=parseInt(slider.value||'1',10); if (!(i>=1&&i<=bins.length)) i=1;
-      config._selected_time_key = bins[i-1].key;
-      refreshSizes(); updateLegend();
-    }}
-    prev.addEventListener('click', function(){ var v=parseInt(slider.value||'1',10); v=(v-2+bins.length)%bins.length+1; slider.value=String(v); updateLabel(); apply(); });
-    next.addEventListener('click', function(){ var v=parseInt(slider.value||'1',10); v=(v%bins.length)+1; slider.value=String(v); updateLabel(); apply(); });
-    slider.addEventListener('input', function(){ updateLabel(); apply(); });
-    slider.value = (config.collocate_time_default && String(config.collocate_time_default)) || '1';
-    updateLabel(); apply();
-  }}
-  function currentTimeKey() {{ return config._selected_time_key || null; }}
-  function resolveTimeKeys(tk) {{
-    var out = [];
-    if (tk === null || typeof tk === 'undefined') return out;
-    var key = String(tk);
-    out.push(key);
-    var bins = Array.isArray(config.collocate_time_bins) ? config.collocate_time_bins : [];
-    for (var i=0;i<bins.length;i++) {{
-      var b = bins[i]; if (!b) continue;
-      if (String(b.key) === key) {{
-        if (b.label) out.push(String(b.label));
-        if (b.iso) out.push(String(b.iso));
-        break;
-      }}
-    }}
-    return out;
-  }}
-  function refreshSizes() {{
-    var mapObj = window[mapVarName];
-    if (!mapObj || typeof mapObj.eachLayer !== 'function') return;
-    var sel = document.getElementById('collocateTermSelect');
-    var term = sel ? String(sel.value||'').trim() : '';
-    var variant = currentVariant();
-    var timeKey = currentTimeKey();
-    var maxCount = 1;
-    if (variant === 'top_term') {{
-      Object.keys(dataset).forEach(function(gid) {{
-        var d = dataset[gid]; if (!d) return; var hits = d.collocate_hits||{{}}; var best = 0;
-        Object.keys(hits).forEach(function(t) {{
-          var arr = hits[t]||[];
-          var c = 0;
-          if (timeKey && d.time_bins && d.time_bins[timeKey]) {{
-            var allowed = new Set((d.time_bins[timeKey].indexes||[]).map(function(x){{return Number(x);}}));
-            arr.forEach(function(idx){{ if (allowed.has(Number(idx))) c+=1; }});
-          }} else {{ c = arr.length; }}
-          if (c>best) best=c;
-        }});
-        if (best>maxCount) maxCount = best;
-      }});
-    }}
-    mapObj.eachLayer(function(layer) {{
-      if (!layer || !layer.options || !layer.options.groupId) return;
-      var gid = layer.options.groupId;
-      var d = dataset[gid]; if (!d) return;
-      var ck = cityKey(d.city, d.state);
-      var radius = 6;
-      if (variant === 'rank' && term) {{
-        var ranks = (config.collocate_ranks||{{}})[ck] || {{}};
-        var bucket = {{}};
-        var tries = resolveTimeKeys(timeKey);
-        for (var i=0;i<tries.length;i++) {{ var k = tries[i]; if (Object.prototype.hasOwnProperty.call(ranks, k)) {{ bucket = ranks[k]||{{}}; break; }} }}
-        if (!Object.keys(bucket).length) {{ bucket = ranks[''] || {{}}; }}
-        var r = Number(bucket[term]); if (!Number.isFinite(r)) r = null;
-        radius = rankToRadius(r);
-      }} else if (variant === 'top_term') {{
-        var hits = d.collocate_hits||{{}};
-        var count = 0;
-        if (term && Object.prototype.hasOwnProperty.call(hits, term)) {{
-          var arr = hits[term]||[];
-          if (timeKey && d.time_bins && d.time_bins[timeKey]) {{
-            var allowed = new Set((d.time_bins[timeKey].indexes||[]).map(function(x){{return Number(x);}}));
-            arr.forEach(function(idx){{ if (allowed.has(Number(idx))) count+=1; }});
-          }} else {{ count = arr.length; }}
-        }} else {{
-          Object.keys(hits).forEach(function(t) {{
-            var arr = hits[t]||[]; var c=0;
-            if (timeKey && d.time_bins && d.time_bins[timeKey]) {{
-              var allowed = new Set((d.time_bins[timeKey].indexes||[]).map(function(x){{return Number(x);}}));
-              arr.forEach(function(idx){{ if (allowed.has(Number(idx))) c+=1; }});
-            }} else {{ c = arr.length; }}
-            if (c>count) count=c;
-          }});
-        }}
-        radius = countToRadius(count, maxCount);
-      }}
-      if (typeof layer.setRadius === 'function') {{ layer.setRadius(radius); }}
-      else {{ layer.options.radius = radius; if (typeof layer.redraw==='function') try {{ layer.redraw(); }} catch(e) {{}} }}
-      // Labels
-      try {{ if (layer.unbindTooltip) layer.unbindTooltip(); }} catch(e){{}}
-      if (variant === 'rank' && term && Number.isFinite(radius)) {{
-        var ranks = (config.collocate_ranks||{{}})[ck] || {{}};
-        var bucket = {{}};
-        var tries = resolveTimeKeys(timeKey);
-        for (var i=0;i<tries.length;i++) {{ var k = tries[i]; if (Object.prototype.hasOwnProperty.call(ranks, k)) {{ bucket = ranks[k]||{{}}; break; }} }}
-        if (!Object.keys(bucket).length) {{ bucket = ranks[''] || {{}}; }}
-        var rv = Number(bucket[term]);
-        var label = Number.isFinite(rv) ? String(rv) : '';
-        if (label && layer.bindTooltip) {{ layer.bindTooltip(label, {{ permanent:true, direction:'center', className:'collocate-rank-label', opacity:1 }}); }}
-      }} else if (variant === 'top_term') {{
-        var bestLabel = '';
-        if (term) {{ bestLabel = term; }} else {{
-          var ranks = (config.collocate_ranks||{{}})[ck] || {{}};
-          var bucket = {{}};
-          var tries = resolveTimeKeys(timeKey);
-          for (var i=0;i<tries.length;i++) {{ var k = tries[i]; if (Object.prototype.hasOwnProperty.call(ranks, k)) {{ bucket = ranks[k]||{{}}; break; }} }}
-          if (!Object.keys(bucket).length) {{ bucket = ranks[''] || {{}}; }}
-          var bestRank = 1e9;
-          Object.keys(bucket).forEach(function(t) {{ var rv=Number(bucket[t]); if (Number.isFinite(rv) && (rv<bestRank || (rv===bestRank && t<bestLabel))) {{ bestRank=rv; bestLabel=t; }} }});
-        }}
-        if (bestLabel && layer.bindTooltip) {{ layer.bindTooltip(bestLabel, {{ permanent:true, direction:'center', className:'top-term-label', opacity:0.9 }}); }}
-      }}
-    }});
-    updateSummary();
-  }}
-  function updateSummary() {{
-    var line = document.getElementById('collocateSummaryLine');
-    if (!line) return;
-    var sel = document.getElementById('collocateTermSelect');
-    var term = sel ? String(sel.value||'').trim() : '';
-    var timeKey = currentTimeKey();
-    if (!term) {{ line.textContent = 'Topic term: none selected'; return; }}
-    var cities = 0; var articles = 0;
-    Object.keys(dataset).forEach(function(gid) {{
-      var d = dataset[gid]; if (!d) return; var hits = d.collocate_hits||{{}};
-      var arr = hits[term]||[]; var c=0;
-      if (timeKey && d.time_bins && d.time_bins[timeKey]) {{
-        var allowed = new Set((d.time_bins[timeKey].indexes||[]).map(function(x){{return Number(x);}}));
-        arr.forEach(function(idx){{ if (allowed.has(Number(idx))) c+=1; }});
-      }} else {{ c = arr.length; }}
-      if (c>0) {{ cities += 1; articles += c; }}
-    }});
-    line.textContent = 'Topic term "' + term + '": ' + (articles||0).toLocaleString() + ' articles | ' + (cities||0).toLocaleString() + ' cities' + (timeKey ? (' | Time: '+String(timeKey)) : '');
-  }}
-  function updateLegend() {{
-    var variant = currentVariant();
-    var host = document.getElementById('topicLegend');
-    if (!host) {{ host = document.createElement('div'); host.id='topicLegend'; host.className='top-term-legend'; host.style.position='fixed'; host.style.top='60px'; host.style.right='12px'; host.style.zIndex='9999'; host.style.background='rgba(255,255,255,0.94)'; host.style.padding='8px 10px'; host.style.borderRadius='6px'; host.style.boxShadow='0 1px 4px rgba(0,0,0,0.25)'; document.body.appendChild(host); }}
-    if (variant !== 'top_term') {{ host.style.display='none'; return; }}
-    host.style.display='';
-    var listHtml = '';
-    var counts = {{}};
-    Object.keys(dataset).forEach(function(gid) {{
-      var d = dataset[gid]; if (!d) return; var ck = cityKey(d.city,d.state);
-      var ranks = (config.collocate_ranks||{{}})[ck]||{{}}; var bucket = {{}};
-      var tries = resolveTimeKeys(config._selected_time_key||'');
-      for (var i=0;i<tries.length;i++) {{ var k = tries[i]; if (Object.prototype.hasOwnProperty.call(ranks, k)) {{ bucket = ranks[k]||{{}}; break; }} }}
-      if (!Object.keys(bucket).length) {{ bucket = ranks[''] || {{}}; }}
-      var bestT=''; var bestR=1e9;
-      Object.keys(bucket).forEach(function(t) {{ var rv=Number(bucket[t]); if (Number.isFinite(rv) && (rv<bestR || (rv===bestR && t<bestT))) {{ bestT=t; bestR=rv; }} }});
-      if (bestT) counts[bestT] = (counts[bestT]||0)+1;
-    }});
-    var entries = Object.keys(counts).map(function(t){{ return {{ term:t, count:counts[t] }}; }}).sort(function(a,b){ if (b.count!==a.count) return b.count-a.count; return a.term.localeCompare(b.term); });
-    listHtml += '<h3>Top terms</h3><div class="legend-body">';
-    entries.forEach(function(e) {{ listHtml += '<div class="legend-item"><span class="swatch" style="background:#2b6cb0; width:12px;height:12px;border-radius:3px;display:inline-block;margin-right:6px;"></span><span class="term-label">'+e.term+'</span><span class="count-label" style="color:#4a5568;margin-left:6px;">'+e.count+' cities</span></div>'; }});
-    listHtml += '</div>';
-    host.innerHTML = listHtml;
-  }}
-function fillPopup(e) {
-    try {
-      var root = e && e.popup && e.popup.getElement && e.popup.getElement();
-      if (!root) return;
-      var container = root.querySelector('[data-popup-root="1"]');
-      if (!container) return;
-      var gid = container.getAttribute('data-group-id') || '';
-      var d = dataset[gid]; if (!d) return;
-      var body = container.querySelector('[data-detail-container]'); if (!body) return;
-      var timeKey = currentTimeKey();
-      var base = Array.isArray(d.full_entries) ? d.full_entries : (Array.isArray(d.entries) ? d.entries : []);
-      var items = [];
-      if (base.length) {
-        var allowed = null;
-        if (timeKey && d.time_bins && d.time_bins[timeKey] && Array.isArray(d.time_bins[timeKey].indexes)) {
-          allowed = new Set(d.time_bins[timeKey].indexes.map(function(v){ return Number(v); }));
-        }
-        if (allowed && allowed.size) {
-          for (var i=0;i<base.length;i++) {
-            var it = base[i]||{}; var idx = Number(it.full_index);
-            if (Number.isFinite(idx) && allowed.has(idx)) items.push(it);
-          }
-        } else {
-          items = base.slice();
-        }
-      }
-      var select = container.querySelector('select[data-map-select]');
-      if (select) {
-        var html = '';
-        for (var j=0;j<items.length;j++) { var x = items[j]||{}; var label = x.label || x.date || ('Entry '+(j+1)); html += '<option value="'+String(j)+'">'+label+'</option>'; }
-        select.innerHTML = html;
-        select.selectedIndex = select.options.length ? 0 : -1;
-        if (!select.dataset.listenerAttached) {
-          select.addEventListener('change', function(){
-            var idx = Number(select.value);
-            var it = (Array.isArray(items) && Number.isFinite(idx)) ? items[idx] : null;
-            if (!it) { body.innerHTML = '<div style="color:#999;">No data.</div>'; return; }
-            var meta=[];
-            if (it.topic_label) meta.push('Topic: '+it.topic_label);
-            if (it.date) meta.push('Date: '+it.date);
-            if (it.newspaper) meta.push('Newspaper: '+it.newspaper);
-            if (it.place) meta.push('Place: '+it.place);
-            var h='';
-            if (meta.length) h+='<div style="font-size:12px;color:#555;">'+meta.join(' | ')+'</div>';
-            if (it.first_line) h+='<div style="margin-top:4px;">'+it.first_line+'</div>';
-            body.innerHTML = h || '<div style="color:#999;">No data.</div>';
-          });
-          select.dataset.listenerAttached = '1';
-        }
-      }
-      if (!items.length) { body.innerHTML = '<div style="color:#999;">No data.</div>'; return; }
-      var entry = items[0] || {};
-      var meta = [];
-      if (entry.topic_label) meta.push('Topic: '+entry.topic_label);
-      if (entry.date) meta.push('Date: '+entry.date);
-      if (entry.newspaper) meta.push('Newspaper: '+entry.newspaper);
-      if (entry.place) meta.push('Place: '+entry.place);
-      var html = '';
-      if (meta.length) html += '<div style="font-size:12px;color:#555;">'+meta.join(' | ')+'</div>';
-      if (entry.first_line) html += '<div style="margin-top:4px;">'+entry.first_line+'</div>';
-      body.innerHTML = html || '<div style="color:#999;">No data.</div>';
-    } catch (err) {}
-  }
-  function boot() {{
-    config = readJson('map-config');
-    dataset = readJson('popup-data');
-    populateDropdown();
-    initTimeControls();
-    refreshSizes();
-    updateLegend();
-  var mapObj = window[mapVarName];
-    if (mapObj && typeof mapObj.on==='function') {{ mapObj.on('popupopen', fillPopup); }}
-  }}
-  if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', boot); } else { boot(); }
-})();
-""")
-    mini_js = mini_js_template.substitute(map_var=json.dumps(map_var))
-    # Avoid Jinja interpreting '{{' '}}' sequences inside inline JS, but preserve '}});' (end of blocks + function call)
-    import re as _re_js
-    mini_js = _re_js.sub(r'\{\{', '{', mini_js)
-    # Replace all double right braces with a single right brace; previously we
-    # attempted to preserve occurrences before ");" which left stray braces
-    # in the final JS (e.g., "}});"), causing a SyntaxError in browsers.
-    mini_js = _re_js.sub(r'\}\}', '}', mini_js)
-    m.get_root().script.add_child(folium.Element(mini_js))
+    script_html = _collocate_script_html(map_var)
+    m.get_root().script.add_child(folium.Element(script_html))
 
     # Save map
-    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
     map_filename = f"{base_name}_topicmap_{topic_map_variant}_{timestamp}.html"
     out_html = os.path.join(out_dir, map_filename)
     m.save(out_html)
@@ -1037,7 +1182,7 @@ function fillPopup(e) {
             range_end=range_end,
         )
 
-    return {'map_path': out_html, 'attribute_table': None, 'topic_csv': csv_path}
+    return {'map_path': out_html, 'attribute_table': attr_file, 'topic_csv': csv_path}
 
 
 def _tok(text: Any, drop_stop: bool = False) -> List[str]:
@@ -2032,6 +2177,16 @@ def _entry_payload(
             '' if lightweight else (_article_excerpt(article_text, search_term, max_chars=600) if article_text else '')
         ),
     }
+    weight_raw = props.get('weight')
+    weight_val = None
+    try:
+        weight_val = float(weight_raw)
+        if math.isnan(weight_val):
+            weight_val = None
+    except (TypeError, ValueError):
+        weight_val = None
+    if weight_val is not None:
+        payload['metric_weight'] = weight_val
     label_value = _feature_label(props)
     if label_value:
         payload['label'] = label_value
@@ -2535,1367 +2690,8 @@ class _ZoomTopRight(MacroElement):
 # Public API
 # ----------------------------
 
-def create_map(
-    geojson_path: str,
-    mode: str = "points",
-    time_unit: str = "month",
-    time_step: int = 1,
-    linger_unit: str = "week",
-    linger_step: int = 0,
-    disable_time: bool = False,
-    heat_radius: Optional[int] = None,
-    heat_value: Optional[float] = None,
-    grad_min_radius: Optional[int] = None,
-    grad_max_radius: Optional[int] = None,
-    metric: Optional[str] = None,
-    normalize: bool = False,
-    normalize_denominator: Optional[str] = None,
-    lightweight: bool = False,
-    table_mode: str = "full",
-    table_row_limit: Optional[int] = None,
-    collocate_rank_mode: bool = False,
-    collocate_drop_stopwords: bool = False,
-    collocate_window: int = 5,
-    collocate_drop_terms: Optional[List[str]] = None,
-    collocate_term_groups: Optional[List[dict]] = None,
-    collocate_rank_top_n: int = COLLOCATE_RANK_LIMIT,
-    collocate_rank_term_scope: str = 'global',
-    collocate_rank_time_key: Optional[str] = None,
-    collocate_rank_focus: str = 'all',
-    collocate_rank_focus_city: Optional[str] = None,
-    collocate_rank_focus_state: Optional[str] = None,
-    collocate_rank_time_label: Optional[str] = None,
-    collocate_rank_focus_label: Optional[str] = None,
-    collocate_rank_colorize: bool = False,
-    collocate_time_slider: bool = False,
-    collocate_rank_terms: Optional[List[str]] = None,
-    collocate_map_variant: str = 'rank',
-    collocate_search_term: Optional[str] = None,
-    metadata_enabled: bool = False,
-    project_dir: Optional[str] = None,
-    time_start_override: Optional[str] = None,
-    time_end_override: Optional[str] = None,
-    collocate_export_csv: bool = False,
-    cancel_event: Optional[threading.Event] = None,
-) -> Dict[str, Optional[str]]:
-    """
-    Create a leaflet map next to the GeoJSON.
 
-    Modes:
-      - "points": static points (CircleMarker dots) with popups.
-      - "cluster": clustered point markers that expand on zoom/click.
-      - "heatmap": heat density view. Uses a time slider if dates are present and time is enabled.
-      - "graduated": scaled circle markers sized by the chosen metric.
-
-    Time slider parameters (heatmap mode only):
-      - time_unit: 'day' | 'week' | 'month' | 'year'   (default 'month')
-      - time_step: integer step for the slider increments (default 1)
-      - linger_unit: same options as time_unit (default 'week')
-      - linger_step: how long (in linger_unit) a point remains visible after its date (default 0)
-
-    Additional options:
-      - disable_time: force a static heat layer even when dates are available.
-      - heat_radius: override the radius for the heatmap kernel (default 15).
-      - heat_value: multiplier applied to heatmap weights (default 1.0).
-      - grad_min_radius / grad_max_radius: radius range for graduated markers.
-      - metric: 'article_count' | 'page_count' | 'key_term_frequency'.
-      - normalize: divide the metric by a denominator when True.
-      - normalize_denominator: 'word_count' | 'article_count' | 'page_count'.
-      - lightweight: reduce popup detail and attribute table size for very large outputs.
-      - table_mode: 'full' | 'article' | 'minimal' – controls attribute table columns.
-      - table_row_limit: optional max rows in attribute table (None/<=0 for all rows).
-      - collocate_rank_mode / collocate_drop_stopwords / collocate_window / collocate_drop_terms: configure
-        lightweight collocate rank visualisation on point maps.
-      - collocate_term_groups: optional grouping definitions applied to collocate terms (list of
-        dictionaries with "name" and "terms" entries).
-      - collocate_rank_top_n: limit collocate list and rank output to the top-N terms (default 150).
-      - collocate_rank_term_scope: 'global' to rank across entire period, 'time' to use a specific time bin.
-      - collocate_rank_time_key: time-bin key (1-based index) when collocate_rank_term_scope='time'.
-      - collocate_rank_focus: 'all' (default), 'city', or 'state' to control which locations determine the top terms.
-      - collocate_rank_focus_city / collocate_rank_focus_state: labels used when collocate_rank_focus filters by city or state.
-      - collocate_rank_colorize: when True, apply a graduated color ramp based on collocate article counts.
-      - collocate_rank_terms: optional explicit list of collocate terms to include (overrides top-N when provided).
-      - collocate_time_slider: when True, expose an interactive time slider for collocate views (points mode only).
-      - collocate_map_variant: 'rank' (default) for the ranked-term explorer, or 'top_term' to show each location's top term.
-      - time_start_override / time_end_override: optional ISO dates to force the slider/time-bin extent
-        to respect user-selected parameters when metadata is missing.
-      - collocate_export_csv: when True, write a CSV summarizing collocate data per location.
-
-    Returns:
-        dict with 'map_path' and optional 'attribute_table'.
-    """
-
-    permitted_modes = {"points", "heatmap", "graduated", "cluster"}
-    mode_normalized = (mode or "points").strip().lower()
-    if mode_normalized not in permitted_modes:
-        mode_normalized = "points"
-    mode = mode_normalized
-
-    variant_norm = (collocate_map_variant or 'rank').strip().lower()
-    if variant_norm not in {'rank', 'top_term'}:
-        variant_norm = 'rank'
-    collocate_map_variant = variant_norm
-    top_term_variant = collocate_map_variant == 'top_term'
-
-    _check_cancel(cancel_event)
-
-    with open(geojson_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    features = data.get("features") or []
-    if not isinstance(features, list):
-        raise ValueError("GeoJSON does not contain a valid 'features' list.")
-
-    pts = _extract_points(features, cancel_event=cancel_event)
-    _check_cancel(cancel_event)
-    for entry in pts:
-        _check_cancel(cancel_event)
-        props = entry.get('props') or {}
-        entry['_article_full'] = props.get('article') or ''
-    for idx, entry in enumerate(pts):
-        _check_cancel(cancel_event)
-        entry['_popup_row_id'] = _sanitize_element_id(f'feature-row-{idx}')
-    groups = _group_points(pts, cancel_event=cancel_event)
-    _check_cancel(cancel_event)
-    override_term = (collocate_search_term or '').strip()
-    search_term = override_term or _detect_search_term(geojson_path, data)
-
-    start_override = (time_start_override or '').strip()
-    end_override = (time_end_override or '').strip()
-
-    city_entries_map: Dict[str, List[Dict[str, Any]]] = {}
-
-    allowed_metrics = {"article_count", "page_count", "key_term_frequency"}
-    metric_key = (metric or "article_count").strip().lower()
-    if metric_key not in allowed_metrics:
-        metric_key = "article_count"
-
-    metric_definitions = {
-        'article_count': {
-            'metric_display': 'Articles',
-            'normalized_display': 'Articles / Total Articles',
-            'denominator': 'article_count',
-            'denom_label': 'total articles',
-        },
-        'page_count': {
-            'metric_display': 'Pages',
-            'normalized_display': 'Pages / Total Pages',
-            'denominator': 'page_count',
-            'denom_label': 'total pages',
-        },
-        'key_term_frequency': {
-            'metric_display': 'Term Frequency',
-            'normalized_display': 'Term Frequency / Total Words',
-            'denominator': 'word_count',
-            'denom_label': 'total words',
-        },
-    }
-
-    metric_info = metric_definitions.get(metric_key, metric_definitions['article_count'])
-    metric_display = metric_info['metric_display']
-    metric_normalized_display = metric_info['normalized_display']
-    denom_label = metric_info['denom_label']
-
-    normalize_flag = bool(normalize)
-    denominator_key = metric_info['denominator'] if normalize_flag else None
-
-    time_enabled = mode == 'heatmap' and not disable_time
-
-    articles_count = len(pts)
-    city_set: set = set()
-    newspaper_ids: set = set()
-    dates_dt: List[datetime] = []
-    for p in pts:
-        props = p.get('props', {})
-        city = props.get('City')
-        if city not in (None, ""):
-            city_set.add(str(city))
-        sn = props.get('SN') or props.get('lccn')
-        if sn not in (None, ""):
-            newspaper_ids.add(str(sn))
-        else:
-            title = props.get('Title') or props.get('newspaper_name')
-            if title not in (None, ""):
-                newspaper_ids.add(str(title))
-        dt = p.get('date')
-        if isinstance(dt, datetime):
-            dates_dt.append(dt)
-
-    metadata = data.get('metadata') or data.get('properties') or {}
-    start_meta = start_override or metadata.get('start_date') or metadata.get('StartDate')
-    end_meta = end_override or metadata.get('end_date') or metadata.get('EndDate')
-    start_dt_meta = _parse_date(start_meta) if start_meta else None
-    end_dt_meta = _parse_date(end_meta) if end_meta else None
-
-    if dates_dt:
-        min_dt = min(dates_dt)
-        max_dt = max(dates_dt)
-    else:
-        min_dt = max_dt = None
-
-    dated_pts = [p for p in pts if p.get("date") is not None]
-    rank_time_bins = collocate_rank_mode and bool(dated_pts)
-    use_time_slider = bool(dated_pts) and time_enabled
-    time_index: List[datetime] = []
-    time_labels: List[str] = []
-    range_start = start_dt_meta or min_dt
-    range_end = end_dt_meta or max_dt
-    if range_start and range_end and range_start > range_end:
-        range_start, range_end = range_end, range_start
-    if (use_time_slider or rank_time_bins) and min_dt and max_dt:
-        time_index = _build_time_index(range_start, range_end, time_unit, max(1, int(time_step or 1)))
-        time_labels = [dt.strftime('%Y-%m-%dT%H:%M:%SZ') for dt in time_index]
-
-    collocate_time_slider_enabled = bool(
-        collocate_time_slider
-        and collocate_rank_mode
-        and time_index
-        and len(time_index) > 1
-    )
-    collocate_time_bins_payload: List[Dict[str, str]] = []
-    collocate_time_default_key: Optional[str] = None
-    if collocate_time_slider_enabled:
-        for idx, dt in enumerate(time_index):
-            label_iso = time_labels[idx] if idx < len(time_labels) else dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-            try:
-                display_label = dt.strftime('%Y-%m-%d')
-            except Exception:
-                display_label = label_iso
-            collocate_time_bins_payload.append({'key': str(idx + 1), 'label': display_label, 'iso': label_iso})
-        if len(collocate_time_bins_payload) <= 1:
-            collocate_time_slider_enabled = False
-            collocate_time_bins_payload = []
-        else:
-            if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time'):
-                if collocate_rank_time_key:
-                    candidate_key = str(collocate_rank_time_key).strip()
-                    if any(bin_info['key'] == candidate_key for bin_info in collocate_time_bins_payload):
-                        collocate_time_default_key = candidate_key
-            if collocate_time_default_key is None and collocate_time_bins_payload:
-                collocate_time_default_key = collocate_time_bins_payload[0]['key']
-
-    start_str = start_meta or (min_dt.strftime('%Y-%m-%d') if min_dt else '')
-    end_str = end_meta or (max_dt.strftime('%Y-%m-%d') if max_dt else '')
-    if not start_str and end_str:
-        start_str = end_str
-    if not end_str and start_str:
-        end_str = start_str
-    date_range = (start_str, end_str) if start_str or end_str else ()
-
-    popup_width = 320 if lightweight else 360
-
-    start_date_for_metrics: Optional[date] = None
-    end_date_for_metrics: Optional[date] = None
-    if isinstance(range_start, datetime):
-        start_date_for_metrics = range_start.date()
-    elif isinstance(range_start, date):
-        start_date_for_metrics = range_start
-    if isinstance(range_end, datetime):
-        end_date_for_metrics = range_end.date()
-    elif isinstance(range_end, date):
-        end_date_for_metrics = range_end
-    if start_date_for_metrics is None and min_dt:
-        start_date_for_metrics = min_dt.date()
-    if end_date_for_metrics is None and max_dt:
-        end_date_for_metrics = max_dt.date()
-
-    embed_articles = not lightweight
-    values: List[float] = []
-    popup_dataset: Dict[str, Any] = {}
-    for group in groups:
-        _check_cancel(cancel_event)
-        entries = group.get("entries", [])
-        stats = _compute_group_stats(entries, search_term)
-        group["stats"] = stats
-        value = _compute_group_value(stats, metric_key, normalize_flag, denominator_key)
-        group["value"] = value
-        group["metric_key"] = metric_key
-        group["metric_display"] = metric_display
-        group["metric_normalized_display"] = metric_normalized_display
-        group["normalized"] = normalize_flag
-        group["denominator_label"] = denom_label if normalize_flag else ''
-
-        location = group.get('location') or (
-            (entries[0]['lat'], entries[0]['lon']) if entries else (0.0, 0.0)
-        )
-        try:
-            loc_lat = float(location[0])
-        except (TypeError, ValueError, IndexError):
-            loc_lat = 0.0
-        try:
-            loc_lon = float(location[1])
-        except (TypeError, ValueError, IndexError):
-            loc_lon = 0.0
-
-        entry_payloads = []
-        year_match_counts: Dict[str, int] = {}
-        for entry_idx, entry in enumerate(entries):
-            _check_cancel(cancel_event)
-            payload = _entry_payload(
-                entry,
-                search_term,
-                embed_article=embed_articles,
-                lightweight=lightweight,
-            )
-            payload['full_index'] = entry_idx
-            entry_date = str(entry.get('date') or '').strip()
-            if entry_date:
-                year_token = entry_date[:4]
-                if year_token.isdigit():
-                    payload['dataset_year'] = year_token
-                    year_match_counts[year_token] = year_match_counts.get(year_token, 0) + 1
-                    try:
-                        year_int = int(year_token)
-                    except (TypeError, ValueError):
-                        year_int = None
-                    if year_int is not None:
-                        start_for_year = start_date_for_metrics or date(year_int, 1, 1)
-                        end_for_year = end_date_for_metrics or date(year_int, 12, 31)
-                        try:
-                            year_total_val = metric_total_for_year_within_dates(
-                                year_int,
-                                start_for_year,
-                                end_for_year,
-                                "article_count",
-                            )
-                        except Exception:
-                            year_total_val = None
-                        if year_total_val:
-                            payload['dataset_year_total'] = int(year_total_val)
-                            payload['dataset_metric_label'] = 'articles'
-            entry_payloads.append(payload)
-
-        for entry in entries:
-            _check_cancel(cancel_event)
-            entry["value"] = value
-
-        first_props = entries[0].get('props', {}) if entries else {}
-        city_raw = str(first_props.get('City') or '').strip()
-        state_raw = str(first_props.get('State') or '').strip()
-        city_key = _city_state_key(city_raw, state_raw)
-        place_label = ', '.join([p for p in (city_raw, state_raw) if p])
-
-        city_entries_map.setdefault(city_key, entries)
-
-        title_text, article_count, _ = _group_header(entries, stats, search_term)
-        dataset_entry: Dict[str, Any] = {
-            'entries': entry_payloads,
-            'value': value,
-            'full_value': value,
-            'article_count': article_count,
-            'full_article_count': article_count,
-            'title': title_text,
-            'full_title': title_text,
-            'metric_display': metric_display,
-            'metric_normalized_display': metric_normalized_display,
-            'normalized': normalize_flag,
-            'denominator_label': denom_label if normalize_flag else '',
-            'lat': loc_lat,
-            'lon': loc_lon,
-            'coords': [{'lat': loc_lat, 'lon': loc_lon}],
-            'location_index': 1,
-            'location_total': 1,
-            'location_label': '',
-            'search_term': search_term or '',
-            'city': city_raw,
-            'state': state_raw,
-            'place_label': place_label,
-        }
-        if year_match_counts:
-            dataset_entry['year_match_counts'] = year_match_counts
-
-        if (use_time_slider or rank_time_bins) and time_index:
-            time_bins: Dict[str, Dict[str, Any]] = {}
-            for idx_entry, entry in enumerate(entries):
-                dt = entry.get('date')
-                bin_indices = _assign_time_bins(dt, time_index, linger_unit, int(linger_step or 0))
-                for bin_idx in bin_indices:
-                    _check_cancel(cancel_event)
-                    if bin_idx < len(time_labels):
-                        label = time_labels[bin_idx]
-                    else:
-                        label = time_index[bin_idx].strftime('%Y-%m-%dT%H:%M:%SZ')
-                    key = str(bin_idx + 1)
-                    bucket = time_bins.setdefault(key, {'indexes': [], 'label': label})
-                    bucket['indexes'].append(idx_entry)
-
-            if time_bins:
-                time_payload: Dict[str, Any] = {}
-                for bin_key, info in time_bins.items():
-                    _check_cancel(cancel_event)
-                    indexes = info.get('indexes') or []
-                    if not indexes:
-                        continue
-                    bin_entries = [entries[i] for i in indexes if 0 <= i < len(entries)]
-                    if not bin_entries:
-                        continue
-                    bin_stats = _compute_group_stats(bin_entries, search_term)
-                    bin_value = _compute_group_value(bin_stats, metric_key, normalize_flag, denominator_key)
-                    bin_title, bin_count, _ = _group_header(bin_entries, bin_stats, search_term)
-                    label_value = info.get('label') or ''
-                    time_payload[bin_key] = {
-                        'indexes': indexes,
-                        'value': bin_value,
-                        'article_count': bin_count,
-                        'title': bin_title,
-                        'time_label': label_value,
-                    }
-                if time_payload:
-                    dataset_entry['time_bins'] = time_payload
-
-        popup_dataset[group['id']] = dataset_entry
-        values.append(value)
-
-    collocate_terms_list: List[str] = []
-    rank_index: Dict[str, Dict[str, Dict[str, int]]] = {}
-    rank_max_value = 0
-    collocate_term_stats: Dict[str, Dict[str, int]] = {}
-    collocate_hits_by_city: Dict[str, Dict[str, Set[int]]] = {}
-    initial_collocate_term: str = ''
-    initial_collocate_summary_text: str = ''
-    if collocate_rank_mode:
-        (
-            collocate_terms_list,
-            rank_index,
-            rank_max_value,
-            collocate_hits_by_city,
-            collocate_time_totals,
-            collocate_time_labels,
-        ) = _build_collocate_rank_index(
-            groups,
-            popup_dataset,
-            search_term,
-            drop_stopwords=collocate_drop_stopwords,
-            window=collocate_window,
-            drop_terms=collocate_drop_terms,
-            term_groups=collocate_term_groups,
-            top_n=collocate_rank_top_n,
-            term_scope=collocate_rank_term_scope,
-            time_key=collocate_rank_time_key,
-            focus_mode=collocate_rank_focus,
-            focus_city=collocate_rank_focus_city,
-            focus_state=collocate_rank_focus_state,
-            manual_terms=collocate_rank_terms,
-            cancel_event=cancel_event,
-        )
-        if collocate_hits_by_city:
-            for group in groups:
-                group_id = group.get('id')
-                if not group_id:
-                    continue
-                dataset_entry = popup_dataset.get(group_id)
-                if not isinstance(dataset_entry, dict):
-                    continue
-                city_val = dataset_entry.get('city')
-                state_val = dataset_entry.get('state')
-                city_key = _city_state_key(city_val, state_val)
-                term_map = collocate_hits_by_city.get(city_key)
-                if not term_map:
-                    continue
-                hits_for_dataset: Dict[str, List[int]] = {}
-                for term, indexes in term_map.items():
-                    if not indexes:
-                        continue
-                    normalized_indexes: Set[int] = set()
-                    for idx in indexes:
-                        try:
-                            normalized_indexes.add(int(idx))
-                        except (TypeError, ValueError):
-                            continue
-                    if normalized_indexes:
-                        hits_for_dataset[term] = sorted(normalized_indexes)
-                if hits_for_dataset:
-                    dataset_entry['collocate_hits'] = hits_for_dataset
-
-        if collocate_hits_by_city:
-            term_article_counts: Dict[str, int] = defaultdict(int)
-            term_cities: Dict[str, Set[str]] = defaultdict(set)
-            term_newspapers: Dict[str, Set[str]] = defaultdict(set)
-
-            for city_key, term_map in collocate_hits_by_city.items():
-                entries = city_entries_map.get(city_key) or []
-                for term, indexes in term_map.items():
-                    if not indexes:
-                        continue
-                    term_article_counts[term] += len(indexes)
-                    term_cities[term].add(city_key)
-                    for idx in indexes:
-                        try:
-                            idx_int = int(idx)
-                        except (TypeError, ValueError):
-                            continue
-                        if idx_int < 0 or idx_int >= len(entries):
-                            continue
-                        entry_obj = entries[idx_int]
-                        props = entry_obj.get('props', {}) if isinstance(entry_obj, dict) else {}
-                        paper_id = (
-                            props.get('SN')
-                            or props.get('lccn')
-                            or props.get('Title')
-                            or props.get('newspaper_name')
-                            or ''
-                        )
-                        paper_str = str(paper_id).strip()
-                        if paper_str:
-                            term_newspapers[term].add(paper_str)
-
-            for term, total_articles in term_article_counts.items():
-                collocate_term_stats[term] = {
-                    'articles': int(total_articles),
-                    'newspapers': len(term_newspapers.get(term, set())),
-                    'cities': len(term_cities.get(term, set())),
-                }
-
-        initial_collocate_term = collocate_terms_list[0] if collocate_terms_list else ''
-
-        def _format_collocate_summary(term: str) -> str:
-            if not term:
-                return 'Collocate term: none selected'
-            stats = collocate_term_stats.get(term) or {}
-            articles_val = stats.get('articles', 0)
-            newspapers_val = stats.get('newspapers', 0)
-            cities_val = stats.get('cities', 0)
-            return (
-                f'Collocate term "{term}": '
-                f'{articles_val:,} articles | {newspapers_val:,} newspapers | {cities_val:,} cities'
-            )
-
-        initial_collocate_summary_text = _format_collocate_summary(initial_collocate_term)
-
-        scope_norm = str(collocate_rank_term_scope or '').strip().lower()
-        if scope_norm.startswith('time') and collocate_rank_time_key:
-            raw_key = str(collocate_rank_time_key).strip()
-            key_variants = [raw_key] if raw_key else []
-            label_variant = collocate_time_labels.get(raw_key)
-            if label_variant:
-                key_variants.append(label_variant)
-            combined_counter = Counter()
-            for candidate in key_variants:
-                if not candidate:
-                    continue
-                counter = collocate_time_totals.get(candidate)
-                if counter:
-                    combined_counter.update(counter)
-            if combined_counter:
-                scoped_terms = [
-                    term for term, _freq in _sorted_counter_terms(combined_counter) if term
-                ][:collocate_rank_top_n]
-                if scoped_terms:
-                    collocate_terms_list = scoped_terms
-                    initial_collocate_term = collocate_terms_list[0]
-                    initial_collocate_summary_text = _format_collocate_summary(initial_collocate_term)
-
-    if groups and not any(v > 0 for v in values):
-        for group in groups:
-            group["value"] = 1.0
-            for entry in group.get("entries", []):
-                entry["value"] = 1.0
-
-    base_name = os.path.splitext(os.path.basename(geojson_path))[0]
-    out_dir = os.path.dirname(geojson_path)
-
-    articles_count = len(pts)
-    city_set: set = set()
-    newspaper_ids: set = set()
-    dates_dt: List[datetime] = []
-    for p in pts:
-        props = p.get('props', {})
-        city = props.get('City')
-        if city not in (None, ""):
-            city_set.add(str(city))
-        sn = props.get('SN') or props.get('lccn')
-        if sn not in (None, ""):
-            newspaper_ids.add(str(sn))
-        else:
-            title = props.get('Title') or props.get('newspaper_name')
-            if title not in (None, ""):
-                newspaper_ids.add(str(title))
-        dt = p.get('date')
-        if isinstance(dt, datetime):
-            dates_dt.append(dt)
-
-    metadata = data.get('metadata') or data.get('properties') or {}
-    start_meta = start_override or metadata.get('start_date') or metadata.get('StartDate')
-    end_meta = end_override or metadata.get('end_date') or metadata.get('EndDate')
-
-    if dates_dt:
-        min_dt = min(dates_dt)
-        max_dt = max(dates_dt)
-    else:
-        min_dt = max_dt = None
-
-    dated_pts = [p for p in pts if p.get("date") is not None]
-    rank_time_bins = collocate_rank_mode and bool(dated_pts)
-    use_time_slider = bool(dated_pts) and time_enabled
-    time_index: List[datetime] = []
-    time_labels: List[str] = []
-    range_start = start_dt_meta or min_dt
-    range_end = end_dt_meta or max_dt
-    if range_start and range_end and range_start > range_end:
-        range_start, range_end = range_end, range_start
-    if (use_time_slider or rank_time_bins) and min_dt and max_dt:
-        time_index = _build_time_index(range_start, range_end, time_unit, max(1, int(time_step or 1)))
-        time_labels = [dt.strftime('%Y-%m-%dT%H:%M:%SZ') for dt in time_index]
-
-    start_str = start_meta or (min_dt.strftime('%Y-%m-%d') if min_dt else '')
-    end_str = end_meta or (max_dt.strftime('%Y-%m-%d') if max_dt else '')
-    if not start_str and end_str:
-        start_str = end_str
-    if not end_str and start_str:
-        end_str = start_str
-    date_range = (start_str, end_str) if start_str or end_str else ()
-
-    metric_display_summary = metric_normalized_display if normalize_flag else metric_display
-
-    allowed_table_modes = {'full', 'article', 'minimal'}
-    table_mode_norm = (table_mode or 'full').strip().lower()
-    if table_mode_norm not in allowed_table_modes:
-        table_mode_norm = 'full'
-
-    row_limit_val: Optional[int] = None
-    if table_row_limit:
-        try:
-            parsed_limit = int(table_row_limit)
-            if parsed_limit > 0:
-                row_limit_val = parsed_limit
-        except (TypeError, ValueError):
-            row_limit_val = None
-
-    summary = {
-        'geojson_name': os.path.basename(geojson_path),
-        'term': search_term or '',
-        'date_range': date_range,
-        'articles': articles_count,
-        'newspapers': len(newspaper_ids),
-        'cities': len(city_set),
-        'metric_display': metric_display_summary,
-        'metric_key': metric_key,
-        'normalized': normalize_flag,
-        'denominator_label': denom_label if normalize_flag else '',
-        'mode': mode,
-        'time_enabled': time_enabled,
-        'time_unit': time_unit,
-        'time_step': time_step,
-        'linger_unit': linger_unit,
-        'linger_step': linger_step,
-        'lightweight': bool(lightweight),
-        'table_mode': table_mode_norm,
-        'table_row_limit': row_limit_val or 0,
-        'collocate_drop_terms': list(collocate_drop_terms or []),
-        'collocate_term_groups': list(collocate_term_groups or []),
-    }
-
-    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-    suffix_parts = [mode, metric_key]
-    if normalize_flag:
-        suffix_parts.append('norm')
-    if lightweight:
-        suffix_parts.append('lite')
-    if collocate_rank_mode:
-        scope_tag = 'global'
-        if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time'):
-            key_val = (collocate_rank_time_key or '').strip()
-            scope_tag = f'time-{key_val}' if key_val else 'time'
-        suffix_parts.append(f'scope-{_slug(scope_tag)}')
-
-        focus_mode_norm = (collocate_rank_focus or 'all').strip().lower()
-        focus_tag = focus_mode_norm or 'all'
-        if focus_mode_norm == 'city':
-            components = [collocate_rank_focus_city or '']
-            if collocate_rank_focus_state:
-                components.append(collocate_rank_focus_state)
-            focus_tag = 'city-' + '-'.join(filter(None, components))
-        elif focus_mode_norm == 'state':
-            focus_tag = f"state-{collocate_rank_focus_state or ''}"
-        suffix_parts.append(f'focus-{_slug(focus_tag)}')
-    suffix_parts.append(timestamp)
-    suffix = '_'.join(suffix_parts)
-
-    map_filename = f"{base_name}_{suffix}.html"
-    table_filename = f"{base_name}_{suffix}_attributes.html"
-    out_html = os.path.join(out_dir, map_filename)
-    attr_path = os.path.join(out_dir, table_filename)
-
-    table_kwargs: Dict[str, Any] = {'hyperlink_columns': ['url']}
-    if table_mode_norm == 'article':
-        table_kwargs['include_columns'] = ['date', 'Title', 'article', 'url']
-    elif table_mode_norm == 'minimal':
-        table_kwargs['include_columns'] = ['date', 'Title', 'City', 'State', 'lccn', 'page', 'url', 'article']
-        table_kwargs['omit_article'] = False
-
-    max_rows = row_limit_val
-    if lightweight:
-        light_limit = min(len(pts), 1000) if pts else None
-        if light_limit:
-            max_rows = light_limit if max_rows is None else min(max_rows, light_limit)
-        include_cols = table_kwargs.get('include_columns')
-        if include_cols:
-            if 'article' not in include_cols:
-                include_cols.append('article')
-        else:
-            table_kwargs['include_columns'] = [
-                'date',
-                'Title',
-                'headline',
-                'Headline',
-                'City',
-                'State',
-                'page',
-                'url',
-                'article',
-            ]
-        table_kwargs['omit_article'] = False
-
-    if max_rows:
-        table_kwargs['max_rows'] = max_rows
-
-    heat_radius_val = 15
-    if heat_radius is not None:
-        try:
-            candidate_radius = int(heat_radius)
-            if candidate_radius > 0:
-                heat_radius_val = candidate_radius
-        except (TypeError, ValueError):
-            pass
-
-    heat_multiplier = 1.0
-    if heat_value is not None:
-        try:
-            candidate_multiplier = float(heat_value)
-            if candidate_multiplier > 0:
-                heat_multiplier = candidate_multiplier
-        except (TypeError, ValueError):
-            pass
-
-    grad_min_val = max(1, int(grad_min_radius) if grad_min_radius else 6)
-    grad_max_val = max(grad_min_val + 1, int(grad_max_radius) if grad_max_radius else 28)
-
-    m = folium.Map(location=[37.8, -96.0], zoom_start=4)
-    m.add_child(_ZoomTopRight())
-
-    def point_radius(group: Dict[str, Any]) -> float:
-        count = len(group.get("entries") or [])
-        return 5 if count > 1 else 3
-
-    if mode == "heatmap":
-        if use_time_slider and dated_pts:
-            idx = time_index
-            slices = _heat_slices(dated_pts, idx, linger_unit, int(linger_step or 0))
-            heat_data: List[List[List[float]]] = []
-            for frame in slices:
-                frame_pts: List[List[float]] = []
-                for item in frame:
-                    lat, lon = item[0], item[1]
-                    base_weight = item[2] if len(item) > 2 else None
-                    if base_weight is not None and base_weight > 0:
-                        weight_val = base_weight * heat_multiplier
-                        frame_pts.append([lat, lon, weight_val])
-                    elif heat_multiplier > 0:
-                        frame_pts.append([lat, lon, heat_multiplier])
-                    else:
-                        frame_pts.append([lat, lon])
-                heat_data.append(frame_pts)
-            index_labels = time_labels if time_labels else [t.strftime("%Y-%m-%dT00:00:00Z") for t in idx]
-            HeatMapWithTime(
-                heat_data,
-                index=index_labels,
-                auto_play=False,
-                max_opacity=0.7,
-                radius=heat_radius_val,
-            ).add_to(m)
-        else:
-            coords: List[List[float]] = []
-            for p in pts:
-                base_weight = p.get("value")
-                if base_weight is not None and base_weight > 0:
-                    weight_val = base_weight * heat_multiplier
-                    coords.append([p["lat"], p["lon"], weight_val])
-                elif heat_multiplier > 0:
-                    coords.append([p["lat"], p["lon"], heat_multiplier])
-                else:
-                    coords.append([p["lat"], p["lon"]])
-            if coords:
-                HeatMap(coords, max_opacity=0.7, radius=heat_radius_val).add_to(m)
-
-        _add_point_markers(
-            m,
-            groups,
-            search_term,
-            point_radius,
-            popup_width=popup_width,
-            lightweight=lightweight,
-            popup_dataset=popup_dataset,
-            ghost_markers=True,
-        )
-
-    elif mode == "graduated":
-        resolver = _graduated_radius_resolver(groups, float(grad_min_val), float(grad_max_val))
-        _add_point_markers(
-            m,
-            groups,
-            search_term,
-            resolver,
-            popup_width=popup_width,
-            lightweight=lightweight,
-            popup_dataset=popup_dataset,
-        )
-    elif mode == "cluster":
-        icon_create_function = (
-            "function(cluster) {"
-            " var sum = 0;"
-            " cluster.getAllChildMarkers().forEach(function(marker) {"
-            "   var v = marker.options && marker.options.metricValue;"
-            "   if (typeof v === 'number' && !isNaN(v)) { sum += v; }"
-            "   else if (v) { var num = parseFloat(v); if (!isNaN(num)) sum += num; }"
-            " });"
-            " var formatted;"
-            " if (%s) { formatted = sum.toFixed(4); }"
-            " else { formatted = Math.round(sum).toLocaleString(); }"
-            " var absSum = Math.abs(sum);"
-            " var c = 'marker-cluster marker-cluster-small';"
-            " if (absSum >= 100) { c = 'marker-cluster marker-cluster-large'; }"
-            " else if (absSum >= 10) { c = 'marker-cluster marker-cluster-medium'; }"
-            " return L.divIcon({ html: '<div><span>' + formatted + '</span></div>', className: c, iconSize: new L.Point(40, 40) });"
-            "}"
-        ) % ('true' if normalize_flag else 'false')
-
-        cluster = MarkerCluster(
-            name='Markers',
-            options={
-                'showCoverageOnHover': False,
-                'zoomToBoundsOnClick': False,
-                'spiderfyOnMaxZoom': False,
-            },
-            icon_create_function=icon_create_function,
-        )
-        cluster.add_to(m)
-        _add_point_markers(
-            cluster,
-            groups,
-            search_term,
-            point_radius,
-            popup_width=popup_width,
-            lightweight=lightweight,
-            popup_dataset=popup_dataset,
-            ghost_markers=False,
-        )
-    else:
-        _add_point_markers(
-            m,
-            groups,
-            search_term,
-            point_radius,
-            popup_width=popup_width,
-            lightweight=lightweight,
-            popup_dataset=popup_dataset,
-        )
-
-
-    if lightweight:
-        for entry in pts:
-            props = entry.get('props') if isinstance(entry, dict) else None
-            if isinstance(props, dict) and 'article' in props:
-                props['article'] = ''
-
-    attr_file = _write_attribute_table(pts, attr_path, **table_kwargs)
-    if attr_file:
-        summary['attribute_table'] = attr_file
-
-    valid_row_ids = {
-        entry.get('_popup_row_id')
-        for entry in pts
-        if isinstance(entry, dict) and entry.get('_attr_in_table')
-    }
-    if not attr_file:
-        valid_row_ids = set()
-
-    if popup_dataset:
-        def _prune_attr_ids(payloads: Optional[List[Dict[str, Any]]]) -> None:
-            if not payloads:
-                return
-            for payload in payloads:
-                if not isinstance(payload, dict):
-                    continue
-                row_id = payload.get('attr_row_id')
-                if row_id and row_id not in valid_row_ids:
-                    payload['attr_row_id'] = ''
-
-        for dataset_entry in popup_dataset.values():
-            if not isinstance(dataset_entry, dict):
-                continue
-            _prune_attr_ids(dataset_entry.get('entries'))
-            _prune_attr_ids(dataset_entry.get('full_entries'))
-
-    lazy_popup_mode = bool(attr_file and mode == 'heatmap' and lightweight)
-    if lazy_popup_mode and popup_dataset:
-        def _strip_inline_articles(payloads: Optional[List[Dict[str, Any]]]) -> None:
-            if not payloads:
-                return
-            for payload in payloads:
-                if not isinstance(payload, dict):
-                    continue
-                if payload.get('attr_row_id'):
-                    payload['article_html'] = ''
-
-        for dataset_entry in popup_dataset.values():
-            if not isinstance(dataset_entry, dict):
-                continue
-            _strip_inline_articles(dataset_entry.get('entries'))
-            _strip_inline_articles(dataset_entry.get('full_entries'))
-
-    if collocate_rank_mode:
-        metric_display_summary = 'Ranked Collocates'
-        if top_term_variant:
-            metric_display_summary = 'Top Collocate Term'
-
-    search_results_text = f"{articles_count:,} articles | {len(newspaper_ids):,} newspapers | {len(city_set):,} cities"
-    search_results_line = f'<div id="collocateSearchResults" style="margin-top:4px;"><strong>Search Results:</strong> {_esc(search_results_text)}</div>'
-
-    header_lines: List[str] = []
-
-    title_html = ''
-    # Collocate maps get a custom title; otherwise include basic info lines
-    if collocate_rank_mode:
-        term_text = (summary.get('term') or '').strip()
-        term_segment = f"of '{_esc(term_text)}'" if term_text else ''
-        date_segment = ''
-        if summary.get('date_range'):
-            start, end = summary['date_range']
-            date_text = start if start == end else ' – '.join([s for s in (start, end) if s])
-            if date_text:
-                date_segment = f"between {_esc(date_text)}"
-        title_bits = ['Top Ranked Collocates']
-        if term_segment:
-            title_bits.append(term_segment)
-        if date_segment:
-            title_bits.append(date_segment)
-        title_html = '<div style="font-weight:700; font-size:16px; margin-bottom:4px;">' + ' '.join(title_bits) + '</div>'
-    else:
-        if summary.get('date_range'):
-            start, end = summary['date_range']
-            date_text = start if start == end else ' – '.join([s for s in (start, end) if s])
-            if date_text:
-                header_lines.append(f'<div><strong>Date range:</strong> {_esc(date_text)}</div>')
-        if summary.get('term'):
-            header_lines.append(f'<div><strong>Term:</strong> {_esc(summary["term"])}</div>')
-
-    if title_html:
-        header_lines.insert(0, title_html)
-
-    if lightweight:
-        header_lines.append('<div style="font-size:12px; font-weight:400;"><em>Lightweight mode: popups and table trimmed for size.</em></div>')
-
-    header_lines.append(f'<div><strong>Data Source:</strong> {_esc(summary["geojson_name"])}</div>')
-
-    header_lines.append(search_results_line)
-
-    if attr_file:
-        link_name = os.path.basename(attr_file)
-        header_lines.append(
-            f'<div><a href="{html.escape(link_name)}" target="_blank" rel="noopener">Open attribute table</a></div>'
-        )
-
-    header_lines.append('<div style="height:6px;"></div>')
-
-    header_lines.append(f'<div><strong>Mapped metric:</strong> {_esc(metric_display_summary)}</div>')
-    if summary.get('normalized') and denom_label:
-        header_lines.append(
-            f'<div style="font-size:12px; color:#555;">Normalized per city by {_esc(denom_label)}</div>'
-        )
-    if time_enabled:
-        time_text = f"{time_step} {time_unit}"
-        linger_text = f"{linger_step} {linger_unit}"
-        header_lines.append(
-            f'<div><strong>Time bin:</strong> {_esc(time_text)} | <strong>Linger:</strong> {_esc(linger_text)}</div>'
-        )
-
-    if collocate_rank_mode:
-        if top_term_variant:
-            summary_line_text = 'Top collocate term per location.'
-        else:
-            summary_line_text = initial_collocate_summary_text or 'Collocate term: none selected'
-        ranking_scope_text = 'Entire period'
-        if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time'):
-            key_text = collocate_rank_time_key or ''
-            if collocate_rank_time_label:
-                ranking_scope_text = collocate_rank_time_label
-            elif key_text:
-                ranking_scope_text = f'Time bin {key_text}'
-            else:
-                ranking_scope_text = 'First time bin'
-        header_lines.append(
-            f'<div><strong>Home time Bin:</strong> {_esc(ranking_scope_text)}</div>'
-        )
-
-        focus_mode_norm = (collocate_rank_focus or '').strip().lower()
-        if collocate_rank_focus_label:
-            focus_desc = collocate_rank_focus_label
-        elif focus_mode_norm == 'city' and collocate_rank_focus_city:
-            if collocate_rank_focus_state:
-                focus_desc = f'City — {collocate_rank_focus_city}, {collocate_rank_focus_state}'
-            else:
-                focus_desc = f'City — {collocate_rank_focus_city}'
-        elif focus_mode_norm == 'state' and collocate_rank_focus_state:
-            focus_desc = f'State — {collocate_rank_focus_state}'
-        else:
-            focus_desc = 'All cities'
-        header_lines.append(
-            f'<div><strong>Ranking Location:</strong> {_esc(focus_desc)}</div>'
-        )
-
-        slider_placeholder = '<div id="collocateTimeSliderContainer" style="margin-top:6px;"></div>' if collocate_time_slider_enabled and collocate_time_bins_payload else ''
-        if top_term_variant:
-            header_lines.append(
-                '<div style="margin-top:6px;">Markers display the top-ranked collocate term for each location. Circle size reflects the number of articles containing that term.</div>'
-            )
-            if slider_placeholder:
-                header_lines.append(slider_placeholder)
-            header_lines.append(
-                '<div id="collocateSummaryLine" '
-                'style="color:#2d3748; margin-top:6px; position:relative; display:inline-block; min-width:320px;">'
-                f'<span data-summary-content="1">{_esc(summary_line_text)}</span>'
-                '<span aria-hidden="true" data-summary-buffer="1" '
-                'style="visibility:hidden; pointer-events:none; white-space:nowrap; display:inline-block;">'
-                'Top collocate term sample: 999,999 articles | Unique terms: 9,999 | Time: 1901-01-01'
-                '</span>'
-                '</div>'
-            )
-        else:
-            if collocate_terms_list:
-                select_opts_parts = []
-                for idx, term in enumerate(collocate_terms_list[:200], start=1):
-                    select_opts_parts.append(
-                        f'<option value="{_esc(term)}">({_esc(str(idx))}) {_esc(term)}</option>'
-                    )
-                select_opts = ''.join(select_opts_parts)
-                scope_desc = ranking_scope_text
-                if scope_desc.lower() == 'entire period':
-                    scope_desc = 'entire period'
-                focus_desc = ''
-                focus_mode_norm = (collocate_rank_focus or '').strip().lower()
-                if focus_mode_norm == 'city' and collocate_rank_focus_city:
-                    focus_desc = f' for {collocate_rank_focus_city}'
-                    if collocate_rank_focus_state:
-                        focus_desc += f', {collocate_rank_focus_state}'
-                elif focus_mode_norm == 'state' and collocate_rank_focus_state:
-                    focus_desc = f' for {collocate_rank_focus_state}'
-                scope_text = _esc(scope_desc)
-                focus_text = _esc(focus_desc)
-                header_lines.append(
-                    f'<div>Top {len(collocate_terms_list)} collocates based on {scope_text}{focus_text}</div>'
-                )
-                header_lines.append(
-                    '<div style="margin-top:6px;">'
-                    '<label style="font-weight:600; margin-right:6px;">Collocate term:</label>'
-                    f'<select id="collocateTermSelect" style="min-width:220px;">{select_opts}</select>'
-                    '</div>'
-                )
-                if slider_placeholder:
-                    header_lines.append(slider_placeholder)
-            else:
-                if slider_placeholder:
-                    header_lines.append(slider_placeholder)
-
-            header_lines.append(
-                '<div id="collocateSummaryLine" '
-                'style="color:#c53030; margin-top:6px; position:relative; display:inline-block; min-width:320px;">'
-                f'<span data-summary-content="1">{_esc(summary_line_text)}</span>'
-                '<span aria-hidden="true" data-summary-buffer="1" '
-                'style="visibility:hidden; pointer-events:none; white-space:nowrap; display:inline-block;">'
-                'Collocate term sample: 999,999 articles | 9,999 newspapers | 9,999 cities | Time: 1901-01-01'
-                '</span>'
-                '</div>'
-            )
-
-    header_html = (
-        '<div style="position: fixed; top: 5px; left: 5px; z-index:9999;">'
-        '<div style="max-width: 560px; background: rgba(255,255,255,0.92); '
-        'padding: 8px 12px; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.2); '
-        'font-size: 13px; line-height: 1.4;">'
-        + ''.join(header_lines)
-        + '</div></div>'
-    )
-    m.get_root().html.add_child(folium.Element(header_html))
-
-    if rank_index and not top_term_variant:
-        label_style = (
-            '<style>'
-            '.collocate-rank-label { '
-            'background: transparent; '
-            'border: none; '
-            'box-shadow: none; '
-            'color: #ffffff; '
-            'font-weight: 600; '
-            'pointer-events: none; '
-            'padding: 0; '
-            'margin: 0; '
-            'text-shadow: 0 1px 2px rgba(0,0,0,0.55); '
-            '}'
-            '.collocate-rank-label:before { display: none; }'
-            '.collocate-rank-label .leaflet-tooltip-content { '
-            'margin: 0 !important; '
-            'padding: 0 !important; '
-            'line-height: 1; '
-            '}'
-            '.collocate-time-button { '
-            'border: 1px solid #cbd5e0; '
-            'background: #f7fafc; '
-            'color: #2d3748; '
-            'border-radius: 999px; '
-            'padding: 2px 10px; '
-            'font-size: 14px; '
-            'line-height: 1; '
-            'cursor: pointer; '
-            'transition: background 0.2s ease, color 0.2s ease; '
-            '}'
-            '.collocate-time-button[data-clock-role="toggle"] { '
-            'position: relative; '
-            'font-size: 18px; '
-            'padding: 2px 8px; '
-            '}'
-            '.collocate-time-button[data-clock-role="toggle"][data-clock-disabled="1"]::after { '
-            'content: ""; '
-            'position: absolute; '
-            'left: 50%; '
-            'top: 50%; '
-            'width: 70%; '
-            'height: 2px; '
-            'background: #c53030; '
-            'border-radius: 999px; '
-            'pointer-events: none; '
-            'transform: translate(-50%, -50%) rotate(45deg); '
-            '}'
-            '.collocate-time-button:hover { background: #edf2f7; color: #1a202c; }'
-            '.collocate-time-button:disabled { opacity: 0.4; cursor: default; }'
-            '#collocateTimeRange { accent-color: #2b6cb0; }'
-            '</style>'
-        )
-        m.get_root().html.add_child(folium.Element(label_style))
-
-    config_payload = {
-        'attribute_table': os.path.basename(attr_file) if attr_file else '',
-        'search_term': search_term or '',
-        'inline_articles': bool(embed_articles),
-        'time_labels': time_labels if (use_time_slider or collocate_time_slider_enabled) and time_labels else [],
-        'map_mode': mode,
-        'click_radius_px': heat_radius_val,
-        'collocate_summary': collocate_term_stats if collocate_term_stats else {},
-        'collocate_colorize': bool(collocate_rank_colorize),
-        'initial_collocate_term': initial_collocate_term,
-        'collocate_map_variant': collocate_map_variant,
-        'collocate_export_csv': bool(collocate_export_csv),
-    }
-
-    # Embed collocate rank index when available
-    if rank_index:
-        config_payload['collocate_ranks'] = rank_index
-        config_payload['collocate_terms'] = collocate_terms_list
-        config_payload['rank_max'] = rank_max_value or COLLOCATE_RANK_LIMIT
-        config_payload['collocate_settings'] = {
-            'requested_top_n': collocate_rank_top_n,
-            'terms_returned': len(collocate_terms_list),
-            'term_scope': collocate_rank_term_scope,
-            'time_key': collocate_rank_time_key or '',
-            'focus': collocate_rank_focus,
-            'focus_city': collocate_rank_focus_city or '',
-            'focus_state': collocate_rank_focus_state or '',
-            'time_label': collocate_rank_time_label or '',
-            'focus_label': collocate_rank_focus_label or '',
-            'colorize': bool(collocate_rank_colorize),
-        }
-        if collocate_time_slider_enabled and collocate_time_bins_payload:
-            config_payload['collocate_time_slider'] = True
-            config_payload['collocate_time_bins'] = collocate_time_bins_payload
-            if collocate_time_default_key is not None:
-                config_payload['collocate_time_default'] = collocate_time_default_key
-    config_json = json.dumps(config_payload, ensure_ascii=False).replace('</', '<\\/')
-    config_script = (
-        '<script id="map-config" type="application/json">'
-        f"{config_json}"
-        '</script>'
-    )
-    m.get_root().html.add_child(folium.Element(config_script))
-
-    popup_json_js = json.dumps(popup_dataset, ensure_ascii=False).replace('</', '<\\/')
-    data_script = (
-        '<script id="popup-data" type="application/json">'
-        f"{popup_json_js}"
-        '</script>'
-    )
-    m.get_root().html.add_child(folium.Element(data_script))
-
-    map_var = m.get_name()
-    cluster_block = ''
-    if mode == 'cluster':
-        cluster_var = cluster.get_name()
-        metric_label_js = json.dumps(metric_display_summary)
-        normalized_js = 'true' if normalize_flag else 'false'
-        cluster_block = f"""
-  whenLayerReady('{cluster_var}', function(clusterLayer) {{
-    if (!clusterLayer) {{
-      return;
-    }}
-    clusterLayer.options.iconCreateFunction = function(cluster) {{
-      var sum = 0;
-      cluster.getAllChildMarkers().forEach(function(marker) {{
-        var v = marker.options && marker.options.metricValue;
-        if (typeof v === 'number' && !isNaN(v)) {{
-          sum += v;
-        }} else if (v) {{
-          var num = parseFloat(v);
-          if (!isNaN(num)) sum += num;
-        }}
-      }});
-      var formatted;
-      if ({normalized_js}) {{
-        formatted = sum.toFixed(4);
-      }} else {{
-        formatted = Math.round(sum).toLocaleString();
-      }}
-      var absSum = Math.abs(sum);
-      var c = 'marker-cluster marker-cluster-small';
-      if (absSum >= 100) {{
-        c = 'marker-cluster marker-cluster-large';
-      }} else if (absSum >= 10) {{
-        c = 'marker-cluster marker-cluster-medium';
-      }}
-      return L.divIcon({{
-        html: '<div><span>' + formatted + '</span></div>',
-        className: c,
-        iconSize: new L.Point(40, 40)
-      }});
-    }};
-    if (clusterLayer.refreshClusters) {{
-      clusterLayer.refreshClusters();
-    }}
-    clusterLayer.on('clusterclick', function(e) {{
-      if (e && e.originalEvent) {{
-        if (typeof e.originalEvent.preventDefault === 'function') {{
-          e.originalEvent.preventDefault();
-        }}
-        if (typeof e.originalEvent.stopPropagation === 'function') {{
-          e.originalEvent.stopPropagation();
-        }}
-        if (typeof L !== 'undefined' && L.DomEvent && typeof L.DomEvent.stop === 'function') {{
-          L.DomEvent.stop(e.originalEvent);
-        }}
-      }}
-      loadData(function(dataset) {{
-        dataset = dataset || {{}};
-        var markers = e.layer.getAllChildMarkers();
-        var ids = [];
-        var metricSum = 0;
-        markers.forEach(function(marker) {{
-          var gid = marker.options && marker.options.groupId;
-          if (gid && ids.indexOf(gid) === -1) ids.push(gid);
-          var mv = marker.options && marker.options.metricValue;
-          if (typeof mv === 'number' && !isNaN(mv)) {{
-            metricSum += mv;
-          }} else if (mv) {{
-            var num = parseFloat(mv);
-            if (!isNaN(num)) metricSum += num;
-          }}
-        }});
-        if (!ids.length) return;
-        var metricLabel = {metric_label_js};
-        var isNormalized = {normalized_js};
-        var metricText = isNormalized ? (metricSum).toFixed(4) : Math.round(metricSum).toLocaleString();
-        var container = document.createElement('div');
-        container.style.minWidth = '280px';
-        container.style.fontSize = '14px';
-        container.style.lineHeight = '1.3';
-        var summary = document.createElement('div');
-        summary.style.fontSize = '12px';
-        summary.style.color = '#555';
-        var cityCount = ids.length;
-        var cityLabel = cityCount === 1 ? 'City' : 'Cities';
-        var totalArticles = 0;
-        var hasArticleCounts = true;
-        ids.forEach(function(gid) {{
-          var data = dataset[gid];
-          var articleCount = data && data.article_count;
-          var parsed = Number(articleCount);
-          if (Number.isFinite(parsed)) {{
-            totalArticles += parsed;
-          }} else {{
-            hasArticleCounts = false;
-          }}
-        }});
-        var articleDisplay;
-        if (hasArticleCounts) {{
-          articleDisplay = Math.round(totalArticles).toLocaleString();
-        }} else if (!isNormalized) {{
-          articleDisplay = Math.round(metricSum).toLocaleString();
-        }} else {{
-          articleDisplay = metricText;
-        }}
-        summary.textContent = 'Articles: ' + articleDisplay + ' from ' + cityCount + ' ' + cityLabel;
-        container.appendChild(summary);
-        if (isNormalized || metricLabel !== 'Articles') {{
-          var metricDetail = document.createElement('div');
-          metricDetail.style.marginTop = '2px';
-          metricDetail.style.fontSize = '12px';
-          metricDetail.style.color = '#555';
-          metricDetail.textContent = metricLabel + ': ' + metricText;
-          container.appendChild(metricDetail);
-        }}
-        var select = null;
-        if (ids.length > 1) {{
-          var selectLabel = document.createElement('div');
-          selectLabel.style.marginTop = '6px';
-          selectLabel.style.fontWeight = '600';
-          selectLabel.textContent = 'Select a location';
-          container.appendChild(selectLabel);
-          select = document.createElement('select');
-          select.style.width = '100%';
-          select.style.marginTop = '4px';
-          ids.forEach(function(gid) {{
-            var data = dataset[gid];
-            var opt = document.createElement('option');
-            opt.value = gid;
-            opt.textContent = (data && data.title) || gid;
-            select.appendChild(opt);
-          }});
-          container.appendChild(select);
-        }}
-        var detailHost = document.createElement('div');
-        detailHost.style.marginTop = '8px';
-        container.appendChild(detailHost);
-        function renderGroup(gid) {{
-          detailHost.innerHTML = '';
-          var data = dataset[gid];
-          if (!data) {{
-            detailHost.textContent = 'No data.';
-            return;
-          }}
-          if (data.template) {{
-            var wrapper = document.createElement('div');
-            wrapper.innerHTML = data.template;
-            var root = wrapper.firstElementChild;
-            if (root) {{
-              detailHost.appendChild(root);
-              attach(root);
-              attachDockToggle(root, clusterLayer._map, null);
-            }}
-          }} else {{
-            detailHost.textContent = 'No data.';
-          }}
-        }}
-        renderGroup(ids[0]);
-        if (select) {{
-          select.addEventListener('change', function() {{
-            renderGroup(this.value);
-          }});
-        }}
-        var mapRef = clusterLayer._map;
-        if (!mapRef || typeof mapRef.openPopup !== 'function') {{
-          return;
-        }}
-        L.popup({{maxWidth: 360}}).setLatLng(e.latlng).setContent(container).openOn(mapRef);
-      }});
-      return false;
-    }});
-  }});
-"""
+def _collocate_script_html(map_var: str, cluster_block: str = '') -> str:
     script_template = StrTemplate(r"""
 (function() {
   var popupCache = null;
@@ -3909,6 +2705,8 @@ def create_map(
   var collocateTerms = [];
   var rankMax = 0;
   var collocateSummary = {};
+  var rankMetricMode = '';
+  var rankMetricLabel = '';
   var collocateMapVariant = 'rank';
   var collocateColorize = false;
   var initialCollocateTerm = '';
@@ -3942,6 +2740,13 @@ def create_map(
   var topTermActiveFilterTerm = '';
   var topTermCollapseButton = null;
   var topTermLegendCollapsed = false;
+  var mapContext = 'collocate';
+  var termSingularLabel = 'Collocate term';
+  var termPluralLabel = 'Collocate terms';
+  var summaryPreferConfig = false;
+  var customTopPaletteProvided = false;
+  var topTermLegendTitle = 'Top Terms';
+  var legendTitleProvided = false;
 
   (function parseConfig() {
     var tag = document.getElementById('map-config');
@@ -3995,11 +2800,50 @@ def create_map(
     if (config.collocate_summary && typeof config.collocate_summary === 'object') {
       collocateSummary = config.collocate_summary;
     }
+    if (typeof config.collocate_rank_metric === 'string') {
+      rankMetricMode = config.collocate_rank_metric.trim().toLowerCase();
+    }
+    if (typeof config.collocate_rank_metric_label === 'string') {
+      rankMetricLabel = config.collocate_rank_metric_label;
+    }
     if (typeof config.collocate_colorize === 'boolean') {
       collocateColorize = config.collocate_colorize;
     }
     if (typeof config.initial_collocate_term === 'string') {
       initialCollocateTerm = String(config.initial_collocate_term).trim();
+    }
+    if (typeof config.summary_prefer_config === 'boolean') {
+      summaryPreferConfig = config.summary_prefer_config;
+    }
+    var labelConfig = (config.display_labels && typeof config.display_labels === 'object') ? config.display_labels : null;
+    if (labelConfig) {
+      if (typeof labelConfig.context === 'string' && labelConfig.context.trim()) {
+        mapContext = labelConfig.context.trim().toLowerCase();
+      }
+      if (typeof labelConfig.term_singular === 'string' && labelConfig.term_singular.trim()) {
+        termSingularLabel = labelConfig.term_singular;
+      }
+      if (typeof labelConfig.term_plural === 'string' && labelConfig.term_plural.trim()) {
+        termPluralLabel = labelConfig.term_plural;
+      }
+      if (Array.isArray(labelConfig.top_term_palette) && labelConfig.top_term_palette.length) {
+        topTermPalette = labelConfig.top_term_palette.slice();
+        topTermPaletteIndex = 0;
+        customTopPaletteProvided = true;
+      }
+      if (typeof labelConfig.legend_title === 'string' && labelConfig.legend_title.trim()) {
+        topTermLegendTitle = labelConfig.legend_title;
+        legendTitleProvided = true;
+      }
+    }
+    if (!rankMetricMode) {
+      rankMetricMode = 'article_count';
+    }
+    if (!rankMetricLabel) {
+      rankMetricLabel = 'Article count';
+    }
+    if (mapContext === 'topic' && !legendTitleProvided) {
+      topTermLegendTitle = 'Top Topics';
     }
     if (config.collocate_time_slider) {
       collocateTimeEnabled = true;
@@ -4045,6 +2889,10 @@ def create_map(
       } else {
         selectedTimeBinKey = null;
       }
+    }
+    if (mapContext === 'topic' && !customTopPaletteProvided) {
+      topTermPalette = ['#264653', '#2a9d8f', '#e9c46a', '#f4a261', '#e76f51', '#6a4c93', '#1982c4', '#8ac926', '#ffca3a', '#ff595e', '#9a8c98', '#4361ee'];
+      topTermPaletteIndex = 0;
     }
   })();
 
@@ -4160,6 +3008,10 @@ def create_map(
       topTermLegendContainer.style.display = '';
       topTermLegendList = topTermLegendContainer.querySelector('.legend-body');
       topTermCollapseButton = topTermLegendContainer.querySelector('[data-top-term-collapse]');
+      var titleNode = topTermLegendContainer.querySelector('h3');
+      if (titleNode) {
+        titleNode.textContent = topTermLegendTitle;
+      }
       setTopTermLegendCollapsed(topTermLegendCollapsed);
       return;
     }
@@ -4173,7 +3025,7 @@ def create_map(
     headerRow.style.alignItems = 'center';
     headerRow.style.gap = '8px';
     var title = document.createElement('h3');
-    title.textContent = 'Top Terms';
+    title.textContent = topTermLegendTitle;
     headerRow.appendChild(title);
 
     var headerSpacer = document.createElement('span');
@@ -4321,7 +3173,8 @@ def create_map(
       var empty = document.createElement('div');
       empty.style.color = '#4a5568';
       empty.style.fontStyle = 'italic';
-      empty.textContent = 'No collocate terms available.';
+      var emptyLabel = termPluralLabel ? termPluralLabel.toLowerCase() : 'terms';
+      empty.textContent = 'No ' + emptyLabel + ' available.';
       topTermLegendList.appendChild(empty);
       return;
     }
@@ -4355,17 +3208,34 @@ def create_map(
     setTopTermLegendCollapsed(topTermLegendCollapsed);
   }
 
+  function formatTopTermLabel(term) {
+    if (!term) {
+      return '';
+    }
+    var str = String(term);
+    var maxLen = 15;
+    if (str.length <= maxLen) {
+      return str;
+    }
+    var truncated = str.slice(0, maxLen);
+    while (truncated.length && /\s$$/.test(truncated)) {
+      truncated = truncated.slice(0, -1);
+    }
+    return truncated + '…';
+  }
+
   function applyTopTermLabelState(layer, term) {
     if (!layer || typeof layer.setTooltipContent === 'function') {
       // handled later via bind/unbind
     }
-    var labelText = term ? String(term) : '';
-    if (!labelText) {
+    var fullLabelText = term ? String(term) : '';
+    if (!fullLabelText) {
       if (typeof layer.unbindTooltip === 'function') {
         try { layer.unbindTooltip(); } catch (err) {}
       }
       return;
     }
+    var labelText = formatTopTermLabel(fullLabelText);
     var highlighted = !(layer && layer.options && layer.options.topTermHighlighted === false);
     var baseColor = colorForTerm(term);
     var bgColor = highlighted ? baseColor : lightenColor(baseColor, 0.7);
@@ -4802,6 +3672,7 @@ def create_map(
         var info = getTermInfoForGroup(data, timeKey);
         updates.push({ layer: layer, data: data, info: info || { term: '', rank: null, count: 0 } });
       });
+      var useCountRadius = isTopTermMode();
       var maxCount = 0;
       if (isTopTermMode()) {
         updates.forEach(function(entry) {
@@ -4824,10 +3695,11 @@ def create_map(
         var term = info.term || '';
         var count = Number(info.count) || 0;
         var hasArticles = count > 0;
-        var radius = isTopTermMode() ? countToRadius(count, maxCount) : rankToRadius(rank);
-        if (!isTopTermMode()) {
-          count = Array.isArray(data.entries) ? data.entries.length : 0;
-          hasArticles = count > 0;
+        var radius;
+        if (isTopTermMode()) {
+          radius = countToRadius(count, maxCount);
+        } else {
+          radius = rankToRadius(rank);
         }
         if (typeof layer.setRadius === 'function') {
           layer.setRadius(radius);
@@ -4918,8 +3790,12 @@ def create_map(
         } else {
           var labelText = '';
           // Only show a label when the location has visible entries in this time bin
-          if (!smallMarker && Number.isFinite(rank) && rank > 0) {
-            labelText = String(Math.round(rank));
+          if (!smallMarker) {
+            if (useCountRadius) {
+              labelText = count > 0 ? formatInteger(count) : '';
+            } else if (Number.isFinite(rank) && rank > 0) {
+              labelText = String(Math.round(rank));
+            }
           }
           if (typeof layer.bindTooltip === 'function') {
             var tooltip = (typeof layer.getTooltip === 'function') ? layer.getTooltip() : null;
@@ -4952,6 +3828,11 @@ def create_map(
             }
             if (tooltipEl) {
               tooltipEl.style.display = labelText ? '' : 'none';
+              tooltipEl.style.background = 'transparent';
+              tooltipEl.style.border = 'none';
+              tooltipEl.style.boxShadow = 'none';
+              tooltipEl.style.color = '#ffffff';
+              tooltipEl.style.textShadow = '0 1px 2px rgba(0,0,0,0.55)';
               var fontSize = Math.max(11, Math.round(radius * 1.05));
               tooltipEl.style.fontSize = fontSize + 'px';
             }
@@ -5073,6 +3954,9 @@ def create_map(
         if (entry.key === primary || entry.label === primary || entry.iso === primary) {
           if (entry.key && keys.indexOf(entry.key) === -1) {
             keys.push(entry.key);
+          }
+          if (entry.label && keys.indexOf(entry.label) === -1) {
+            keys.push(entry.label);
           }
           if (entry.iso && keys.indexOf(entry.iso) === -1) {
             keys.push(entry.iso);
@@ -5420,12 +4304,26 @@ def create_map(
     return Math.round(num).toLocaleString();
   }
 
+  function formatMetricValue(value) {
+    var num = Number(value);
+    if (!Number.isFinite(num)) {
+      return '0';
+    }
+    if (!rankMetricMode || rankMetricMode === 'article_count') {
+      return Math.round(num).toLocaleString();
+    }
+    var precision = (rankMetricMode === 'weight_avg') ? 4 : 2;
+    return num.toLocaleString(undefined, { minimumFractionDigits: precision, maximumFractionDigits: precision });
+  }
+
   function collectCollocateStats(dataset) {
     var articles = 0;
     var cityCount = 0;
     var newspaperSet = new Set();
+    var metricTotal = 0;
+    var metricCount = 0;
     if (!dataset) {
-      return { articles: 0, newspapers: 0, cities: 0 };
+      return { articles: 0, newspapers: 0, cities: 0, metric_total: 0, metric_count: 0 };
     }
     Object.keys(dataset).forEach(function(key) {
       var data = dataset[key];
@@ -5438,12 +4336,29 @@ def create_map(
         if (entry && entry.newspaper) {
           newspaperSet.add(entry.newspaper);
         }
+        if (!entry) { return; }
+        if (rankMetricMode === 'article_count') {
+          metricTotal += 1;
+          metricCount += 1;
+          return;
+        }
+        if (rankMetricMode === 'weight_sum' || rankMetricMode === 'weight_avg') {
+          var weightVal = Number(entry.metric_weight);
+          if (Number.isFinite(weightVal)) {
+            metricTotal += weightVal;
+            if (rankMetricMode === 'weight_avg') {
+              metricCount += 1;
+            }
+          }
+        }
       });
     });
     return {
       articles: articles,
       newspapers: newspaperSet.size,
       cities: cityCount,
+      metric_total: metricTotal,
+      metric_count: metricCount,
     };
   }
 
@@ -5479,7 +4394,9 @@ def create_map(
         });
       }
       var uniqueTerms = Object.keys(termCounter).length;
-      var summaryParts = ['Top collocate term per location'];
+      var singularLower = termSingularLabel ? termSingularLabel.toLowerCase() : 'term';
+      var pluralLower = termPluralLabel ? termPluralLabel.toLowerCase() : (singularLower + 's');
+      var summaryParts = ['Top ' + singularLower + ' per location'];
       if (collocateTimeEnabled) {
         var timeLabel = labelForTimeKey(selectedTimeBinKey);
         if (timeLabel) {
@@ -5489,27 +4406,71 @@ def create_map(
       summaryParts.push('Locations: ' + formatInteger(stats.cities || 0));
       summaryParts.push('Articles: ' + formatInteger(stats.articles || 0));
       if (uniqueTerms) {
-        summaryParts.push('Unique terms: ' + formatInteger(uniqueTerms));
+        summaryParts.push('Unique ' + pluralLower + ': ' + formatInteger(uniqueTerms));
       }
       content.textContent = summaryParts.join(' | ');
       return;
     }
     var term = String(selectedCollocate || '').trim();
     if (!term) {
-      content.textContent = 'Collocate term: none selected';
+      var noneLabel = termSingularLabel || 'Term';
+      var noTermText = noneLabel + ': none selected';
+      if (rankMetricLabel) {
+        noTermText += ' (Metric: ' + rankMetricLabel + ')';
+      }
+      content.textContent = noTermText;
       return;
     }
     var stats = collectCollocateStats(dataset);
-    if ((!stats || (!stats.articles && !stats.cities)) && collocateSummary && collocateSummary[term]) {
-      var fallback = collocateSummary[term];
-      stats = {
-        articles: Number(fallback.articles) || 0,
-        newspapers: Number(fallback.newspapers) || 0,
-        cities: Number(fallback.cities) || 0,
+    var fallback = null;
+    if (collocateSummary && collocateSummary[term]) {
+      var summaryEntry = collocateSummary[term];
+      fallback = {
+        articles: Number(summaryEntry.articles) || 0,
+        newspapers: Number(summaryEntry.newspapers) || 0,
+        cities: Number(summaryEntry.cities) || 0,
+        metric_value: Number(summaryEntry.metric) || 0,
+        metric_sum: Number(
+          summaryEntry.metric_sum != null ? summaryEntry.metric_sum : summaryEntry.metric
+        ) || 0,
+        metric_count: Number(
+          summaryEntry.metric_count != null ? summaryEntry.metric_count : summaryEntry.articles
+        ) || 0,
       };
     }
-    stats = stats || { articles: 0, newspapers: 0, cities: 0 };
-    var summaryText = 'Collocate term "' + term + '": '
+    if (summaryPreferConfig && fallback) {
+      stats = {
+        articles: fallback.articles,
+        newspapers: fallback.newspapers,
+        cities: fallback.cities,
+        metric_total: fallback.metric_sum,
+        metric_count: fallback.metric_count,
+        metric_value: fallback.metric_value,
+      };
+    } else if ((!stats || (!stats.articles && !stats.cities)) && fallback) {
+      stats = {
+        articles: fallback.articles,
+        newspapers: fallback.newspapers,
+        cities: fallback.cities,
+        metric_total: fallback.metric_sum,
+        metric_count: fallback.metric_count,
+        metric_value: fallback.metric_value,
+      };
+    }
+    if (!stats) {
+      stats = { articles: 0, newspapers: 0, cities: 0, metric_total: 0, metric_count: 0, metric_value: 0 };
+    }
+    if (typeof stats.metric_total !== 'number') {
+      stats.metric_total = 0;
+    }
+    if (typeof stats.metric_count !== 'number') {
+      stats.metric_count = 0;
+    }
+    if (typeof stats.metric_value !== 'number') {
+      stats.metric_value = (rankMetricMode === 'article_count') ? stats.articles : 0;
+    }
+    var labelPrefix = termSingularLabel || 'Term';
+    var summaryText = labelPrefix + ' "' + term + '": '
       + formatInteger(stats.articles) + ' articles | '
       + formatInteger(stats.newspapers) + ' newspapers | '
       + formatInteger(stats.cities) + ' cities';
@@ -5518,6 +4479,30 @@ def create_map(
       if (timeLabel) {
         summaryText += ' | Time: ' + timeLabel;
       }
+    }
+    if (rankMetricMode && rankMetricMode !== 'article_count') {
+      var metricValue = 0;
+      if (rankMetricMode === 'weight_sum') {
+        metricValue = stats.metric_total || (fallback ? fallback.metric_sum || 0 : 0);
+      } else if (rankMetricMode === 'weight_avg') {
+        var denom = Number(stats.metric_count);
+        if (!Number.isFinite(denom) || denom <= 0) {
+          if (fallback) {
+            denom = Number(fallback.metric_count);
+            if (Number.isFinite(denom) && denom > 0) {
+              metricValue = (fallback.metric_sum || 0) / denom;
+            } else {
+              metricValue = fallback ? fallback.metric_value || 0 : 0;
+            }
+          } else {
+            metricValue = 0;
+          }
+        } else {
+          metricValue = (stats.metric_total || 0) / denom;
+        }
+      }
+      stats.metric_value = metricValue;
+      summaryText += ' | ' + rankMetricLabel + ': ' + formatMetricValue(metricValue);
     }
     content.textContent = summaryText;
   }
@@ -6355,52 +5340,7 @@ def create_map(
     var current = index + 1;
     if (!Number.isFinite(current) || current < 1) current = 1;
     if (current > total) current = total;
-    var entry = groupData.entries[index] || null;
-    var baseText = 'Article ' + current + ' of ' + total;
-    if (!entry) {
-      progress.textContent = baseText;
-      return;
-    }
-    var parts = [baseText];
-    var yearToken = entry.dataset_year || entry.datasetYear || null;
-    if (yearToken) {
-      var yearStr = String(yearToken);
-      var yearCounts = groupData.year_match_counts || groupData.yearMatchCounts || {};
-      var totalMatchesForYear = 0;
-      if (yearCounts && Object.prototype.hasOwnProperty.call(yearCounts, yearStr)) {
-        totalMatchesForYear = Number(yearCounts[yearStr]) || 0;
-      }
-      if (totalMatchesForYear > 0) {
-        var withinYearIndex = 0;
-        for (var i = 0; i <= index; i++) {
-          var candidate = groupData.entries[i];
-          if (candidate && String(candidate.dataset_year || candidate.datasetYear || '') === yearStr) {
-            withinYearIndex += 1;
-          }
-        }
-        if (withinYearIndex < 1) withinYearIndex = 1;
-        parts.push('— ' + yearStr + ' match ' + withinYearIndex + ' of ' + totalMatchesForYear);
-      } else {
-        parts.push('— ' + yearStr);
-      }
-      var rawYearTotal = entry.dataset_year_total || entry.datasetYearTotal;
-      var metricLabel = entry.dataset_metric_label || entry.datasetMetricLabel || 'articles';
-      var numericYearTotal = Number(rawYearTotal);
-      if (Number.isFinite(numericYearTotal) && numericYearTotal > 0) {
-        var localizedTotal = numericYearTotal.toLocaleString();
-        var percent = null;
-        if (totalMatchesForYear > 0) {
-          percent = (totalMatchesForYear / numericYearTotal) * 100;
-        }
-        if (percent && percent > 0) {
-          var rounded = percent >= 0.01 ? percent.toFixed(2) : percent.toFixed(4);
-          parts.push('(~' + rounded + '% of ' + localizedTotal + ' ' + metricLabel + ')');
-        } else {
-          parts.push('(' + localizedTotal + ' ' + metricLabel + ' in dataset)');
-        }
-      }
-    }
-    progress.textContent = parts.join(' ');
+    progress.textContent = 'Article ' + current + ' of ' + total;
   }
   function updateDockButtonState(root, btn) {
     if (!root || !btn) {
@@ -7828,7 +6768,1376 @@ function attach(root) {
 ${cluster_block}
 })();
 """)
-    script_html = script_template.substitute(map_var=map_var, cluster_block=cluster_block)
+    return script_template.substitute(map_var=map_var, cluster_block=cluster_block)
+
+def create_map(
+    geojson_path: str,
+    mode: str = "points",
+    time_unit: str = "month",
+    time_step: int = 1,
+    linger_unit: str = "week",
+    linger_step: int = 0,
+    disable_time: bool = False,
+    heat_radius: Optional[int] = None,
+    heat_value: Optional[float] = None,
+    grad_min_radius: Optional[int] = None,
+    grad_max_radius: Optional[int] = None,
+    metric: Optional[str] = None,
+    normalize: bool = False,
+    normalize_denominator: Optional[str] = None,
+    lightweight: bool = False,
+    table_mode: str = "full",
+    table_row_limit: Optional[int] = None,
+    collocate_rank_mode: bool = False,
+    collocate_drop_stopwords: bool = False,
+    collocate_window: int = 5,
+    collocate_drop_terms: Optional[List[str]] = None,
+    collocate_term_groups: Optional[List[dict]] = None,
+    collocate_rank_top_n: int = COLLOCATE_RANK_LIMIT,
+    collocate_rank_term_scope: str = 'global',
+    collocate_rank_time_key: Optional[str] = None,
+    collocate_rank_focus: str = 'all',
+    collocate_rank_focus_city: Optional[str] = None,
+    collocate_rank_focus_state: Optional[str] = None,
+    collocate_rank_time_label: Optional[str] = None,
+    collocate_rank_focus_label: Optional[str] = None,
+    collocate_rank_colorize: bool = False,
+    collocate_time_slider: bool = False,
+    collocate_rank_terms: Optional[List[str]] = None,
+    collocate_map_variant: str = 'rank',
+    collocate_search_term: Optional[str] = None,
+    metadata_enabled: bool = False,
+    project_dir: Optional[str] = None,
+    time_start_override: Optional[str] = None,
+    time_end_override: Optional[str] = None,
+    collocate_export_csv: bool = False,
+    cancel_event: Optional[threading.Event] = None,
+) -> Dict[str, Optional[str]]:
+    """
+    Create a leaflet map next to the GeoJSON.
+
+    Modes:
+      - "points": static points (CircleMarker dots) with popups.
+      - "cluster": clustered point markers that expand on zoom/click.
+      - "heatmap": heat density view. Uses a time slider if dates are present and time is enabled.
+      - "graduated": scaled circle markers sized by the chosen metric.
+
+    Time slider parameters (heatmap mode only):
+      - time_unit: 'day' | 'week' | 'month' | 'year'   (default 'month')
+      - time_step: integer step for the slider increments (default 1)
+      - linger_unit: same options as time_unit (default 'week')
+      - linger_step: how long (in linger_unit) a point remains visible after its date (default 0)
+
+    Additional options:
+      - disable_time: force a static heat layer even when dates are available.
+      - heat_radius: override the radius for the heatmap kernel (default 15).
+      - heat_value: multiplier applied to heatmap weights (default 1.0).
+      - grad_min_radius / grad_max_radius: radius range for graduated markers.
+      - metric: 'article_count' | 'page_count' | 'key_term_frequency'.
+      - normalize: divide the metric by a denominator when True.
+      - normalize_denominator: 'word_count' | 'article_count' | 'page_count'.
+      - lightweight: reduce popup detail and attribute table size for very large outputs.
+      - table_mode: 'full' | 'article' | 'minimal' – controls attribute table columns.
+      - table_row_limit: optional max rows in attribute table (None/<=0 for all rows).
+      - collocate_rank_mode / collocate_drop_stopwords / collocate_window / collocate_drop_terms: configure
+        lightweight collocate rank visualisation on point maps.
+      - collocate_term_groups: optional grouping definitions applied to collocate terms (list of
+        dictionaries with "name" and "terms" entries).
+      - collocate_rank_top_n: limit collocate list and rank output to the top-N terms (default 150).
+      - collocate_rank_term_scope: 'global' to rank across entire period, 'time' to use a specific time bin.
+      - collocate_rank_time_key: time-bin key (1-based index) when collocate_rank_term_scope='time'.
+      - collocate_rank_focus: 'all' (default), 'city', or 'state' to control which locations determine the top terms.
+      - collocate_rank_focus_city / collocate_rank_focus_state: labels used when collocate_rank_focus filters by city or state.
+      - collocate_rank_colorize: when True, apply a graduated color ramp based on collocate article counts.
+      - collocate_rank_terms: optional explicit list of collocate terms to include (overrides top-N when provided).
+      - collocate_time_slider: when True, expose an interactive time slider for collocate views (points mode only).
+      - collocate_map_variant: 'rank' (default) for the ranked-term explorer, or 'top_term' to show each location's top term.
+      - time_start_override / time_end_override: optional ISO dates to force the slider/time-bin extent
+        to respect user-selected parameters when metadata is missing.
+      - collocate_export_csv: when True, write a CSV summarizing collocate data per location.
+
+    Returns:
+        dict with 'map_path' and optional 'attribute_table'.
+    """
+
+    permitted_modes = {"points", "heatmap", "graduated", "cluster"}
+    mode_normalized = (mode or "points").strip().lower()
+    if mode_normalized not in permitted_modes:
+        mode_normalized = "points"
+    mode = mode_normalized
+
+    variant_norm = (collocate_map_variant or 'rank').strip().lower()
+    if variant_norm not in {'rank', 'top_term'}:
+        variant_norm = 'rank'
+    collocate_map_variant = variant_norm
+    top_term_variant = collocate_map_variant == 'top_term'
+
+    _check_cancel(cancel_event)
+
+    with open(geojson_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    features = data.get("features") or []
+    if not isinstance(features, list):
+        raise ValueError("GeoJSON does not contain a valid 'features' list.")
+
+    pts = _extract_points(features, cancel_event=cancel_event)
+    _check_cancel(cancel_event)
+    for entry in pts:
+        _check_cancel(cancel_event)
+        props = entry.get('props') or {}
+        entry['_article_full'] = props.get('article') or ''
+    for idx, entry in enumerate(pts):
+        _check_cancel(cancel_event)
+        entry['_popup_row_id'] = _sanitize_element_id(f'feature-row-{idx}')
+    groups = _group_points(pts, cancel_event=cancel_event)
+    _check_cancel(cancel_event)
+    override_term = (collocate_search_term or '').strip()
+    search_term = override_term or _detect_search_term(geojson_path, data)
+
+    start_override = (time_start_override or '').strip()
+    end_override = (time_end_override or '').strip()
+
+    city_entries_map: Dict[str, List[Dict[str, Any]]] = {}
+
+    allowed_metrics = {"article_count", "page_count", "key_term_frequency"}
+    metric_key = (metric or "article_count").strip().lower()
+    if metric_key not in allowed_metrics:
+        metric_key = "article_count"
+
+    metric_definitions = {
+        'article_count': {
+            'metric_display': 'Articles',
+            'normalized_display': 'Articles / Total Articles',
+            'denominator': 'article_count',
+            'denom_label': 'total articles',
+        },
+        'page_count': {
+            'metric_display': 'Pages',
+            'normalized_display': 'Pages / Total Pages',
+            'denominator': 'page_count',
+            'denom_label': 'total pages',
+        },
+        'key_term_frequency': {
+            'metric_display': 'Term Frequency',
+            'normalized_display': 'Term Frequency / Total Words',
+            'denominator': 'word_count',
+            'denom_label': 'total words',
+        },
+    }
+
+    metric_info = metric_definitions.get(metric_key, metric_definitions['article_count'])
+    metric_display = metric_info['metric_display']
+    metric_normalized_display = metric_info['normalized_display']
+    denom_label = metric_info['denom_label']
+
+    normalize_flag = bool(normalize)
+    denominator_key = metric_info['denominator'] if normalize_flag else None
+
+    time_enabled = mode == 'heatmap' and not disable_time
+
+    articles_count = len(pts)
+    city_set: set = set()
+    newspaper_ids: set = set()
+    dates_dt: List[datetime] = []
+    for p in pts:
+        props = p.get('props', {})
+        city = props.get('City')
+        if city not in (None, ""):
+            city_set.add(str(city))
+        sn = props.get('SN') or props.get('lccn')
+        if sn not in (None, ""):
+            newspaper_ids.add(str(sn))
+        else:
+            title = props.get('Title') or props.get('newspaper_name')
+            if title not in (None, ""):
+                newspaper_ids.add(str(title))
+        dt = p.get('date')
+        if isinstance(dt, datetime):
+            dates_dt.append(dt)
+
+    metadata = data.get('metadata') or data.get('properties') or {}
+    start_meta = start_override or metadata.get('start_date') or metadata.get('StartDate')
+    end_meta = end_override or metadata.get('end_date') or metadata.get('EndDate')
+    start_dt_meta = _parse_date(start_meta) if start_meta else None
+    end_dt_meta = _parse_date(end_meta) if end_meta else None
+
+    if dates_dt:
+        min_dt = min(dates_dt)
+        max_dt = max(dates_dt)
+    else:
+        min_dt = max_dt = None
+
+    dated_pts = [p for p in pts if p.get("date") is not None]
+    rank_time_bins = collocate_rank_mode and bool(dated_pts)
+    use_time_slider = bool(dated_pts) and time_enabled
+    time_index: List[datetime] = []
+    time_labels: List[str] = []
+    range_start = start_dt_meta or min_dt
+    range_end = end_dt_meta or max_dt
+    if range_start and range_end and range_start > range_end:
+        range_start, range_end = range_end, range_start
+    if (use_time_slider or rank_time_bins) and min_dt and max_dt:
+        time_index = _build_time_index(range_start, range_end, time_unit, max(1, int(time_step or 1)))
+        time_labels = [dt.strftime('%Y-%m-%dT%H:%M:%SZ') for dt in time_index]
+
+    collocate_time_slider_enabled = bool(
+        collocate_time_slider
+        and collocate_rank_mode
+        and time_index
+        and len(time_index) > 1
+    )
+    collocate_time_bins_payload: List[Dict[str, str]] = []
+    collocate_time_default_key: Optional[str] = None
+    if collocate_time_slider_enabled:
+        for idx, dt in enumerate(time_index):
+            label_iso = time_labels[idx] if idx < len(time_labels) else dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+            try:
+                display_label = dt.strftime('%Y-%m-%d')
+            except Exception:
+                display_label = label_iso
+            collocate_time_bins_payload.append({'key': str(idx + 1), 'label': display_label, 'iso': label_iso})
+        if len(collocate_time_bins_payload) <= 1:
+            collocate_time_slider_enabled = False
+            collocate_time_bins_payload = []
+        else:
+            if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time'):
+                if collocate_rank_time_key:
+                    candidate_key = str(collocate_rank_time_key).strip()
+                    if any(bin_info['key'] == candidate_key for bin_info in collocate_time_bins_payload):
+                        collocate_time_default_key = candidate_key
+            if collocate_time_default_key is None and collocate_time_bins_payload:
+                collocate_time_default_key = collocate_time_bins_payload[0]['key']
+
+    start_str = start_meta or (min_dt.strftime('%Y-%m-%d') if min_dt else '')
+    end_str = end_meta or (max_dt.strftime('%Y-%m-%d') if max_dt else '')
+    if not start_str and end_str:
+        start_str = end_str
+    if not end_str and start_str:
+        end_str = start_str
+    date_range = (start_str, end_str) if start_str or end_str else ()
+
+    popup_width = 320 if lightweight else 360
+
+    start_date_for_metrics: Optional[date] = None
+    end_date_for_metrics: Optional[date] = None
+    if isinstance(range_start, datetime):
+        start_date_for_metrics = range_start.date()
+    elif isinstance(range_start, date):
+        start_date_for_metrics = range_start
+    if isinstance(range_end, datetime):
+        end_date_for_metrics = range_end.date()
+    elif isinstance(range_end, date):
+        end_date_for_metrics = range_end
+    if start_date_for_metrics is None and min_dt:
+        start_date_for_metrics = min_dt.date()
+    if end_date_for_metrics is None and max_dt:
+        end_date_for_metrics = max_dt.date()
+
+    embed_articles = not lightweight
+    values: List[float] = []
+    popup_dataset: Dict[str, Any] = {}
+    for group in groups:
+        _check_cancel(cancel_event)
+        entries = group.get("entries", [])
+        stats = _compute_group_stats(entries, search_term)
+        group["stats"] = stats
+        value = _compute_group_value(stats, metric_key, normalize_flag, denominator_key)
+        group["value"] = value
+        group["metric_key"] = metric_key
+        group["metric_display"] = metric_display
+        group["metric_normalized_display"] = metric_normalized_display
+        group["normalized"] = normalize_flag
+        group["denominator_label"] = denom_label if normalize_flag else ''
+
+        location = group.get('location') or (
+            (entries[0]['lat'], entries[0]['lon']) if entries else (0.0, 0.0)
+        )
+        try:
+            loc_lat = float(location[0])
+        except (TypeError, ValueError, IndexError):
+            loc_lat = 0.0
+        try:
+            loc_lon = float(location[1])
+        except (TypeError, ValueError, IndexError):
+            loc_lon = 0.0
+
+        entry_payloads = []
+        year_match_counts: Dict[str, int] = {}
+        for entry_idx, entry in enumerate(entries):
+            _check_cancel(cancel_event)
+            payload = _entry_payload(
+                entry,
+                search_term,
+                embed_article=embed_articles,
+                lightweight=lightweight,
+            )
+            payload['full_index'] = entry_idx
+            entry_date = str(entry.get('date') or '').strip()
+            if entry_date:
+                year_token = entry_date[:4]
+                if year_token.isdigit():
+                    payload['dataset_year'] = year_token
+                    year_match_counts[year_token] = year_match_counts.get(year_token, 0) + 1
+                    try:
+                        year_int = int(year_token)
+                    except (TypeError, ValueError):
+                        year_int = None
+                    if year_int is not None:
+                        start_for_year = start_date_for_metrics or date(year_int, 1, 1)
+                        end_for_year = end_date_for_metrics or date(year_int, 12, 31)
+                        try:
+                            year_total_val = metric_total_for_year_within_dates(
+                                year_int,
+                                start_for_year,
+                                end_for_year,
+                                "article_count",
+                            )
+                        except Exception:
+                            year_total_val = None
+                        if year_total_val:
+                            payload['dataset_year_total'] = int(year_total_val)
+                            payload['dataset_metric_label'] = 'articles'
+            entry_payloads.append(payload)
+
+        for entry in entries:
+            _check_cancel(cancel_event)
+            entry["value"] = value
+
+        first_props = entries[0].get('props', {}) if entries else {}
+        city_raw = str(first_props.get('City') or '').strip()
+        state_raw = str(first_props.get('State') or '').strip()
+        city_key = _city_state_key(city_raw, state_raw)
+        place_label = ', '.join([p for p in (city_raw, state_raw) if p])
+
+        city_entries_map.setdefault(city_key, entries)
+
+        title_text, article_count, _ = _group_header(entries, stats, search_term)
+        dataset_entry: Dict[str, Any] = {
+            'entries': entry_payloads,
+            'value': value,
+            'full_value': value,
+            'article_count': article_count,
+            'full_article_count': article_count,
+            'title': title_text,
+            'full_title': title_text,
+            'metric_display': metric_display,
+            'metric_normalized_display': metric_normalized_display,
+            'normalized': normalize_flag,
+            'denominator_label': denom_label if normalize_flag else '',
+            'lat': loc_lat,
+            'lon': loc_lon,
+            'coords': [{'lat': loc_lat, 'lon': loc_lon}],
+            'location_index': 1,
+            'location_total': 1,
+            'location_label': '',
+            'search_term': search_term or '',
+            'city': city_raw,
+            'state': state_raw,
+            'place_label': place_label,
+        }
+        if year_match_counts:
+            dataset_entry['year_match_counts'] = year_match_counts
+
+        if (use_time_slider or rank_time_bins) and time_index:
+            time_bins: Dict[str, Dict[str, Any]] = {}
+            for idx_entry, entry in enumerate(entries):
+                dt = entry.get('date')
+                bin_indices = _assign_time_bins(dt, time_index, linger_unit, int(linger_step or 0))
+                for bin_idx in bin_indices:
+                    _check_cancel(cancel_event)
+                    if bin_idx < len(time_labels):
+                        label = time_labels[bin_idx]
+                    else:
+                        label = time_index[bin_idx].strftime('%Y-%m-%dT%H:%M:%SZ')
+                    key = str(bin_idx + 1)
+                    bucket = time_bins.setdefault(key, {'indexes': [], 'label': label})
+                    bucket['indexes'].append(idx_entry)
+
+            if time_bins:
+                time_payload: Dict[str, Any] = {}
+                for bin_key, info in time_bins.items():
+                    _check_cancel(cancel_event)
+                    indexes = info.get('indexes') or []
+                    if not indexes:
+                        continue
+                    bin_entries = [entries[i] for i in indexes if 0 <= i < len(entries)]
+                    if not bin_entries:
+                        continue
+                    bin_stats = _compute_group_stats(bin_entries, search_term)
+                    bin_value = _compute_group_value(bin_stats, metric_key, normalize_flag, denominator_key)
+                    bin_title, bin_count, _ = _group_header(bin_entries, bin_stats, search_term)
+                    label_value = info.get('label') or ''
+                    time_payload[bin_key] = {
+                        'indexes': indexes,
+                        'value': bin_value,
+                        'article_count': bin_count,
+                        'title': bin_title,
+                        'time_label': label_value,
+                    }
+                if time_payload:
+                    dataset_entry['time_bins'] = time_payload
+
+        popup_dataset[group['id']] = dataset_entry
+        values.append(value)
+
+    collocate_terms_list: List[str] = []
+    rank_index: Dict[str, Dict[str, Dict[str, int]]] = {}
+    rank_max_value = 0
+    collocate_term_stats: Dict[str, Dict[str, int]] = {}
+    collocate_hits_by_city: Dict[str, Dict[str, Set[int]]] = {}
+    initial_collocate_term: str = ''
+    initial_collocate_summary_text: str = ''
+    if collocate_rank_mode:
+        (
+            collocate_terms_list,
+            rank_index,
+            rank_max_value,
+            collocate_hits_by_city,
+            collocate_time_totals,
+            collocate_time_labels,
+        ) = _build_collocate_rank_index(
+            groups,
+            popup_dataset,
+            search_term,
+            drop_stopwords=collocate_drop_stopwords,
+            window=collocate_window,
+            drop_terms=collocate_drop_terms,
+            term_groups=collocate_term_groups,
+            top_n=collocate_rank_top_n,
+            term_scope=collocate_rank_term_scope,
+            time_key=collocate_rank_time_key,
+            focus_mode=collocate_rank_focus,
+            focus_city=collocate_rank_focus_city,
+            focus_state=collocate_rank_focus_state,
+            manual_terms=collocate_rank_terms,
+            cancel_event=cancel_event,
+        )
+        if collocate_hits_by_city:
+            for group in groups:
+                group_id = group.get('id')
+                if not group_id:
+                    continue
+                dataset_entry = popup_dataset.get(group_id)
+                if not isinstance(dataset_entry, dict):
+                    continue
+                city_val = dataset_entry.get('city')
+                state_val = dataset_entry.get('state')
+                city_key = _city_state_key(city_val, state_val)
+                term_map = collocate_hits_by_city.get(city_key)
+                if not term_map:
+                    continue
+                hits_for_dataset: Dict[str, List[int]] = {}
+                for term, indexes in term_map.items():
+                    if not indexes:
+                        continue
+                    normalized_indexes: Set[int] = set()
+                    for idx in indexes:
+                        try:
+                            normalized_indexes.add(int(idx))
+                        except (TypeError, ValueError):
+                            continue
+                    if normalized_indexes:
+                        hits_for_dataset[term] = sorted(normalized_indexes)
+                if hits_for_dataset:
+                    dataset_entry['collocate_hits'] = hits_for_dataset
+
+        if collocate_hits_by_city:
+            term_article_counts: Dict[str, int] = defaultdict(int)
+            term_cities: Dict[str, Set[str]] = defaultdict(set)
+            term_newspapers: Dict[str, Set[str]] = defaultdict(set)
+
+            for city_key, term_map in collocate_hits_by_city.items():
+                entries = city_entries_map.get(city_key) or []
+                for term, indexes in term_map.items():
+                    if not indexes:
+                        continue
+                    term_article_counts[term] += len(indexes)
+                    term_cities[term].add(city_key)
+                    for idx in indexes:
+                        try:
+                            idx_int = int(idx)
+                        except (TypeError, ValueError):
+                            continue
+                        if idx_int < 0 or idx_int >= len(entries):
+                            continue
+                        entry_obj = entries[idx_int]
+                        props = entry_obj.get('props', {}) if isinstance(entry_obj, dict) else {}
+                        paper_id = (
+                            props.get('SN')
+                            or props.get('lccn')
+                            or props.get('Title')
+                            or props.get('newspaper_name')
+                            or ''
+                        )
+                        paper_str = str(paper_id).strip()
+                        if paper_str:
+                            term_newspapers[term].add(paper_str)
+
+            for term, total_articles in term_article_counts.items():
+                collocate_term_stats[term] = {
+                    'articles': int(total_articles),
+                    'newspapers': len(term_newspapers.get(term, set())),
+                    'cities': len(term_cities.get(term, set())),
+                }
+
+        initial_collocate_term = collocate_terms_list[0] if collocate_terms_list else ''
+
+        def _format_collocate_summary(term: str) -> str:
+            if not term:
+                return 'Collocate term: none selected'
+            stats = collocate_term_stats.get(term) or {}
+            articles_val = stats.get('articles', 0)
+            newspapers_val = stats.get('newspapers', 0)
+            cities_val = stats.get('cities', 0)
+            return (
+                f'Collocate term "{term}": '
+                f'{articles_val:,} articles | {newspapers_val:,} newspapers | {cities_val:,} cities'
+            )
+
+        initial_collocate_summary_text = _format_collocate_summary(initial_collocate_term)
+
+        scope_norm = str(collocate_rank_term_scope or '').strip().lower()
+        if scope_norm.startswith('time') and collocate_rank_time_key:
+            raw_key = str(collocate_rank_time_key).strip()
+            key_variants = [raw_key] if raw_key else []
+            label_variant = collocate_time_labels.get(raw_key)
+            if label_variant:
+                key_variants.append(label_variant)
+            combined_counter = Counter()
+            for candidate in key_variants:
+                if not candidate:
+                    continue
+                counter = collocate_time_totals.get(candidate)
+                if counter:
+                    combined_counter.update(counter)
+            if combined_counter:
+                scoped_terms = [
+                    term for term, _freq in _sorted_counter_terms(combined_counter) if term
+                ][:collocate_rank_top_n]
+                if scoped_terms:
+                    collocate_terms_list = scoped_terms
+                    initial_collocate_term = collocate_terms_list[0]
+                    initial_collocate_summary_text = _format_collocate_summary(initial_collocate_term)
+
+    if groups and not any(v > 0 for v in values):
+        for group in groups:
+            group["value"] = 1.0
+            for entry in group.get("entries", []):
+                entry["value"] = 1.0
+
+    base_name = os.path.splitext(os.path.basename(geojson_path))[0]
+    out_dir = os.path.dirname(geojson_path)
+
+    articles_count = len(pts)
+    city_set: set = set()
+    newspaper_ids: set = set()
+    dates_dt: List[datetime] = []
+    for p in pts:
+        props = p.get('props', {})
+        city = props.get('City')
+        if city not in (None, ""):
+            city_set.add(str(city))
+        sn = props.get('SN') or props.get('lccn')
+        if sn not in (None, ""):
+            newspaper_ids.add(str(sn))
+        else:
+            title = props.get('Title') or props.get('newspaper_name')
+            if title not in (None, ""):
+                newspaper_ids.add(str(title))
+        dt = p.get('date')
+        if isinstance(dt, datetime):
+            dates_dt.append(dt)
+
+    metadata = data.get('metadata') or data.get('properties') or {}
+    start_meta = start_override or metadata.get('start_date') or metadata.get('StartDate')
+    end_meta = end_override or metadata.get('end_date') or metadata.get('EndDate')
+
+    if dates_dt:
+        min_dt = min(dates_dt)
+        max_dt = max(dates_dt)
+    else:
+        min_dt = max_dt = None
+
+    dated_pts = [p for p in pts if p.get("date") is not None]
+    rank_time_bins = collocate_rank_mode and bool(dated_pts)
+    use_time_slider = bool(dated_pts) and time_enabled
+    time_index: List[datetime] = []
+    time_labels: List[str] = []
+    range_start = start_dt_meta or min_dt
+    range_end = end_dt_meta or max_dt
+    if range_start and range_end and range_start > range_end:
+        range_start, range_end = range_end, range_start
+    if (use_time_slider or rank_time_bins) and min_dt and max_dt:
+        time_index = _build_time_index(range_start, range_end, time_unit, max(1, int(time_step or 1)))
+        time_labels = [dt.strftime('%Y-%m-%dT%H:%M:%SZ') for dt in time_index]
+
+    start_str = start_meta or (min_dt.strftime('%Y-%m-%d') if min_dt else '')
+    end_str = end_meta or (max_dt.strftime('%Y-%m-%d') if max_dt else '')
+    if not start_str and end_str:
+        start_str = end_str
+    if not end_str and start_str:
+        end_str = start_str
+    date_range = (start_str, end_str) if start_str or end_str else ()
+
+    metric_display_summary = metric_normalized_display if normalize_flag else metric_display
+
+    allowed_table_modes = {'full', 'article', 'minimal'}
+    table_mode_norm = (table_mode or 'full').strip().lower()
+    if table_mode_norm not in allowed_table_modes:
+        table_mode_norm = 'full'
+
+    row_limit_val: Optional[int] = None
+    if table_row_limit:
+        try:
+            parsed_limit = int(table_row_limit)
+            if parsed_limit > 0:
+                row_limit_val = parsed_limit
+        except (TypeError, ValueError):
+            row_limit_val = None
+
+    summary = {
+        'geojson_name': os.path.basename(geojson_path),
+        'term': search_term or '',
+        'date_range': date_range,
+        'articles': articles_count,
+        'newspapers': len(newspaper_ids),
+        'cities': len(city_set),
+        'metric_display': metric_display_summary,
+        'metric_key': metric_key,
+        'normalized': normalize_flag,
+        'denominator_label': denom_label if normalize_flag else '',
+        'mode': mode,
+        'time_enabled': time_enabled,
+        'time_unit': time_unit,
+        'time_step': time_step,
+        'linger_unit': linger_unit,
+        'linger_step': linger_step,
+        'lightweight': bool(lightweight),
+        'table_mode': table_mode_norm,
+        'table_row_limit': row_limit_val or 0,
+        'collocate_drop_terms': list(collocate_drop_terms or []),
+        'collocate_term_groups': list(collocate_term_groups or []),
+    }
+
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    suffix_parts = [mode, metric_key]
+    if normalize_flag:
+        suffix_parts.append('norm')
+    if lightweight:
+        suffix_parts.append('lite')
+    if collocate_rank_mode:
+        scope_tag = 'global'
+        if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time'):
+            key_val = (collocate_rank_time_key or '').strip()
+            scope_tag = f'time-{key_val}' if key_val else 'time'
+        suffix_parts.append(f'scope-{_slug(scope_tag)}')
+
+        focus_mode_norm = (collocate_rank_focus or 'all').strip().lower()
+        focus_tag = focus_mode_norm or 'all'
+        if focus_mode_norm == 'city':
+            components = [collocate_rank_focus_city or '']
+            if collocate_rank_focus_state:
+                components.append(collocate_rank_focus_state)
+            focus_tag = 'city-' + '-'.join(filter(None, components))
+        elif focus_mode_norm == 'state':
+            focus_tag = f"state-{collocate_rank_focus_state or ''}"
+        suffix_parts.append(f'focus-{_slug(focus_tag)}')
+    suffix_parts.append(timestamp)
+    suffix = '_'.join(suffix_parts)
+
+    map_filename = f"{base_name}_{suffix}.html"
+    table_filename = f"{base_name}_{suffix}_attributes.html"
+    out_html = os.path.join(out_dir, map_filename)
+    attr_path = os.path.join(out_dir, table_filename)
+
+    table_kwargs: Dict[str, Any] = {'hyperlink_columns': ['url']}
+    if table_mode_norm == 'article':
+        table_kwargs['include_columns'] = ['date', 'Title', 'article', 'url']
+    elif table_mode_norm == 'minimal':
+        table_kwargs['include_columns'] = ['date', 'Title', 'City', 'State', 'lccn', 'page', 'url', 'article']
+        table_kwargs['omit_article'] = False
+
+    max_rows = row_limit_val
+    if lightweight:
+        light_limit = min(len(pts), 1000) if pts else None
+        if light_limit:
+            max_rows = light_limit if max_rows is None else min(max_rows, light_limit)
+        include_cols = table_kwargs.get('include_columns')
+        if include_cols:
+            if 'article' not in include_cols:
+                include_cols.append('article')
+        else:
+            table_kwargs['include_columns'] = [
+                'date',
+                'Title',
+                'headline',
+                'Headline',
+                'City',
+                'State',
+                'page',
+                'url',
+                'article',
+            ]
+        table_kwargs['omit_article'] = False
+
+    if max_rows:
+        table_kwargs['max_rows'] = max_rows
+
+    heat_radius_val = 15
+    if heat_radius is not None:
+        try:
+            candidate_radius = int(heat_radius)
+            if candidate_radius > 0:
+                heat_radius_val = candidate_radius
+        except (TypeError, ValueError):
+            pass
+
+    heat_multiplier = 1.0
+    if heat_value is not None:
+        try:
+            candidate_multiplier = float(heat_value)
+            if candidate_multiplier > 0:
+                heat_multiplier = candidate_multiplier
+        except (TypeError, ValueError):
+            pass
+
+    grad_min_val = max(1, int(grad_min_radius) if grad_min_radius else 6)
+    grad_max_val = max(grad_min_val + 1, int(grad_max_radius) if grad_max_radius else 28)
+
+    m = folium.Map(location=[37.8, -96.0], zoom_start=4)
+    m.add_child(_ZoomTopRight())
+
+    def point_radius(group: Dict[str, Any]) -> float:
+        count = len(group.get("entries") or [])
+        return 5 if count > 1 else 3
+
+    if mode == "heatmap":
+        if use_time_slider and dated_pts:
+            idx = time_index
+            slices = _heat_slices(dated_pts, idx, linger_unit, int(linger_step or 0))
+            heat_data: List[List[List[float]]] = []
+            for frame in slices:
+                frame_pts: List[List[float]] = []
+                for item in frame:
+                    lat, lon = item[0], item[1]
+                    base_weight = item[2] if len(item) > 2 else None
+                    if base_weight is not None and base_weight > 0:
+                        weight_val = base_weight * heat_multiplier
+                        frame_pts.append([lat, lon, weight_val])
+                    elif heat_multiplier > 0:
+                        frame_pts.append([lat, lon, heat_multiplier])
+                    else:
+                        frame_pts.append([lat, lon])
+                heat_data.append(frame_pts)
+            index_labels = time_labels if time_labels else [t.strftime("%Y-%m-%dT00:00:00Z") for t in idx]
+            HeatMapWithTime(
+                heat_data,
+                index=index_labels,
+                auto_play=False,
+                max_opacity=0.7,
+                radius=heat_radius_val,
+            ).add_to(m)
+        else:
+            coords: List[List[float]] = []
+            for p in pts:
+                base_weight = p.get("value")
+                if base_weight is not None and base_weight > 0:
+                    weight_val = base_weight * heat_multiplier
+                    coords.append([p["lat"], p["lon"], weight_val])
+                elif heat_multiplier > 0:
+                    coords.append([p["lat"], p["lon"], heat_multiplier])
+                else:
+                    coords.append([p["lat"], p["lon"]])
+            if coords:
+                HeatMap(coords, max_opacity=0.7, radius=heat_radius_val).add_to(m)
+
+        _add_point_markers(
+            m,
+            groups,
+            search_term,
+            point_radius,
+            popup_width=popup_width,
+            lightweight=lightweight,
+            popup_dataset=popup_dataset,
+            ghost_markers=True,
+        )
+
+    elif mode == "graduated":
+        resolver = _graduated_radius_resolver(groups, float(grad_min_val), float(grad_max_val))
+        _add_point_markers(
+            m,
+            groups,
+            search_term,
+            resolver,
+            popup_width=popup_width,
+            lightweight=lightweight,
+            popup_dataset=popup_dataset,
+        )
+    elif mode == "cluster":
+        icon_create_function = (
+            "function(cluster) {"
+            " var sum = 0;"
+            " cluster.getAllChildMarkers().forEach(function(marker) {"
+            "   var v = marker.options && marker.options.metricValue;"
+            "   if (typeof v === 'number' && !isNaN(v)) { sum += v; }"
+            "   else if (v) { var num = parseFloat(v); if (!isNaN(num)) sum += num; }"
+            " });"
+            " var formatted;"
+            " if (%s) { formatted = sum.toFixed(4); }"
+            " else { formatted = Math.round(sum).toLocaleString(); }"
+            " var absSum = Math.abs(sum);"
+            " var c = 'marker-cluster marker-cluster-small';"
+            " if (absSum >= 100) { c = 'marker-cluster marker-cluster-large'; }"
+            " else if (absSum >= 10) { c = 'marker-cluster marker-cluster-medium'; }"
+            " return L.divIcon({ html: '<div><span>' + formatted + '</span></div>', className: c, iconSize: new L.Point(40, 40) });"
+            "}"
+        ) % ('true' if normalize_flag else 'false')
+
+        cluster = MarkerCluster(
+            name='Markers',
+            options={
+                'showCoverageOnHover': False,
+                'zoomToBoundsOnClick': False,
+                'spiderfyOnMaxZoom': False,
+            },
+            icon_create_function=icon_create_function,
+        )
+        cluster.add_to(m)
+        _add_point_markers(
+            cluster,
+            groups,
+            search_term,
+            point_radius,
+            popup_width=popup_width,
+            lightweight=lightweight,
+            popup_dataset=popup_dataset,
+            ghost_markers=False,
+        )
+    else:
+        _add_point_markers(
+            m,
+            groups,
+            search_term,
+            point_radius,
+            popup_width=popup_width,
+            lightweight=lightweight,
+            popup_dataset=popup_dataset,
+        )
+
+
+    if lightweight:
+        for entry in pts:
+            props = entry.get('props') if isinstance(entry, dict) else None
+            if isinstance(props, dict) and 'article' in props:
+                props['article'] = ''
+
+    attr_file = _write_attribute_table(pts, attr_path, **table_kwargs)
+    if attr_file:
+        summary['attribute_table'] = attr_file
+
+    valid_row_ids = {
+        entry.get('_popup_row_id')
+        for entry in pts
+        if isinstance(entry, dict) and entry.get('_attr_in_table')
+    }
+    if not attr_file:
+        valid_row_ids = set()
+
+    if popup_dataset:
+        def _prune_attr_ids(payloads: Optional[List[Dict[str, Any]]]) -> None:
+            if not payloads:
+                return
+            for payload in payloads:
+                if not isinstance(payload, dict):
+                    continue
+                row_id = payload.get('attr_row_id')
+                if row_id and row_id not in valid_row_ids:
+                    payload['attr_row_id'] = ''
+
+        for dataset_entry in popup_dataset.values():
+            if not isinstance(dataset_entry, dict):
+                continue
+            _prune_attr_ids(dataset_entry.get('entries'))
+            _prune_attr_ids(dataset_entry.get('full_entries'))
+
+    lazy_popup_mode = bool(attr_file and mode == 'heatmap' and lightweight)
+    if lazy_popup_mode and popup_dataset:
+        def _strip_inline_articles(payloads: Optional[List[Dict[str, Any]]]) -> None:
+            if not payloads:
+                return
+            for payload in payloads:
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get('attr_row_id'):
+                    payload['article_html'] = ''
+
+        for dataset_entry in popup_dataset.values():
+            if not isinstance(dataset_entry, dict):
+                continue
+            _strip_inline_articles(dataset_entry.get('entries'))
+            _strip_inline_articles(dataset_entry.get('full_entries'))
+
+    if collocate_rank_mode:
+        metric_display_summary = 'Ranked Collocates'
+        if top_term_variant:
+            metric_display_summary = 'Top Collocate Term'
+
+    search_results_text = f"{articles_count:,} articles | {len(newspaper_ids):,} newspapers | {len(city_set):,} cities"
+    search_results_line = f'<div id="collocateSearchResults" style="margin-top:4px;"><strong>Search Results:</strong> {_esc(search_results_text)}</div>'
+
+    header_lines: List[str] = []
+
+    title_html = ''
+    # Collocate maps get a custom title; otherwise include basic info lines
+    if collocate_rank_mode:
+        term_text = (summary.get('term') or '').strip()
+        term_segment = f"of '{_esc(term_text)}'" if term_text else ''
+        date_segment = ''
+        if summary.get('date_range'):
+            start, end = summary['date_range']
+            date_text = start if start == end else ' – '.join([s for s in (start, end) if s])
+            if date_text:
+                date_segment = f"between {_esc(date_text)}"
+        title_bits = ['Top Ranked Collocates']
+        if term_segment:
+            title_bits.append(term_segment)
+        if date_segment:
+            title_bits.append(date_segment)
+        title_html = '<div style="font-weight:700; font-size:16px; margin-bottom:4px;">' + ' '.join(title_bits) + '</div>'
+    else:
+        if summary.get('date_range'):
+            start, end = summary['date_range']
+            date_text = start if start == end else ' – '.join([s for s in (start, end) if s])
+            if date_text:
+                header_lines.append(f'<div><strong>Date range:</strong> {_esc(date_text)}</div>')
+        if summary.get('term'):
+            header_lines.append(f'<div><strong>Term:</strong> {_esc(summary["term"])}</div>')
+
+    if title_html:
+        header_lines.insert(0, title_html)
+
+    if lightweight:
+        header_lines.append('<div style="font-size:12px; font-weight:400;"><em>Lightweight mode: popups and table trimmed for size.</em></div>')
+
+    header_lines.append(f'<div><strong>Data Source:</strong> {_esc(summary["geojson_name"])}</div>')
+
+    header_lines.append(search_results_line)
+
+    if attr_file:
+        link_name = os.path.basename(attr_file)
+        header_lines.append(
+            f'<div><a href="{html.escape(link_name)}" target="_blank" rel="noopener">Open attribute table</a></div>'
+        )
+
+    header_lines.append('<div style="height:6px;"></div>')
+
+    header_lines.append(f'<div><strong>Mapped metric:</strong> {_esc(metric_display_summary)}</div>')
+    if summary.get('normalized') and denom_label:
+        header_lines.append(
+            f'<div style="font-size:12px; color:#555;">Normalized per city by {_esc(denom_label)}</div>'
+        )
+    if time_enabled:
+        time_text = f"{time_step} {time_unit}"
+        linger_text = f"{linger_step} {linger_unit}"
+        header_lines.append(
+            f'<div><strong>Time bin:</strong> {_esc(time_text)} | <strong>Linger:</strong> {_esc(linger_text)}</div>'
+        )
+
+    if collocate_rank_mode:
+        if top_term_variant:
+            summary_line_text = 'Top collocate term per location.'
+        else:
+            summary_line_text = initial_collocate_summary_text or 'Collocate term: none selected'
+        ranking_scope_text = 'Entire period'
+        if collocate_rank_term_scope and collocate_rank_term_scope.strip().lower().startswith('time'):
+            key_text = collocate_rank_time_key or ''
+            if collocate_rank_time_label:
+                ranking_scope_text = collocate_rank_time_label
+            elif key_text:
+                ranking_scope_text = f'Time bin {key_text}'
+            else:
+                ranking_scope_text = 'First time bin'
+        header_lines.append(
+            f'<div><strong>Home time Bin:</strong> {_esc(ranking_scope_text)}</div>'
+        )
+
+        focus_mode_norm = (collocate_rank_focus or '').strip().lower()
+        if collocate_rank_focus_label:
+            focus_desc = collocate_rank_focus_label
+        elif focus_mode_norm == 'city' and collocate_rank_focus_city:
+            if collocate_rank_focus_state:
+                focus_desc = f'City — {collocate_rank_focus_city}, {collocate_rank_focus_state}'
+            else:
+                focus_desc = f'City — {collocate_rank_focus_city}'
+        elif focus_mode_norm == 'state' and collocate_rank_focus_state:
+            focus_desc = f'State — {collocate_rank_focus_state}'
+        else:
+            focus_desc = 'All cities'
+        header_lines.append(
+            f'<div><strong>Ranking Location:</strong> {_esc(focus_desc)}</div>'
+        )
+
+        slider_placeholder = '<div id="collocateTimeSliderContainer" style="margin-top:6px;"></div>' if collocate_time_slider_enabled and collocate_time_bins_payload else ''
+        if top_term_variant:
+            header_lines.append(
+                '<div style="margin-top:6px;">Markers display the top-ranked collocate term for each location. Circle size reflects the number of articles containing that term.</div>'
+            )
+            if slider_placeholder:
+                header_lines.append(slider_placeholder)
+            header_lines.append(
+                '<div id="collocateSummaryLine" '
+                'style="color:#2d3748; margin-top:6px; position:relative; display:inline-block; min-width:320px;">'
+                f'<span data-summary-content="1">{_esc(summary_line_text)}</span>'
+                '<span aria-hidden="true" data-summary-buffer="1" '
+                'style="visibility:hidden; pointer-events:none; white-space:nowrap; display:inline-block;">'
+                'Top collocate term sample: 999,999 articles | Unique terms: 9,999 | Time: 1901-01-01'
+                '</span>'
+                '</div>'
+            )
+        else:
+            if collocate_terms_list:
+                select_opts_parts = []
+                for idx, term in enumerate(collocate_terms_list[:200], start=1):
+                    select_opts_parts.append(
+                        f'<option value="{_esc(term)}">({_esc(str(idx))}) {_esc(term)}</option>'
+                    )
+                select_opts = ''.join(select_opts_parts)
+                scope_desc = ranking_scope_text
+                if scope_desc.lower() == 'entire period':
+                    scope_desc = 'entire period'
+                focus_desc = ''
+                focus_mode_norm = (collocate_rank_focus or '').strip().lower()
+                if focus_mode_norm == 'city' and collocate_rank_focus_city:
+                    focus_desc = f' for {collocate_rank_focus_city}'
+                    if collocate_rank_focus_state:
+                        focus_desc += f', {collocate_rank_focus_state}'
+                elif focus_mode_norm == 'state' and collocate_rank_focus_state:
+                    focus_desc = f' for {collocate_rank_focus_state}'
+                scope_text = _esc(scope_desc)
+                focus_text = _esc(focus_desc)
+                header_lines.append(
+                    f'<div>Top {len(collocate_terms_list)} collocates based on {scope_text}{focus_text}</div>'
+                )
+                header_lines.append(
+                    '<div style="margin-top:6px;">'
+                    '<label style="font-weight:600; margin-right:6px;">Collocate term:</label>'
+                    f'<select id="collocateTermSelect" style="min-width:220px;">{select_opts}</select>'
+                    '</div>'
+                )
+                if slider_placeholder:
+                    header_lines.append(slider_placeholder)
+            else:
+                if slider_placeholder:
+                    header_lines.append(slider_placeholder)
+
+            header_lines.append(
+                '<div id="collocateSummaryLine" '
+                'style="color:#c53030; margin-top:6px; position:relative; display:inline-block; min-width:320px;">'
+                f'<span data-summary-content="1">{_esc(summary_line_text)}</span>'
+                '<span aria-hidden="true" data-summary-buffer="1" '
+                'style="visibility:hidden; pointer-events:none; white-space:nowrap; display:inline-block;">'
+                'Collocate term sample: 999,999 articles | 9,999 newspapers | 9,999 cities | Time: 1901-01-01'
+                '</span>'
+                '</div>'
+            )
+
+    header_html = (
+        '<div style="position: fixed; top: 5px; left: 5px; z-index:9999;">'
+        '<div style="max-width: 560px; background: rgba(255,255,255,0.92); '
+        'padding: 8px 12px; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.2); '
+        'font-size: 13px; line-height: 1.4;">'
+        + ''.join(header_lines)
+        + '</div></div>'
+    )
+    m.get_root().html.add_child(folium.Element(header_html))
+
+    time_controls_style = (
+        '<style>'
+        '.collocate-time-button { '
+        'border: 1px solid #cbd5e0; '
+        'background: #f7fafc; '
+        'color: #2d3748; '
+        'border-radius: 999px; '
+        'padding: 2px 10px; '
+        'font-size: 14px; '
+        'line-height: 1; '
+        'cursor: pointer; '
+        'transition: background 0.2s ease, color 0.2s ease; '
+        '}'
+        '.collocate-time-button[data-clock-role="toggle"] { '
+        'position: relative; '
+        'font-size: 18px; '
+        'padding: 2px 8px; '
+        '}'
+        '.collocate-time-button[data-clock-role="toggle"][data-clock-disabled="1"]::after { '
+        'content: ""; '
+        'position: absolute; '
+        'left: 50%; '
+        'top: 50%; '
+        'width: 70%; '
+        'height: 2px; '
+        'background: #c53030; '
+        'border-radius: 999px; '
+        'pointer-events: none; '
+        'transform: translate(-50%, -50%) rotate(45deg); '
+        '}'
+        '.collocate-time-button:hover { background: #edf2f7; color: #1a202c; }'
+        '.collocate-time-button:disabled { opacity: 0.4; cursor: default; }'
+        '#collocateTimeRange { accent-color: #2b6cb0; }'
+        '</style>'
+    )
+    m.get_root().html.add_child(folium.Element(time_controls_style))
+
+    if rank_index and not top_term_variant:
+        label_style = (
+            '<style>'
+            '.collocate-rank-label { '
+            'background: transparent; '
+            'border: none; '
+            'box-shadow: none; '
+            'color: #ffffff; '
+            'font-weight: 600; '
+            'pointer-events: none; '
+            'padding: 0; '
+            'margin: 0; '
+            'text-shadow: 0 1px 2px rgba(0,0,0,0.55); '
+            '}'
+            '.collocate-rank-label:before { display: none; }'
+            '.collocate-rank-label .leaflet-tooltip-content { '
+            'margin: 0 !important; '
+            'padding: 0 !important; '
+            'line-height: 1; '
+            '}'
+            '</style>'
+        )
+        m.get_root().html.add_child(folium.Element(label_style))
+
+    config_payload = {
+        'attribute_table': os.path.basename(attr_file) if attr_file else '',
+        'search_term': search_term or '',
+        'inline_articles': bool(embed_articles),
+        'time_labels': time_labels if (use_time_slider or collocate_time_slider_enabled) and time_labels else [],
+        'map_mode': mode,
+        'click_radius_px': heat_radius_val,
+        'collocate_summary': collocate_term_stats if collocate_term_stats else {},
+        'collocate_colorize': bool(collocate_rank_colorize),
+        'initial_collocate_term': initial_collocate_term,
+        'collocate_map_variant': collocate_map_variant,
+        'collocate_export_csv': bool(collocate_export_csv),
+    }
+
+    # Embed collocate rank index when available
+    if rank_index:
+        config_payload['collocate_ranks'] = rank_index
+        config_payload['collocate_terms'] = collocate_terms_list
+        config_payload['rank_max'] = rank_max_value or COLLOCATE_RANK_LIMIT
+        config_payload['collocate_settings'] = {
+            'requested_top_n': collocate_rank_top_n,
+            'terms_returned': len(collocate_terms_list),
+            'term_scope': collocate_rank_term_scope,
+            'time_key': collocate_rank_time_key or '',
+            'focus': collocate_rank_focus,
+            'focus_city': collocate_rank_focus_city or '',
+            'focus_state': collocate_rank_focus_state or '',
+            'time_label': collocate_rank_time_label or '',
+            'focus_label': collocate_rank_focus_label or '',
+            'colorize': bool(collocate_rank_colorize),
+        }
+        if collocate_time_slider_enabled and collocate_time_bins_payload:
+            config_payload['collocate_time_slider'] = True
+            config_payload['collocate_time_bins'] = collocate_time_bins_payload
+            if collocate_time_default_key is not None:
+                config_payload['collocate_time_default'] = collocate_time_default_key
+    config_json = json.dumps(config_payload, ensure_ascii=False).replace('</', '<\\/')
+    config_script = (
+        '<script id="map-config" type="application/json">'
+        f"{config_json}"
+        '</script>'
+    )
+    m.get_root().html.add_child(folium.Element(config_script))
+
+    popup_json_js = json.dumps(popup_dataset, ensure_ascii=False).replace('</', '<\\/')
+    data_script = (
+        '<script id="popup-data" type="application/json">'
+        f"{popup_json_js}"
+        '</script>'
+    )
+    m.get_root().html.add_child(folium.Element(data_script))
+
+    map_var = m.get_name()
+    cluster_block = ''
+    if mode == 'cluster':
+        cluster_var = cluster.get_name()
+        metric_label_js = json.dumps(metric_display_summary)
+        normalized_js = 'true' if normalize_flag else 'false'
+        cluster_block = f"""
+  whenLayerReady('{cluster_var}', function(clusterLayer) {{
+    if (!clusterLayer) {{
+      return;
+    }}
+    clusterLayer.options.iconCreateFunction = function(cluster) {{
+      var sum = 0;
+      cluster.getAllChildMarkers().forEach(function(marker) {{
+        var v = marker.options && marker.options.metricValue;
+        if (typeof v === 'number' && !isNaN(v)) {{
+          sum += v;
+        }} else if (v) {{
+          var num = parseFloat(v);
+          if (!isNaN(num)) sum += num;
+        }}
+      }});
+      var formatted;
+      if ({normalized_js}) {{
+        formatted = sum.toFixed(4);
+      }} else {{
+        formatted = Math.round(sum).toLocaleString();
+      }}
+      var absSum = Math.abs(sum);
+      var c = 'marker-cluster marker-cluster-small';
+      if (absSum >= 100) {{
+        c = 'marker-cluster marker-cluster-large';
+      }} else if (absSum >= 10) {{
+        c = 'marker-cluster marker-cluster-medium';
+      }}
+      return L.divIcon({{
+        html: '<div><span>' + formatted + '</span></div>',
+        className: c,
+        iconSize: new L.Point(40, 40)
+      }});
+    }};
+    if (clusterLayer.refreshClusters) {{
+      clusterLayer.refreshClusters();
+    }}
+    clusterLayer.on('clusterclick', function(e) {{
+      if (e && e.originalEvent) {{
+        if (typeof e.originalEvent.preventDefault === 'function') {{
+          e.originalEvent.preventDefault();
+        }}
+        if (typeof e.originalEvent.stopPropagation === 'function') {{
+          e.originalEvent.stopPropagation();
+        }}
+        if (typeof L !== 'undefined' && L.DomEvent && typeof L.DomEvent.stop === 'function') {{
+          L.DomEvent.stop(e.originalEvent);
+        }}
+      }}
+      loadData(function(dataset) {{
+        dataset = dataset || {{}};
+        var markers = e.layer.getAllChildMarkers();
+        var ids = [];
+        var metricSum = 0;
+        markers.forEach(function(marker) {{
+          var gid = marker.options && marker.options.groupId;
+          if (gid && ids.indexOf(gid) === -1) ids.push(gid);
+          var mv = marker.options && marker.options.metricValue;
+          if (typeof mv === 'number' && !isNaN(mv)) {{
+            metricSum += mv;
+          }} else if (mv) {{
+            var num = parseFloat(mv);
+            if (!isNaN(num)) metricSum += num;
+          }}
+        }});
+        if (!ids.length) return;
+        var metricLabel = {metric_label_js};
+        var isNormalized = {normalized_js};
+        var metricText = isNormalized ? (metricSum).toFixed(4) : Math.round(metricSum).toLocaleString();
+        var container = document.createElement('div');
+        container.style.minWidth = '280px';
+        container.style.fontSize = '14px';
+        container.style.lineHeight = '1.3';
+        var summary = document.createElement('div');
+        summary.style.fontSize = '12px';
+        summary.style.color = '#555';
+        var cityCount = ids.length;
+        var cityLabel = cityCount === 1 ? 'City' : 'Cities';
+        var totalArticles = 0;
+        var hasArticleCounts = true;
+        ids.forEach(function(gid) {{
+          var data = dataset[gid];
+          var articleCount = data && data.article_count;
+          var parsed = Number(articleCount);
+          if (Number.isFinite(parsed)) {{
+            totalArticles += parsed;
+          }} else {{
+            hasArticleCounts = false;
+          }}
+        }});
+        var articleDisplay;
+        if (hasArticleCounts) {{
+          articleDisplay = Math.round(totalArticles).toLocaleString();
+        }} else if (!isNormalized) {{
+          articleDisplay = Math.round(metricSum).toLocaleString();
+        }} else {{
+          articleDisplay = metricText;
+        }}
+        summary.textContent = 'Articles: ' + articleDisplay + ' from ' + cityCount + ' ' + cityLabel;
+        container.appendChild(summary);
+        if (isNormalized || metricLabel !== 'Articles') {{
+          var metricDetail = document.createElement('div');
+          metricDetail.style.marginTop = '2px';
+          metricDetail.style.fontSize = '12px';
+          metricDetail.style.color = '#555';
+          metricDetail.textContent = metricLabel + ': ' + metricText;
+          container.appendChild(metricDetail);
+        }}
+        var select = null;
+        if (ids.length > 1) {{
+          var selectLabel = document.createElement('div');
+          selectLabel.style.marginTop = '6px';
+          selectLabel.style.fontWeight = '600';
+          selectLabel.textContent = 'Select a location';
+          container.appendChild(selectLabel);
+          select = document.createElement('select');
+          select.style.width = '100%';
+          select.style.marginTop = '4px';
+          ids.forEach(function(gid) {{
+            var data = dataset[gid];
+            var opt = document.createElement('option');
+            opt.value = gid;
+            opt.textContent = (data && data.title) || gid;
+            select.appendChild(opt);
+          }});
+          container.appendChild(select);
+        }}
+        var detailHost = document.createElement('div');
+        detailHost.style.marginTop = '8px';
+        container.appendChild(detailHost);
+        function renderGroup(gid) {{
+          detailHost.innerHTML = '';
+          var data = dataset[gid];
+          if (!data) {{
+            detailHost.textContent = 'No data.';
+            return;
+          }}
+          if (data.template) {{
+            var wrapper = document.createElement('div');
+            wrapper.innerHTML = data.template;
+            var root = wrapper.firstElementChild;
+            if (root) {{
+              detailHost.appendChild(root);
+              attach(root);
+              attachDockToggle(root, clusterLayer._map, null);
+            }}
+          }} else {{
+            detailHost.textContent = 'No data.';
+          }}
+        }}
+        renderGroup(ids[0]);
+        if (select) {{
+          select.addEventListener('change', function() {{
+            renderGroup(this.value);
+          }});
+        }}
+        var mapRef = clusterLayer._map;
+        if (!mapRef || typeof mapRef.openPopup !== 'function') {{
+          return;
+        }}
+        L.popup({{maxWidth: 360}}).setLatLng(e.latlng).setContent(container).openOn(mapRef);
+      }});
+      return false;
+    }});
+  }});
+"""
+    script_html = _collocate_script_html(map_var, cluster_block)
     m.get_root().script.add_child(folium.Element(script_html))
 
     m.save(out_html)

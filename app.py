@@ -2913,6 +2913,12 @@ class TopicMapSettingsDialog(QDialog):
         self.map_type_combo.addItem('Top Ranked Topic by Location', 'top_term')
         form.addRow('Map type:', self.map_type_combo)
 
+        self.metric_combo = QComboBox()
+        self.metric_combo.addItem('Article count (number of articles)', 'article_count')
+        self.metric_combo.addItem('Topic weight (sum)', 'weight_sum')
+        self.metric_combo.addItem('Topic weight (average)', 'weight_avg')
+        form.addRow('Ranking metric:', self.metric_combo)
+
         self.top_spin = QSpinBox()
         self.top_spin.setRange(1, max_top_n)
         self.top_spin.setValue(max(1, min(default_top_n, max_top_n)))
@@ -3007,6 +3013,7 @@ class TopicMapSettingsDialog(QDialog):
         return {
             'map_type': self.map_type_combo.currentData(),
             'top_n': self.top_spin.value(),
+            'rank_metric': self.metric_combo.currentData(),
             'location_scope': location_scope,
             'location_city': str(city_val or ''),
             'location_state': str(state_val or ''),
@@ -6779,6 +6786,7 @@ class CollocationDialog(QDialog):
 
         start_value = self.start_input.text().strip()
         end_value = self.end_input.text().strip()
+        rank_metric = str(s.get('rank_metric') or 'article_count').strip().lower()
 
         def task(*, cancel_event: Optional[threading.Event]):
             return create_topic_map(
@@ -6797,6 +6805,7 @@ class CollocationDialog(QDialog):
                 topic_rank_focus_city=str(s.get('location_city') or '') or None,
                 topic_rank_focus_state=str(s.get('location_state') or '') or None,
                 topic_map_variant=str(s.get('map_type') or 'rank'),
+                topic_rank_metric=rank_metric,
                 project_dir=parent.project_folder if parent else None,
                 time_start_override=start_value or None,
                 time_end_override=end_value or None,
