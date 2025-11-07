@@ -4,8 +4,13 @@
 # Explicitly allow only these files and folders
 !.gitignore
 !README.md
+!DIST_README.md
+!PACKAGING.md
 !requirements.txt
 !app.py
+!ChronAmTool.spec
+!bootstrap.sh
+!bootstrap.cmd
 !chronam/
 !chronam/**
 

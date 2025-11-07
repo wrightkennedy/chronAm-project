@@ -76,6 +76,7 @@ from chronam.exceptions import OperationCancelledError
 from chronam.utils import term_directory_name
 from chronam.metrics import metric_total_for_dates
 from chronam.preferences import AppPreferences, PreferenceStore
+from chronam.bootstrap import ensure_default_environment
 
 
 def reveal_in_file_manager(path: str):
@@ -448,6 +449,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self._pref_store = PreferenceStore()
+        self._default_env = ensure_default_environment()
         self._pending_startup_project: Optional[str] = None
         self._last_data_folder_check = 0.0
         self._last_data_folder_warning_size: Optional[float] = None
@@ -457,7 +459,16 @@ class MainWindow(QMainWindow):
         self._base_title = 'Untitled'
         self.setWindowTitle(self._base_title)
         self.resize(900, 600)
-        self.project_folder = os.getcwd()
+        self.project_folder = (
+            str(self._default_env.project_dir)
+            if self._default_env
+            else os.getcwd()
+        )
+        self._default_dataset_folder = (
+            str(self._default_env.dataset_dir)
+            if self._default_env
+            else None
+        )
         self.dataset_folder = None
         self.dataset_years = []
         self.json_file = None
@@ -475,7 +486,21 @@ class MainWindow(QMainWindow):
         self._close_filter = CloseShortcutFilter()
         QApplication.instance().installEventFilter(self._close_filter)
         self._apply_preferences_state(initial=True)
+        self._maybe_apply_default_dataset_folder()
         self.ensure_dataset_folder(prompt=False)
+        if (
+            self._default_env
+            and self._default_env.sample_path
+            and self._default_env.created
+        ):
+            dataset_dir = html.escape(str(self._default_env.dataset_dir))
+            self.append_project_log(
+                'Setup',
+                [
+                    '<div>Sample dataset installed for quick start.</div>',
+                    f'<div>Location: {dataset_dir}</div>',
+                ],
+            )
         self._reset_session_tracking()
         self._update_window_title()
         self._maybe_warn_data_folder_size(force=True)
@@ -566,6 +591,17 @@ class MainWindow(QMainWindow):
                 self._pending_startup_project = prefs.last_project_path
             else:
                 self._pending_startup_project = None
+
+    def _maybe_apply_default_dataset_folder(self):
+        if not self._default_dataset_folder:
+            return
+        existing = self.preferences.resolved_dataset_folder()
+        if existing and self._discover_dataset_years(existing):
+            return
+        self._update_preferences(
+            last_dataset_folder=self._default_dataset_folder,
+            dataset_folder_override=self._default_dataset_folder,
+        )
 
     def _update_preferences(self, **kwargs):
         if not kwargs:
@@ -1338,6 +1374,7 @@ class MainWindow(QMainWindow):
         for path in (
             getattr(self, 'dataset_folder', None),
             self.preferences.resolved_dataset_folder(),
+            self._default_dataset_folder,
             os.path.join(self.project_folder, 'data', 'parquet'),
             os.path.join(self.project_folder, 'parquet'),
         ):

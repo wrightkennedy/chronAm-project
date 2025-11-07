@@ -9,8 +9,7 @@ The newspaper files are from AmericanStories (https://huggingface.co/datasets/de
 # First time set up
 ## Download Parquet Files
 1. Download the newspaper articles stored as parquet datasets here: https://emailsc-my.sharepoint.com/:f:/r/personal/w_kennedy_sc_edu/Documents/data_tx?csf=1&web=1&e=gHy9xJ
-2. If you downloaded the zip archive with all years between 1900 and 1922 ("AmericanStories_parquet1900-1922.zip"), unzip the archive.
-3. In Finder/File Explorer, you should see parquet files for each year, roughly 2-3 GB each (for 1900-1910s)
+2. In Finder/File Explorer, you should see parquet files for each year, roughly 1-3 GB each (for 1860-1922). The total size of all years is roughly 100 GB. The software will run much slower if the parquet files are stored on an HDD.
 
 ## Set up the App (macOS)
 VS Code Instructions for first-time use
@@ -27,6 +26,7 @@ VS Code needs Git installed and logged in (github account), if not done so alrea
 6. Install dependencies `pip install -r requirements.txt`
 7. Run the python script `python app.py`
 8. The first start up is often slow, since the software downloads the dependencies
+   - Tip: the packaged app (and the source build after the first run) creates `~/Documents/ChronAm/data/parquet/` and copies the demo `AmericanStories_1800.parquet` there so you can test searches immediately. Point the GUI to that folder or swap it for your own dataset path via **Sources ▸ Set Local Dataset Folder…**.
 
 ## Set up the App (Windows)
 VS Code Instructions for first-time use
