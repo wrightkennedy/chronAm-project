@@ -58,7 +58,7 @@ def plot_bar(collocation_results: Union[str, pd.DataFrame], output_path: Optiona
         raise ValueError("DataFrame must contain 'collocate_term' and 'frequency'.")
     df = df.sort_values(["frequency","collocate_term"], ascending=[False, True]).head(top_n)
 
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(12, 6.5))
     ax.barh(df["collocate_term"][::-1], df["frequency"][::-1])
     ax.set_xlabel("Frequency")
     ax.set_ylabel("Collocate Term")
@@ -121,7 +121,7 @@ def plot_rank_changes(df_or_path: Union[str, pd.DataFrame],
         ordered_terms = list(pivot.columns)
     pivot = pivot[ordered_terms]
 
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(14, 7))
     positions = np.arange(len(bins_ordered))
     lines = []
     scatter_points = []
@@ -270,6 +270,48 @@ def plot_topics_over_time(
     if df.empty:
         raise ValueError("No topic data to plot.")
 
+    def _adjust_canvas(
+        fig,
+        legend_obj,
+        *,
+        left: float,
+        bottom: float,
+        top: float,
+        default_right: float = 0.98,
+    ) -> None:
+        """Shrink or expand margins so the legend stays inside the canvas."""
+        if legend_obj is None:
+            fig.subplots_adjust(left=left, right=default_right, bottom=bottom, top=top)
+            return
+        try:
+            fig.canvas.draw()
+        except Exception:
+            pass
+        renderer = getattr(fig.canvas, "get_renderer", lambda: None)()
+        fig_bbox = fig.bbox
+        if renderer is None or fig_bbox.width <= 0:
+            fig.subplots_adjust(left=left, right=default_right, bottom=bottom, top=top)
+            return
+        legend_bbox = legend_obj.get_window_extent(renderer=renderer)
+        fig_width = max(fig_bbox.width, 1.0)
+        horizontal_pad = 0.02
+        legend_width_frac = legend_bbox.width / fig_width
+        reserved = min(legend_width_frac + horizontal_pad, 0.45)
+        right = max(left + 0.3, 1 - reserved)
+        fig.subplots_adjust(left=left, right=right, bottom=bottom, top=top)
+        try:
+            fig.canvas.draw()
+        except Exception:
+            return
+        renderer = getattr(fig.canvas, "get_renderer", lambda: None)()
+        if renderer is None:
+            return
+        legend_bbox = legend_obj.get_window_extent(renderer=renderer)
+        overflow = max(0.0, (legend_bbox.x1 - fig_bbox.x1) / fig_width)
+        if overflow > 0:
+            right = max(left + 0.25, right - overflow - horizontal_pad)
+            fig.subplots_adjust(left=left, right=right, bottom=bottom, top=top)
+
     metric = (metric or "weight_sum").strip().lower()
     metric_map = {
         "weight_sum": {
@@ -375,7 +417,7 @@ def plot_topics_over_time(
     if not ordered_topics:
         raise ValueError("No topics available to plot.")
 
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(12.5, 7.2))
     positions = np.arange(len(bins_ordered))
     handles: List = []
     legend_labels: List[str] = []
@@ -422,7 +464,22 @@ def plot_topics_over_time(
     legend_handle_entries: List[Tuple] = []
     legend_hover_display = None
     if show_legend and handles:
-        legend = ax.legend(handles, legend_labels, title="Topic", bbox_to_anchor=(1.02, 1), loc="upper left")
+        legend_cols = 1
+        if len(legend_labels) > 14:
+            legend_cols = 2
+        if len(legend_labels) > 28:
+            legend_cols = 3
+        legend = ax.legend(
+            handles,
+            legend_labels,
+            title="Topic",
+            bbox_to_anchor=(1, 1),
+            loc="upper left",
+            ncol=legend_cols,
+            borderaxespad=0.6,
+            columnspacing=0.9,
+            handlelength=2.6,
+        )
         legend_text_entries = list(zip(legend.get_texts(), legend_topic_ids))
         legend_handles_candidate = getattr(legend, "legendHandles", None)
         if legend_handles_candidate is None:
@@ -431,18 +488,13 @@ def plot_topics_over_time(
         legend_handle_entries = list(zip(legend_handles_list, legend_topic_ids))
         legend_hover_display = fig.text(0.5, 0.01, "", ha="center", va="bottom", fontsize=9, color="dimgray")
 
-    top_margin = 0.0
-    bottom_margin = 0.0
+    layout_bottom = 0.16 if legend_hover_display is not None else 0.12
+    layout_top = 0.94
     if settings_text:
         wrapped = "\n".join(textwrap.fill(str(part), 110) for part in str(settings_text).splitlines())
-        fig.text(0.5, 0.98, wrapped, ha="center", va="top", fontsize=10)
-        top_margin = max(top_margin, 0.1)
-    if legend_hover_display is not None:
-        bottom_margin = max(bottom_margin, 0.08)
-    if top_margin or bottom_margin:
-        plt.tight_layout(rect=[0, bottom_margin, 1, 1 - top_margin])
-    else:
-        plt.tight_layout()
+        fig.text(0.5, 0.97, wrapped, ha="center", va="top", fontsize=10)
+        layout_top = 0.9
+    _adjust_canvas(fig, legend, left=0.08, bottom=layout_bottom, top=layout_top)
 
     if enable_hover and scatter_points:
         annot = ax.annotate(
@@ -472,7 +524,7 @@ def plot_topics_over_time(
             annot.xy = (x_val, y_val)
             terms_preview = _shorten(_topic_terms(topic_id), 20)
             annot.set_text(
-                f"Value: {_format_value(y_val)}\nDate: {date_label}\nWords: {terms_preview}"
+                f"Topic {topic_id}: {terms_preview}\nTime: {date_label}\n{metric_info['label']}: {_format_value(y_val)}"
             )
             annot.get_bbox_patch().set_alpha(0.85)
 

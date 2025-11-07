@@ -75,6 +75,7 @@ from chronam.topics import (
 from chronam.exceptions import OperationCancelledError
 from chronam.utils import term_directory_name
 from chronam.metrics import metric_total_for_dates
+from chronam.preferences import AppPreferences, PreferenceStore
 
 
 def reveal_in_file_manager(path: str):
@@ -442,8 +443,17 @@ class CloseShortcutFilter(QObject):
 
 
 class MainWindow(QMainWindow):
+    CLEARABLE_DATA_DIRS = {'processed', 'metadata'}
+
     def __init__(self):
         super().__init__()
+        self._pref_store = PreferenceStore()
+        self._pending_startup_project: Optional[str] = None
+        self._last_data_folder_check = 0.0
+        self._last_data_folder_warning_size: Optional[float] = None
+        self._data_warning_dismissed = False
+        self._session_start_time = time.time()
+        self._session_data_snapshot: Dict[str, float] = {}
         self._base_title = 'Untitled'
         self.setWindowTitle(self._base_title)
         self.resize(900, 600)
@@ -460,11 +470,16 @@ class MainWindow(QMainWindow):
         self.collocation_drop_terms = []
         self.collocation_term_groups: List[dict] = []
         self.map_settings = _default_map_settings()
-        self.metadata_enabled = True
+        self.metadata_enabled = self.preferences.metadata_enabled
         self.init_ui()
         self._close_filter = CloseShortcutFilter()
         QApplication.instance().installEventFilter(self._close_filter)
+        self._apply_preferences_state(initial=True)
+        self.ensure_dataset_folder(prompt=False)
+        self._reset_session_tracking()
         self._update_window_title()
+        self._maybe_warn_data_folder_size(force=True)
+        self._maybe_schedule_open_last_project()
 
     def init_ui(self):
         menubar = self.menuBar()
@@ -481,6 +496,11 @@ class MainWindow(QMainWindow):
         file_menu.addAction(save_project_action)
 
         file_menu.addAction(self._action('Save Project As...', self.save_project_as))
+
+        settings_action = self._action('Settings...', self.open_settings_dialog)
+        settings_action.setMenuRole(QAction.PreferencesRole)
+        file_menu.addAction(settings_action)
+        file_menu.addSeparator()
 
         quit_action = self._action('Quit', self._handle_quit_request)
         quit_action.setMenuRole(QAction.NoRole)
@@ -526,11 +546,6 @@ class MainWindow(QMainWindow):
         for btn in (self.btn_download, self.btn_update, self.btn_collocate, self.btn_map):
             main_layout.addWidget(btn)
 
-        self.metadata_checkbox = QCheckBox('Create metadata JSON for all output files')
-        self.metadata_checkbox.setChecked(self.metadata_enabled)
-        self.metadata_checkbox.stateChanged.connect(self._on_metadata_checkbox_toggled)
-        main_layout.addWidget(self.metadata_checkbox)
-
         self._init_project_log()
         self._update_primary_button_styles()
 
@@ -538,6 +553,146 @@ class MainWindow(QMainWindow):
         a = QAction(name, self)
         a.triggered.connect(slot)
         return a
+
+    @property
+    def preferences(self) -> AppPreferences:
+        return self._pref_store.preferences
+
+    def _apply_preferences_state(self, initial: bool = False):
+        prefs = self.preferences
+        self.metadata_enabled = prefs.metadata_enabled
+        if initial:
+            if prefs.open_last_project and prefs.last_project_path:
+                self._pending_startup_project = prefs.last_project_path
+            else:
+                self._pending_startup_project = None
+
+    def _update_preferences(self, **kwargs):
+        if not kwargs:
+            return
+        self._pref_store.update_from_dict(kwargs)
+        self._pref_store.save()
+        self._apply_preferences_state()
+
+    def _maybe_schedule_open_last_project(self):
+        path = self._pending_startup_project
+        if not path or not os.path.exists(path):
+            return
+        self._pending_startup_project = None
+        QTimer.singleShot(0, lambda: self._open_last_project_on_startup(path))
+
+    def _open_last_project_on_startup(self, path: str):
+        if not os.path.exists(path):
+            return
+        self._load_project_from_path(path, notify=True, startup=True)
+
+    def _reset_session_tracking(self):
+        self._session_start_time = time.time()
+        self._session_data_snapshot = self._snapshot_data_state()
+        self._data_warning_dismissed = False
+        self._last_data_folder_warning_size = None
+
+    def _project_data_root(self) -> Optional[str]:
+        folder = self.project_folder or ''
+        if not folder:
+            return None
+        data_root = os.path.join(folder, 'data')
+        if os.path.isdir(data_root):
+            return data_root
+        return None
+
+    def _snapshot_data_state(self) -> Dict[str, float]:
+        snapshot: Dict[str, float] = {}
+        data_root = self._project_data_root()
+        if not data_root:
+            return snapshot
+        for root, dirs, files in os.walk(data_root):
+            rel_dir = os.path.relpath(root, data_root)
+            if rel_dir == os.curdir:
+                rel_dir = ''
+            dirs[:] = [
+                d for d in dirs
+                if self._allow_directory_walk(os.path.join(rel_dir, d))
+            ]
+            if self._should_skip_data_dir(rel_dir):
+                continue
+            for filename in files:
+                abs_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(abs_path, data_root)
+                if not self._allow_directory_walk(rel_path):
+                    continue
+                try:
+                    snapshot[rel_path] = os.path.getmtime(abs_path)
+                except OSError:
+                    continue
+        return snapshot
+
+    @staticmethod
+    def _should_skip_data_dir(rel_path: str) -> bool:
+        if not rel_path:
+            return False
+        rel_norm = rel_path.replace('\\', '/').strip('./')
+        if not rel_norm:
+            return False
+        parts = [part for part in rel_norm.split('/') if part]
+        first = parts[0].lower()
+        if first not in MainWindow.CLEARABLE_DATA_DIRS:
+            return True
+        return any(part.startswith('parquet') for part in parts if part)
+
+    def _allow_directory_walk(self, rel_path: str) -> bool:
+        rel_norm = rel_path.replace('\\', '/').strip('./')
+        if not rel_norm:
+            return True
+        first = rel_norm.split('/')[0].lower()
+        return first in self.CLEARABLE_DATA_DIRS
+
+    def _delete_session_data_files(self) -> Tuple[int, float]:
+        data_root = self._project_data_root()
+        if not data_root:
+            return (0, 0.0)
+        removed_files = 0
+        removed_bytes = 0.0
+        for root, dirs, files in os.walk(data_root, topdown=False):
+            rel_dir = os.path.relpath(root, data_root)
+            if rel_dir == os.curdir:
+                rel_dir = ''
+            if self._should_skip_data_dir(rel_dir):
+                continue
+            for filename in files:
+                abs_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(abs_path, data_root)
+                if not self._allow_directory_walk(rel_path):
+                    continue
+                if not self._should_delete_session_file(rel_path, abs_path):
+                    continue
+                try:
+                    size = os.path.getsize(abs_path)
+                except OSError:
+                    size = 0
+                try:
+                    os.remove(abs_path)
+                    removed_files += 1
+                    removed_bytes += size
+                except OSError:
+                    continue
+            if root != data_root:
+                try:
+                    if not os.listdir(root):
+                        os.rmdir(root)
+                except OSError:
+                    pass
+        return removed_files, removed_bytes
+
+    def _should_delete_session_file(self, rel_path: str, abs_path: str) -> bool:
+        baseline = self._session_data_snapshot.get(rel_path)
+        try:
+            mtime = os.path.getmtime(abs_path)
+        except OSError:
+            return False
+        if baseline is None:
+            return mtime >= self._session_start_time - 1.0
+        return (mtime - baseline) > 1e-6
 
 
     def _init_project_log(self):
@@ -578,16 +733,42 @@ class MainWindow(QMainWindow):
         self.close()
 
     def closeEvent(self, event):
-        if self._confirm_quit():
-            event.accept()
+        if self._process_quit_sequence():
             super().closeEvent(event)
         else:
             event.ignore()
 
-    def _confirm_quit(self) -> bool:
+    def _process_quit_sequence(self) -> bool:
+        prefs = self.preferences
+        decision = 'quit'
+        if prefs.warn_on_quit:
+            decision = self._prompt_quit_decision()
+            if decision == 'cancel':
+                return False
+        save_required = prefs.save_on_quit or decision == 'save'
+        if save_required:
+            if not self._auto_save_current_project():
+                return False
+        if prefs.offer_clear_on_quit:
+            action = self._prompt_clear_recent_on_quit()
+            if action == 'cancel':
+                return False
+            if action == 'clear':
+                self._clear_recent_datasets_and_files()
+        return True
+
+    def _prompt_quit_decision(self) -> str:
+        prefs = self.preferences
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Question)
-        dialog.setWindowTitle('Quit ChronAM Project')
+        dialog.setWindowTitle('Quit ChronAm Project')
+        if prefs.save_on_quit:
+            dialog.setText('ChronAm will save your project before quitting. Continue?')
+            quit_button = dialog.addButton('Quit', QMessageBox.AcceptRole)
+            cancel_button = dialog.addButton(QMessageBox.Cancel)
+            dialog.setDefaultButton(quit_button)
+            dialog.exec_()
+            return 'cancel' if dialog.clickedButton() == cancel_button else 'save'
         dialog.setText('Are you sure you want to quit?')
         save_button = dialog.addButton('Save and Quit', QMessageBox.AcceptRole)
         quit_button = dialog.addButton('Quit without Saving', QMessageBox.DestructiveRole)
@@ -599,14 +780,91 @@ class MainWindow(QMainWindow):
         dialog.exec_()
         clicked = dialog.clickedButton()
         if clicked == cancel_button:
-            return False
+            return 'cancel'
         if clicked == save_button:
-            had_project_path = bool(self.project_file)
-            self.save_project()
-            if not had_project_path and not self.project_file:
-                return False
+            return 'save'
+        return 'quit'
+
+    def _auto_save_current_project(self) -> bool:
+        target_path = self.project_file
+        if target_path:
+            if self._write_project_file(target_path):
+                self._update_preferences(last_project_path=target_path)
+                self._update_window_title()
+                return True
+            QMessageBox.critical(self, 'Save Failed', 'Unable to save the current project before quitting.')
+            return False
+
+        start_dir = os.path.join(self.project_folder or os.getcwd(), 'chronam_project.json')
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            'Save Project Before Quit',
+            start_dir,
+            'ChronAM Project (*.chronam.json *.json);;All Files (*)'
+        )
+        if not path:
+            return False
+        if self._write_project_file(path):
+            self.project_file = path
+            self._update_preferences(last_project_path=path)
+            self._update_window_title()
             return True
-        return True
+        QMessageBox.critical(self, 'Save Failed', 'Unable to save the current project before quitting.')
+        return False
+
+    def _prompt_clear_recent_on_quit(self) -> str:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Question)
+        dialog.setWindowTitle('Clear Recent Datasets')
+        dialog.setText(
+            'Do you want to delete files created during this session (JSON, GeoJSON, metadata, etc.) '
+            'and clear recent logs before quitting?'
+        )
+        clear_button = dialog.addButton('Clear and Quit', QMessageBox.DestructiveRole)
+        keep_button = dialog.addButton('Keep Data', QMessageBox.AcceptRole)
+        cancel_button = dialog.addButton(QMessageBox.Cancel)
+        dialog.setDefaultButton(keep_button)
+        dialog.exec_()
+        clicked = dialog.clickedButton()
+        if clicked == cancel_button:
+            return 'cancel'
+        if clicked == clear_button:
+            return 'clear'
+        return 'keep'
+
+    def _clear_recent_datasets_and_files(self, show_message: bool = False):
+        cleared_sections = []
+        removed_files, removed_bytes = self._delete_session_data_files()
+        if removed_files:
+            size_label = f"{removed_bytes / (1024 ** 3):.2f} GB" if removed_bytes else "0 GB"
+            cleared_sections.append(f'Data files ({removed_files} removed, {size_label})')
+        if self.json_file or self.geojson_file:
+            self.json_file = None
+            self.geojson_file = None
+            cleared_sections.append('Loaded files')
+        if self.search_log_history:
+            self.search_log_history.clear()
+            cleared_sections.append('Search log')
+        if self.project_log_entries:
+            self.project_log_entries.clear()
+            cleared_sections.append('Project log')
+        if self.collocation_state or self.collocation_drop_terms or self.collocation_term_groups:
+            self.collocation_state = {'dropped_terms': [], 'term_groups': [], 'topic_settings': {}, 'topic_trend_settings': {}}
+            self.collocation_drop_terms = []
+            self.collocation_term_groups = []
+            cleared_sections.append('Collocation settings')
+        if removed_files == 0 and not cleared_sections:
+            cleared_sections.append('No recent data detected')
+        self._reset_session_tracking()
+        if cleared_sections:
+            self._update_loaded_file_labels()
+            self._refresh_project_log_widget()
+            if show_message:
+                QMessageBox.information(
+                    self,
+                    'Recent Data Cleared',
+                    'Cleared: ' + ', '.join(cleared_sections)
+                )
 
     def set_locations_table(self):
         start_dir = self.locations_csv_path or os.path.join(self.project_folder, 'data')
@@ -630,6 +888,17 @@ class MainWindow(QMainWindow):
             return
         reveal_in_file_manager(folder)
 
+    def open_settings_dialog(self):
+        dialog = SettingsDialog(self, self.preferences)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        payload = dialog.preference_payload()
+        self._pref_store.update_from_dict(payload)
+        self._pref_store.save()
+        self._apply_preferences_state()
+        self.ensure_dataset_folder(prompt=False)
+        self._maybe_warn_data_folder_size(force=True)
+
     def append_project_log(self, tool_name: str, html_lines: list):
         if not html_lines:
             return
@@ -645,6 +914,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'project_log_browser'):
             self.project_log_browser.append(entry_html)
             self.project_log_browser.moveCursor(QTextCursor.End)
+        self._maybe_warn_data_folder_size(force=True)
 
     def _format_project_log_lines(self, html_lines: list) -> list:
         formatted = []
@@ -719,8 +989,95 @@ class MainWindow(QMainWindow):
             else:
                 btn.setStyleSheet('')
 
-    def _on_metadata_checkbox_toggled(self, state: int):
-        self.metadata_enabled = state == Qt.Checked
+    def _maybe_warn_data_folder_size(self, *, force: bool = False):
+        prefs = self.preferences
+        if not prefs.warn_data_folder or self._data_warning_dismissed:
+            return
+        data_dir = self._project_data_root()
+        if not data_dir:
+            return
+        now = time.time()
+        if not force and (now - self._last_data_folder_check) < 120:
+            return
+        self._last_data_folder_check = now
+        size_gb = self._calculate_directory_size_gb(data_dir)
+        limit = max(0.1, prefs.warn_data_folder_limit_gb or 0)
+        if size_gb < limit:
+            return
+        last_warn = self._last_data_folder_warning_size
+        if last_warn is not None and size_gb <= last_warn + 0.1:
+            return
+        self._last_data_folder_warning_size = size_gb
+        self._show_data_folder_warning_dialog(size_gb, limit)
+
+    def _show_data_folder_warning_dialog(self, size_gb: float, limit: float):
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setWindowTitle('Data Folder Size Warning')
+        dialog.setText(
+            f'The project data folder is {size_gb:.1f} GB, which exceeds your warning threshold of {limit:.1f} GB.'
+        )
+        dialog.setInformativeText(
+            'You can dismiss this warning for the current project session, turn warnings off, or change the threshold.'
+        )
+        dismiss_btn = dialog.addButton('Dismiss for Session', QMessageBox.RejectRole)
+        disable_btn = dialog.addButton('Turn Off Warning', QMessageBox.DestructiveRole)
+        change_btn = dialog.addButton('Change Threshold…', QMessageBox.ActionRole)
+        ok_btn = dialog.addButton('OK', QMessageBox.AcceptRole)
+        dialog.setDefaultButton(ok_btn)
+        dialog.exec_()
+        clicked = dialog.clickedButton()
+        if clicked == dismiss_btn:
+            self._data_warning_dismissed = True
+            return
+        if clicked == disable_btn:
+            self._update_preferences(warn_data_folder=False)
+            return
+        if clicked == change_btn:
+            new_limit = self._prompt_update_data_warning_limit(limit)
+            if new_limit is not None:
+                self._data_warning_dismissed = False
+                self._last_data_folder_warning_size = None
+                self._maybe_warn_data_folder_size(force=True)
+            return
+
+    def _prompt_update_data_warning_limit(self, current_limit: float) -> Optional[float]:
+        value, ok = QInputDialog.getDouble(
+            self,
+            'Set Data Folder Warning',
+            'Warn me when the data folder exceeds (GB):',
+            current_limit,
+            0.5,
+            4096.0,
+            1
+        )
+        if not ok:
+            return None
+        self._update_preferences(
+            warn_data_folder=True,
+            warn_data_folder_limit_gb=value
+        )
+        return value
+
+    @staticmethod
+    def _calculate_directory_size_gb(root: str) -> float:
+        total = 0
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                total += entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        return total / (1024 ** 3) if total else 0.0
 
     @staticmethod
     def _search_tool_highlight_style() -> str:
@@ -765,18 +1122,16 @@ class MainWindow(QMainWindow):
         self.collocation_drop_terms = []
         self.collocation_term_groups = []
         self.map_settings = _default_map_settings()
-        self.metadata_enabled = True
-        if hasattr(self, 'metadata_checkbox'):
-            self.metadata_checkbox.blockSignals(True)
-            self.metadata_checkbox.setChecked(True)
-            self.metadata_checkbox.blockSignals(False)
+        self.metadata_enabled = self.preferences.metadata_enabled
 
         self.ensure_dataset_folder(prompt=False)
+        self._reset_session_tracking()
         self._update_loaded_file_labels()
         self._refresh_project_log_widget()
-        if self.project_file:
-            self._write_project_file(self.project_file)
+        if self.project_file and self._write_project_file(self.project_file):
+            self._update_preferences(last_project_path=self.project_file)
         self._update_window_title()
+        self._maybe_warn_data_folder_size(force=True)
         self.append_project_log('Project', [f'<div>New project created at: {html.escape(path)}</div>'])
 
     def open_project(self):
@@ -789,34 +1144,48 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        self._load_project_from_path(path)
 
+    def _load_project_from_path(self, path: str, notify: bool = True, startup: bool = False) -> bool:
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except Exception as exc:
-            QMessageBox.critical(self, 'Open Project Failed', f'Unable to load project file:\n{exc}')
-            return
+            if notify:
+                QMessageBox.critical(self, 'Open Project Failed', f'Unable to load project file:\n{exc}')
+            return False
 
+        self._apply_project_payload(data, path)
+        if notify:
+            title = 'Project Loaded' if not startup else 'Project Restored'
+            message = f'Loaded project:\n{path}' if not startup else f'Opened last project:\n{path}'
+            QMessageBox.information(self, title, message)
+        return True
+
+    def _apply_project_payload(self, data: Dict[str, Any], path: str):
         self.project_file = path
         self.project_folder = data.get('project_folder') or os.path.dirname(path)
 
-        self.dataset_folder = data.get('dataset_folder')
+        stored_dataset = data.get('dataset_folder')
         stored_years = data.get('dataset_years', [])
         self.dataset_years = []
-        if self.dataset_folder and not self._apply_dataset_folder(self.dataset_folder):
-            # keep stored path even if parquet files are missing
+        if stored_dataset and not self._apply_dataset_folder(stored_dataset):
+            self.dataset_folder = stored_dataset
             self.dataset_years = stored_years if isinstance(stored_years, list) else []
+        elif not stored_dataset:
+            self.dataset_folder = None
 
         self.json_file = data.get('json_file')
         self.geojson_file = data.get('geojson_file')
         locations_csv = data.get('locations_csv_path')
         self.locations_csv_path = locations_csv if isinstance(locations_csv, str) else None
+
         collocation_state = data.get('collocation_state')
         self.collocation_state = dict(collocation_state) if isinstance(collocation_state, dict) else {}
         self.map_settings = _load_map_settings(data.get('map_settings'))
         drop_terms = data.get('collocation_drop_terms')
-        if drop_terms is None:
-            drop_terms = self.collocation_state.get('dropped_terms') if isinstance(self.collocation_state, dict) else []
+        if drop_terms is None and isinstance(self.collocation_state, dict):
+            drop_terms = self.collocation_state.get('dropped_terms')
         if isinstance(drop_terms, list):
             self.collocation_drop_terms = [str(term) for term in drop_terms if isinstance(term, str) and term.strip()]
         else:
@@ -865,11 +1234,17 @@ class MainWindow(QMainWindow):
         if isinstance(self.collocation_state, dict):
             self.collocation_state['term_groups'] = [dict(group) for group in self.collocation_term_groups]
 
-        self.metadata_enabled = bool(data.get('metadata_enabled', True))
-        if hasattr(self, 'metadata_checkbox'):
-            self.metadata_checkbox.blockSignals(True)
-            self.metadata_checkbox.setChecked(self.metadata_enabled)
-            self.metadata_checkbox.blockSignals(False)
+        project_preferences = data.get('preferences')
+        if project_preferences:
+            self._pref_store.apply_project_preferences(project_preferences)
+            self._pref_store.save()
+            self._apply_preferences_state()
+        else:
+            metadata_flag = data.get('metadata_enabled')
+            if metadata_flag is not None:
+                self._update_preferences(metadata_enabled=bool(metadata_flag))
+            else:
+                self.metadata_enabled = self.preferences.metadata_enabled
 
         search_log = data.get('search_log_history')
         if search_log is None:
@@ -887,16 +1262,19 @@ class MainWindow(QMainWindow):
         else:
             self.project_log_entries = []
 
-        QMessageBox.information(self, 'Project Loaded', f'Loaded project:\n{path}')
+        self._reset_session_tracking()
+        self._update_preferences(last_project_path=self.project_file)
         self._update_loaded_file_labels()
         self._refresh_project_log_widget()
         self._update_window_title()
+        self._maybe_warn_data_folder_size(force=True)
 
     def save_project(self):
         if not self.project_file:
             self.save_project_as()
             return
         if self._write_project_file(self.project_file):
+            self._update_preferences(last_project_path=self.project_file)
             QMessageBox.information(self, 'Project Saved', f'Project saved to:\n{self.project_file}')
             self._update_window_title()
 
@@ -912,6 +1290,7 @@ class MainWindow(QMainWindow):
             return
         if self._write_project_file(path):
             self.project_file = path
+            self._update_preferences(last_project_path=path)
             QMessageBox.information(self, 'Project Saved', f'Project saved to:\n{path}')
             self._update_window_title()
 
@@ -931,6 +1310,7 @@ class MainWindow(QMainWindow):
             'collocation_drop_terms': list(self.collocation_drop_terms),
             'collocation_term_groups': [dict(group) for group in self.collocation_term_groups],
             'metadata_enabled': bool(self.metadata_enabled),
+            'preferences': self._pref_store.export_for_project(),
         }
 
         try:
@@ -957,6 +1337,7 @@ class MainWindow(QMainWindow):
         seen = set()
         for path in (
             getattr(self, 'dataset_folder', None),
+            self.preferences.resolved_dataset_folder(),
             os.path.join(self.project_folder, 'data', 'parquet'),
             os.path.join(self.project_folder, 'parquet'),
         ):
@@ -978,11 +1359,13 @@ class MainWindow(QMainWindow):
         except OSError:
             return []
 
-    def _apply_dataset_folder(self, folder: str) -> bool:
+    def _apply_dataset_folder(self, folder: str, *, persist_last: bool = True) -> bool:
         years = self._discover_dataset_years(folder)
         if years:
             self.dataset_folder = folder
             self.dataset_years = years
+            if persist_last:
+                self._update_preferences(last_dataset_folder=folder)
             return True
         return False
 
@@ -1047,6 +1430,144 @@ class MainWindow(QMainWindow):
         dlg.setModal(False)
         dlg.setWindowModality(Qt.NonModal)
         dlg.show()
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent: Optional[QWidget], preferences: AppPreferences):
+        super().__init__(parent)
+        self.setWindowTitle('Settings')
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        dataset_group = QGroupBox('Datasets & Projects')
+        dataset_form = QFormLayout(dataset_group)
+        dataset_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignTop)
+        dataset_path_widget = QWidget()
+        dataset_path_layout = QHBoxLayout(dataset_path_widget)
+        dataset_path_layout.setContentsMargins(0, 0, 0, 0)
+        self.dataset_path_edit = QLineEdit(preferences.dataset_folder_override or '')
+        self.dataset_path_edit.setPlaceholderText('Uses the last dataset folder when blank')
+        browse_btn = QPushButton('Browse')
+        browse_btn.clicked.connect(self._browse_dataset_folder)
+        dataset_path_layout.addWidget(self.dataset_path_edit, 1)
+        dataset_path_layout.addWidget(browse_btn, 0)
+        dataset_form.addRow('Persistent dataset folder:', dataset_path_widget)
+        hint_label = QLabel(
+            'Provide a persistent parquet folder to use by default, or leave blank to reuse the last folder you selected.'
+        )
+        hint_label.setWordWrap(True)
+        dataset_form.addRow('', hint_label)
+        last_path_text = preferences.last_dataset_folder or 'Not set'
+        last_path_row = QWidget()
+        last_path_layout = QHBoxLayout(last_path_row)
+        last_path_layout.setContentsMargins(0, 0, 0, 0)
+        last_path_layout.setSpacing(4)
+        last_label = QLabel(last_path_text)
+        last_label.setWordWrap(False)
+        last_label.setMinimumWidth(320)
+        last_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        last_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        last_label.setToolTip(last_path_text)
+        last_label.setStyleSheet('padding:2px 6px; border:1px solid #e2e8f0; border-radius:4px; background:#f7fafc;')
+        last_path_layout.addWidget(last_label)
+        dataset_form.addRow('Last dataset folder:', last_path_row)
+        self.open_last_project_cb = QCheckBox('Open last project on startup')
+        self.open_last_project_cb.setChecked(preferences.open_last_project)
+        dataset_form.addRow('', self.open_last_project_cb)
+        warn_row = QWidget()
+        warn_layout = QHBoxLayout(warn_row)
+        warn_layout.setContentsMargins(0, 0, 0, 0)
+        self.warn_data_folder_cb = QCheckBox('Warn me when data folder exceeds')
+        self.warn_data_folder_cb.setChecked(preferences.warn_data_folder)
+        self.warn_data_limit_spin = QDoubleSpinBox()
+        self.warn_data_limit_spin.setRange(0.5, 2048.0)
+        self.warn_data_limit_spin.setSingleStep(0.5)
+        self.warn_data_limit_spin.setDecimals(1)
+        self.warn_data_limit_spin.setValue(preferences.warn_data_folder_limit_gb or 5.0)
+        unit_label = QLabel('GB')
+        warn_layout.addWidget(self.warn_data_folder_cb)
+        warn_layout.addWidget(self.warn_data_limit_spin)
+        warn_layout.addWidget(unit_label)
+        warn_layout.addStretch(1)
+        dataset_form.addRow('', warn_row)
+        layout.addWidget(dataset_group)
+
+        quit_group = QGroupBox('Quit & Cleanup')
+        quit_layout = QVBoxLayout(quit_group)
+        self.warn_on_quit_cb = QCheckBox('Warn me before quitting')
+        self.warn_on_quit_cb.setChecked(preferences.warn_on_quit)
+        self.save_on_quit_cb = QCheckBox('Save on quit')
+        self.save_on_quit_cb.setChecked(preferences.save_on_quit)
+        self.clear_on_quit_cb = QCheckBox('On quit, offer to clear recent datasets and files')
+        self.clear_on_quit_cb.setChecked(preferences.offer_clear_on_quit)
+        quit_layout.addWidget(self.warn_on_quit_cb)
+        quit_layout.addWidget(self.save_on_quit_cb)
+        quit_layout.addWidget(self.clear_on_quit_cb)
+        layout.addWidget(quit_group)
+
+        output_group = QGroupBox('Outputs')
+        output_layout = QVBoxLayout(output_group)
+        self.metadata_cb = QCheckBox('Create metadata JSON for all output files')
+        self.metadata_cb.setChecked(preferences.metadata_enabled)
+        output_layout.addWidget(self.metadata_cb)
+        layout.addWidget(output_group)
+
+        self.warn_data_folder_cb.toggled.connect(self._update_warn_state)
+        self._update_warn_state(self.warn_data_folder_cb.isChecked())
+
+        buttons_layout = QHBoxLayout()
+        reset_btn = QPushButton('Reset to Defaults')
+        reset_btn.clicked.connect(self._handle_reset_clicked)
+        buttons_layout.addWidget(reset_btn, alignment=Qt.AlignLeft)
+        buttons_layout.addStretch(1)
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        buttons_layout.addWidget(button_box)
+        layout.addLayout(buttons_layout)
+
+    def _browse_dataset_folder(self):
+        start_dir = self.dataset_path_edit.text().strip() or os.getcwd()
+        folder = QFileDialog.getExistingDirectory(self, 'Select Dataset Folder', start_dir)
+        if folder:
+            self.dataset_path_edit.setText(folder)
+
+    def _update_warn_state(self, enabled: bool):
+        self.warn_data_limit_spin.setEnabled(enabled)
+
+    def _handle_reset_clicked(self):
+        first = QMessageBox.question(self, 'Reset Settings', 'Reset all settings to factory defaults?')
+        if first != QMessageBox.Yes:
+            return
+        second = QMessageBox.question(self, 'Confirm Reset', 'This will discard your custom preferences. Are you sure?')
+        if second != QMessageBox.Yes:
+            return
+        defaults = AppPreferences()
+        self.dataset_path_edit.setText(defaults.dataset_folder_override or '')
+        self.open_last_project_cb.setChecked(defaults.open_last_project)
+        self.warn_on_quit_cb.setChecked(defaults.warn_on_quit)
+        self.save_on_quit_cb.setChecked(defaults.save_on_quit)
+        self.clear_on_quit_cb.setChecked(defaults.offer_clear_on_quit)
+        self.metadata_cb.setChecked(defaults.metadata_enabled)
+        self.warn_data_folder_cb.setChecked(defaults.warn_data_folder)
+        self.warn_data_limit_spin.setValue(defaults.warn_data_folder_limit_gb)
+        self._update_warn_state(self.warn_data_folder_cb.isChecked())
+
+    def preference_payload(self) -> Dict[str, Any]:
+        dataset_path = self.dataset_path_edit.text().strip() or None
+        return {
+            'dataset_folder_override': dataset_path,
+            'metadata_enabled': self.metadata_cb.isChecked(),
+            'open_last_project': self.open_last_project_cb.isChecked(),
+            'warn_on_quit': self.warn_on_quit_cb.isChecked(),
+            'save_on_quit': self.save_on_quit_cb.isChecked(),
+            'offer_clear_on_quit': self.clear_on_quit_cb.isChecked(),
+            'warn_data_folder': self.warn_data_folder_cb.isChecked(),
+            'warn_data_folder_limit_gb': self.warn_data_limit_spin.value(),
+        }
+
 
 class DownloadDialog(QDialog):
     def __init__(self, parent=None):
@@ -2239,11 +2760,22 @@ class CSVPreviewDialog(QDialog):
 
         # Determine numeric columns for accurate sorting
         numeric_names = {
-            'topic_id', 'doc_count', 'total_documents', 'weight', 'topic_weight', 'ordinal_rank', 'rank'
+            'topic_id', 'doc_count', 'total_documents', 'weight', 'topic_weight', 'ordinal_rank',
+            'rank', 'frequency', 'frequency_count', 'cooccurrence_rate', 'cooccurence_rate',
+            'relative_position', 'mean_relative_position'
+        }
+        float_precision_map: Dict[str, int] = {
+            'cooccurrence_rate': 4,
+            'cooccurence_rate': 4,
+            'relative_position': 3,
+            'mean_relative_position': 3,
         }
         numeric_columns = set()
+        decimal_preferences: Dict[int, int] = {}
         top_scores_index = None
         weight_index = None
+        collocate_freq_column = None
+        collocate_term_present = False
         for idx, name in enumerate(df.columns):
             lname = str(name).strip().lower()
             # dtype-aware detection
@@ -2254,10 +2786,16 @@ class CSVPreviewDialog(QDialog):
                 pass
             if lname in numeric_names:
                 numeric_columns.add(idx)
+            if lname in float_precision_map:
+                decimal_preferences[idx] = float_precision_map[lname]
             if lname == 'top_scores':
                 top_scores_index = idx
             if lname == 'weight':
                 weight_index = idx
+            if lname in ('frequency', 'frequency_count') and collocate_freq_column is None:
+                collocate_freq_column = idx
+            if lname == 'collocate_term':
+                collocate_term_present = True
 
         for i, row in df.iterrows():
             for j, val in enumerate(row):
@@ -2268,7 +2806,9 @@ class CSVPreviewDialog(QDialog):
                     display = text
                 else:
                     # Use higher precision for 'weight' in Topic Documents
-                    decimals = 6 if (weight_index is not None and j == weight_index and self._looks_like_topic_documents(df)) else None
+                    decimals = decimal_preferences.get(j)
+                    if weight_index is not None and j == weight_index and self._looks_like_topic_documents(df):
+                        decimals = 6
                     display, sort_value = self._render_value(val, numeric=(j in numeric_columns), decimals=decimals)
                 item = SortableTableWidgetItem(display)
                 if sort_value is not None:
@@ -2310,6 +2850,12 @@ class CSVPreviewDialog(QDialog):
         layout.addWidget(tbl)
         tbl.setFocus()
         tbl.setSortingEnabled(True)
+        is_collocation_table = collocate_term_present and collocate_freq_column is not None
+        if is_collocation_table and collocate_freq_column is not None:
+            tbl.sortItems(collocate_freq_column, Qt.DescendingOrder)
+            header = tbl.horizontalHeader()
+            header.setSortIndicator(collocate_freq_column, Qt.DescendingOrder)
+            header.setSortIndicatorShown(True)
         self.table = tbl
         self._dataframe = df
 
@@ -2662,6 +3208,12 @@ class CollocateMapSettingsDialog(QDialog):
         self.map_type_combo.addItem('Top Ranked Term by Location', 'top_term')
         form.addRow('Map type:', self.map_type_combo)
 
+        self.rank_metric_combo = QComboBox()
+        self.rank_metric_combo.addItem('Term Frequency (occurrence count)', 'term_frequency')
+        self.rank_metric_combo.addItem('Article Count (unique articles)', 'article_count')
+        self.rank_metric_combo.addItem('Cooccurrence Rate (articles / total articles)', 'cooccurrence_rate')
+        form.addRow('Ranking metric:', self.rank_metric_combo)
+
         self.top_spin = QSpinBox()
         self.top_spin.setRange(1, max_top_n)
         self.top_spin.setValue(max(1, min(default_top_n, max_top_n)))
@@ -2876,6 +3428,7 @@ class CollocateMapSettingsDialog(QDialog):
         return {
             'map_type': self.map_type_combo.currentData(),
             'top_n': self.top_spin.value(),
+            'rank_metric': self.rank_metric_combo.currentData(),
             'term_scope': term_scope,
             'time_key': time_key,
             'time_label': time_label,
@@ -4110,6 +4663,7 @@ class CollocationDialog(QDialog):
         self._operation_cancel_message: Optional[str] = None
         self._base_height: int = 0
         self._topic_trend_settings: Dict[str, Any] = {}
+        self._filter_section_buttons: List[QToolButton] = []
 
         mode_row = QHBoxLayout()
         mode_row.setContentsMargins(0, 0, 0, 0)
@@ -4332,6 +4886,7 @@ class CollocationDialog(QDialog):
         drop_section, drop_toggle = self._create_collapsible_section('Drop Terms', drop_content, expanded=False)
         drop_section.setMaximumWidth(340)
         self._drop_section_button = drop_toggle
+        self._register_filter_section(drop_toggle)
 
         group_column = QVBoxLayout()
         group_column.setContentsMargins(0, 0, 0, 0)
@@ -4367,6 +4922,7 @@ class CollocationDialog(QDialog):
         group_section, group_toggle = self._create_collapsible_section('Group Terms', group_content, expanded=False)
         group_section.setMaximumWidth(340)
         self._group_section_button = group_toggle
+        self._register_filter_section(group_toggle)
 
         select_column = QVBoxLayout()
         select_column.setContentsMargins(0, 0, 0, 0)
@@ -4410,6 +4966,7 @@ class CollocationDialog(QDialog):
         selected_section, selected_toggle = self._create_collapsible_section('Selected Terms', selected_content, expanded=False)
         selected_section.setMaximumWidth(340)
         self._selected_section_button = selected_toggle
+        self._register_filter_section(selected_toggle)
 
         middle_column = QVBoxLayout()
         middle_column.setContentsMargins(0, 0, 0, 0)
@@ -4557,7 +5114,7 @@ class CollocationDialog(QDialog):
         topic_buttons_layout = QVBoxLayout(topic_buttons_container)
         topic_buttons_layout.setContentsMargins(0, 12, 0, 0)
         topic_buttons_layout.setSpacing(8)
-        for button in (btn_topic, btn_topic_trends, btn_topic_map, self.btn_open_topic_docs):
+        for button in (btn_topic, self.btn_open_topic_docs, btn_topic_trends, btn_topic_map):
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             topic_buttons_layout.addWidget(button)
 
@@ -4757,6 +5314,10 @@ class CollocationDialog(QDialog):
             idx = settings_dialog.map_type_combo.findData(prev_map_type)
             if idx >= 0:
                 settings_dialog.map_type_combo.setCurrentIndex(idx)
+            prev_metric = str(prev.get('rank_metric', 'term_frequency')).lower()
+            metric_idx = settings_dialog.rank_metric_combo.findData(prev_metric)
+            if metric_idx >= 0:
+                settings_dialog.rank_metric_combo.setCurrentIndex(metric_idx)
             settings_dialog._apply_map_type_constraints()
             settings_dialog.colorize_check.setChecked(bool(prev.get('colorize')))
             settings_dialog.lightweight_check.setChecked(bool(prev.get('lightweight', True)))
@@ -4796,6 +5357,12 @@ class CollocationDialog(QDialog):
         map_settings = settings_dialog.values()
         map_type = str(map_settings.get('map_type', 'rank') or 'rank').lower()
         self._collocate_map_settings = map_settings
+
+        rank_metric = str(map_settings.get('rank_metric') or '').strip().lower()
+        if rank_metric not in {'term_frequency', 'article_count', 'cooccurrence_rate'}:
+            rank_metric = 'term_frequency'
+        map_settings['rank_metric'] = rank_metric
+        self._collocate_map_settings['rank_metric'] = rank_metric
 
         enable_time_slider = bool(map_settings.get('enable_time_slider')) and bool(time_bin_pairs)
         if not enable_time_slider:
@@ -4882,6 +5449,7 @@ class CollocationDialog(QDialog):
                 collocate_window=context_window,
                 collocate_rank_time_label=time_label or None,
                 collocate_rank_focus_label=location_label or None,
+                collocate_rank_metric=rank_metric,
                 collocate_rank_colorize=bool(map_settings.get('colorize')),
                 collocate_time_slider=enable_time_slider,
                 collocate_map_variant=map_type,
@@ -6261,6 +6829,22 @@ class CollocationDialog(QDialog):
 
         toggle.toggled.connect(handle_toggle)
         return section, toggle
+
+    def _register_filter_section(self, toggle: Optional[QToolButton]):
+        if toggle is None:
+            return
+        if toggle not in self._filter_section_buttons:
+            self._filter_section_buttons.append(toggle)
+            toggle.toggled.connect(lambda checked, t=toggle: self._handle_filter_section_toggle(t, checked))
+
+    def _handle_filter_section_toggle(self, source: QToolButton, checked: bool):
+        if not checked:
+            return
+        for other in self._filter_section_buttons:
+            if other is source:
+                continue
+            if other.isChecked():
+                other.setChecked(False)
 
     def _set_section_badge(self, toggle: Optional[QToolButton], count: int):
         if toggle is None:
