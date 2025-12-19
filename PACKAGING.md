@@ -26,8 +26,9 @@ Outputs:
 To produce a Windows build, run the same command on a Windows machine (PyInstaller is not cross-compiling). The spec automatically selects `app.ico` and builds a console-less `ChronAmTool.exe`.
 
 ## 4. Wrap macOS bundle into a DMG
+Use the helper script so the DMG contains both the app bundle and an `Applications` shortcut (standard drag-and-drop install experience).
 ```bash
-hdiutil create -quiet -volname ChronAmTool -srcfolder dist/ChronAmTool.app dist/ChronAmTool.dmg
+./scripts/build_dmg.sh
 ```
 
 ## 5. Prepare the source distribution

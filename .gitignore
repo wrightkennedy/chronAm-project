@@ -11,6 +11,8 @@
 !ChronAmTool.spec
 !bootstrap.sh
 !bootstrap.cmd
+!scripts/
+!scripts/**
 !chronam/
 !chronam/**
 

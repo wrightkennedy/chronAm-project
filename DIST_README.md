@@ -3,7 +3,7 @@
 Thanks for trying ChronAm! Depending on how you received the project, pick the option below to get started.
 
 ## Option A: macOS App Bundle (recommended)
-1. Double-click `ChronAmTool.dmg` and drag **ChronAmTool.app** into `/Applications` (or any folder you prefer).
+1. Double-click `ChronAmTool.dmg`. The Finder window shows **ChronAmTool.app** alongside an **Applications** shortcut—drag the app onto the shortcut (or directly into Finder’s Applications entry).
 2. On first launch, macOS may flag the app as downloaded from the internet. Control-click the app, choose **Open**, then confirm.
 3. During the first launch ChronAm creates `~/Documents/ChronAm/` (if it does not already exist) and copies the bundled sample dataset there. The app automatically targets `~/Documents/ChronAm/data/parquet/`, so you can immediately run a search against `AmericanStories_1800.parquet`.
 4. Swap in your full dataset anytime via **Sources ▸ Set Local Dataset Folder…**.
