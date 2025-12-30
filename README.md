@@ -1,4 +1,4 @@
-# chronAm
+# chronAm - soon to be renamed geoText Explorer
 Chronicling America Text Mining and Visualization Tool
 
 This tool uses a local parquet dataset of the of the Chronicling America historical newspapers for keyword and date searches to build a corpus, collocation analysis, and geocoding (based on the city of the publisher). 
